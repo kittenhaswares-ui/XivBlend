@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.2 has passed offline build and Blender validation, but still needs broader live in-game testing. Animations are deliberately deferred.
+> **Prototype status:** version 0.0.3 has passed offline build and Blender validation, but still needs broader live in-game testing. Animations are deliberately deferred.
 
 ## What it exports
 

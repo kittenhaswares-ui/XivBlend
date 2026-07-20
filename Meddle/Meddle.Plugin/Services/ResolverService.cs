@@ -19,19 +19,24 @@ public class ResolverService : IService
     private readonly SqPack pack;
     private readonly IFramework framework;
     private readonly PbdHooks pbdHooks;
+    // ParseMaterialUtil reads the dye sheets cached by StainProvider. Keeping this
+    // dependency explicit guarantees that those sheets are loaded before parsing.
+    private readonly StainProvider stainProvider;
 
     public ResolverService(
         ILogger<ResolverService> logger, 
         LayoutService layoutService,
         SqPack pack,
         IFramework framework,
-        PbdHooks pbdHooks)
+        PbdHooks pbdHooks,
+        StainProvider stainProvider)
     {
         this.logger = logger;
         this.layoutService = layoutService;
         this.pack = pack;
         this.framework = framework;
         this.pbdHooks = pbdHooks;
+        this.stainProvider = stainProvider;
     }
     
     

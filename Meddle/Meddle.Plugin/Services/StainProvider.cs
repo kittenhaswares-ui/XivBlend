@@ -10,11 +10,14 @@ namespace Meddle.Plugin.Services;
 public class StainProvider : IDisposable, IService
 {
     private readonly ILogger<PbdHooks> logger;
-    public static IReadOnlyDictionary<uint, Stain> StainDict { get; private set; } = null!;
-    private static Dictionary<uint, uint> HousingDictPriv = null!;
+    public static IReadOnlyDictionary<uint, Stain> StainDict { get; private set; } =
+        new Dictionary<uint, Stain>();
+    private static Dictionary<uint, uint> HousingDictPriv = new();
     public static IReadOnlyDictionary<uint, uint> HousingDict => HousingDictPriv;
-    public static IReadOnlyDictionary<uint, Item> ItemDict { get; private set; } = null!;
-    public static IReadOnlyDictionary<uint, HousingExterior> HousingExterior { get; private set; } = null!;
+    public static IReadOnlyDictionary<uint, Item> ItemDict { get; private set; } =
+        new Dictionary<uint, Item>();
+    public static IReadOnlyDictionary<uint, HousingExterior> HousingExterior { get; private set; } =
+        new Dictionary<uint, HousingExterior>();
     
     public static Stain? GetStain(uint rowId)
     {
