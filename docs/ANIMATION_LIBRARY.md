@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.6 adds an optional Blender sidebar for previewing a deliberately narrow set of built-in FFXIV player animations. It is an on-demand local bridge, not a copy of the game's complete animation archive: the catalog and icons are prepared from the user's own live installation, and only the animation clicked in Blender is decoded. Penumbra is bypassed; see the TexTools integrity caveat below.
+XivBlend 0.0.7 provides an optional Blender sidebar for previewing a deliberately narrow set of built-in FFXIV player animations. It is an on-demand local bridge, not a copy of the game's complete animation archive: the catalog and icons are prepared from the user's own live installation, and only the animation clicked in Blender is decoded. Penumbra is bypassed; see the TexTools integrity caveat below.
 
 ## Scope
 
@@ -47,10 +47,10 @@ Runtime Actions are intentionally transient. Before Blender saves, the add-on re
 
 ## Set up and use
 
-1. Install XivBlend 0.0.6 and select Blender in XivBlend's **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.7 or newer and select Blender in XivBlend's **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both the game catalog and Blender panel to report success.
-4. Export the character again with XivBlend 0.0.6. Older `.blend` files do not contain the race and face-rig metadata required by the browser.
+4. Export the character again with XivBlend 0.0.6 or newer. Older `.blend` files do not contain the race and face-rig metadata required by the browser.
 5. Restart Blender if it was open while the panel was installed, then open the new `.blend`.
 6. In Blender's 3D View, press `N`, open **XivBlend**, and expand **Player Emotes**.
 7. Search or filter by category, then click an icon to play it on a loop.

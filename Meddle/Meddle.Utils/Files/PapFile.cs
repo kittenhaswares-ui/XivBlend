@@ -5,7 +5,10 @@ namespace Meddle.Utils.Files;
 
 public class PapFile
 {
-    public const uint PapMagic = 0x70617020; // "pap "
+    // PAP files begin with the ASCII bytes "pap ". SpanBinaryReader reads
+    // integers in the native little-endian layout used by FFXIV, so those
+    // bytes are represented by 0x20706170 as a uint.
+    public const uint PapMagic = 0x20706170;
     public PapFileHeader FileHeader;
     public PapAnimation[] Animations;
     

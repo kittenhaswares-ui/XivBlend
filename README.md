@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.6 adds an optional, on-demand Blender browser for 279 vanilla player emotes and facial expressions in the current validated game data. It keeps the catalog and decoded clips in a shared local cache rather than bloating each `.blend`. The character exporter has passed release-build, Blender-reopen, and offline end-to-end checks; the new live first-click animation bridge still needs broad in-game coverage.
+> **Prototype status:** version 0.0.7 fixes the PAP signature validation that incorrectly rejected every valid game animation on the first uncached click. The optional Blender browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. The character exporter has passed release-build, Blender-reopen, and offline end-to-end checks; the corrected live first-click animation bridge still needs broad in-game coverage.
 
 ## What it exports
 
@@ -69,7 +69,7 @@ The `.blend` contains redacted provenance, but it is not anonymous: its filename
 
 1. Open XivBlend's **Animations** tab in FFXIV.
 2. Press **Set Up / Update Animation Browser** and wait for the catalog and Blender-panel status messages to finish.
-3. Export the character again with version 0.0.6; older `.blend` files lack the race and face-skeleton lookup metadata.
+3. Export the character again with version 0.0.6 or newer; older `.blend` files lack the race and face-skeleton lookup metadata.
 4. Restart Blender if it was already open. In the 3D View press `N`, open **XivBlend** → **Player Emotes**, then click an icon.
 5. Keep FFXIV running with XivBlend loaded for the first click on an uncached clip. Later clicks use the shared local cache.
 6. Use **Stop / Restore Captured Pose** to unload the preview and return to the exported pose.
@@ -84,7 +84,7 @@ See [Animation browser workflow, scope, and limitations](docs/ANIMATION_LIBRARY.
 - The apparent blocky rig in earlier exports was caused by glTF-imported Icosphere custom bone shapes overriding Blender's `STICK` display. New files disable those widgets and show the clean stick armature by default.
 - Viewport grid, coordinate axes, relationship lines, camera, and light helpers are hidden by default. The camera and three studio lights remain active for F12 renders.
 - Native glTF rest matrices, bind transforms, and bone axes are preserved; the pose slider does not remap the rig. For an FBX round trip, use Primary Bone Axis `X` and Secondary Bone Axis `Y` at the FBX export/import boundary only.
-- Existing `.blend` files are not retroactively changed. Export again with 0.0.6 to receive the rig metadata required by the animation browser.
+- Existing `.blend` files are not retroactively changed. Export again with 0.0.6 or newer to receive the rig metadata required by the animation browser.
 
 ## Verified so far
 
