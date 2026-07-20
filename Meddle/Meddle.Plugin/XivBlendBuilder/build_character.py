@@ -21,11 +21,11 @@ import warnings
 
 import bpy
 from bpy_extras.object_utils import world_to_camera_view
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.2.0"
+BUILDER_VERSION = "0.3.0"
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
 README_TEXT_NAME = "README_XIVBLEND.txt"
@@ -41,6 +41,14 @@ RIG_COLLECTION = "Rig"
 MESH_COLLECTION = "Meshes"
 EXTRAS_COLLECTION = "Character Extras"
 SETUP_COLLECTION = "Scene Setup"
+CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
+
+POSE_REST_FRAME = 0
+POSE_CAPTURED_FRAME = 100
+POSE_SAMPLE_FRAMES = (0, 25, 50, 75, 100)
+POSE_REST_MARKER = "XIV A-POSE"
+POSE_CAPTURED_MARKER = "CAPTURED POSE"
+POSE_MATRIX_TOLERANCE = 1.0e-5
 
 
 class BuildError(RuntimeError):
@@ -265,35 +273,215 @@ def remove_empty_vertex_groups(meshes: Iterable[bpy.types.Object]) -> int:
     return removed
 
 
+def set_scene_frame(scene: bpy.types.Scene, frame: float) -> None:
+    whole = math.floor(frame)
+    scene.frame_set(int(whole), subframe=frame - whole)
+    bpy.context.view_layer.update()
+
+
+def action_fcurves_for_armature(
+    armature: bpy.types.Object,
+) -> tuple[bpy.types.Action, list[bpy.types.FCurve]]:
+    animation_data = armature.animation_data
+    action = animation_data.action if animation_data is not None else None
+    action_slot = (
+        animation_data.action_slot
+        if animation_data is not None and hasattr(animation_data, "action_slot")
+        else None
+    )
+    if action is None or action_slot is None:
+        raise BuildError(
+            f"Armature {armature.name} has no captured glTF pose action"
+        )
+
+    fcurves: list[bpy.types.FCurve] = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            channelbag = strip.channelbag(action_slot, ensure=False)
+            if channelbag is not None:
+                fcurves.extend(channelbag.fcurves)
+    if not fcurves:
+        raise BuildError(
+            f"Armature {armature.name} captured action contains no transform curves"
+        )
+    return action, fcurves
+
+
+def ensure_captured_pose_action(armature: bpy.types.Object) -> bool:
+    """Create a one-frame capture when a valid glTF contains no animation clip."""
+    animation_data = armature.animation_data_create()
+    if animation_data.action is not None:
+        return False
+
+    action = bpy.data.actions.new(f"{armature.name} Captured Pose")
+    animation_data.action = action
+    for pose_bone in armature.pose.bones:
+        if pose_bone.rotation_mode != "QUATERNION":
+            location, rotation, scale = pose_bone.matrix_basis.decompose()
+            pose_bone.location = location
+            pose_bone.rotation_mode = "QUATERNION"
+            pose_bone.rotation_quaternion = rotation
+            pose_bone.scale = scale
+        for property_name in ("location", "rotation_quaternion", "scale"):
+            pose_bone.keyframe_insert(
+                data_path=property_name,
+                frame=float(POSE_REST_FRAME),
+                group=pose_bone.name,
+            )
+    set_scene_frame(bpy.context.scene, POSE_REST_FRAME)
+    return True
+
+
+def rest_channel_value(fcurve: bpy.types.FCurve) -> float:
+    property_name = fcurve.data_path.rsplit(".", 1)[-1]
+    if not fcurve.data_path.startswith('pose.bones["'):
+        raise BuildError(
+            f"Captured action contains unsupported channel: {fcurve.data_path}"
+        )
+    if property_name == "location":
+        return 0.0
+    if property_name == "scale":
+        return 1.0
+    if property_name == "rotation_quaternion":
+        return 1.0 if fcurve.array_index == 0 else 0.0
+    raise BuildError(
+        "Captured action contains an unsupported pose transform channel: "
+        f"{fcurve.data_path}"
+    )
+
+
 def configure_armatures(
     scene: bpy.types.Scene, armatures: Iterable[bpy.types.Object]
-) -> None:
-    """Keep the original FFXIV rig data while making it pleasant to pose in Blender."""
-    actions: set[bpy.types.Action] = set()
+) -> tuple[dict[bpy.types.Object, dict[str, Matrix]], dict[str, Any]]:
+    """Create a script-free Timeline blend from the rig rest pose to the capture."""
+    armatures = sorted(armatures, key=lambda item: item.name)
+    captured_pose: dict[bpy.types.Object, dict[str, Matrix]] = {}
+    action_indices: dict[bpy.types.Action, int] = {}
+    curve_count = 0
+    keyed_bones: set[tuple[str, str]] = set()
+    canonicalized_quaternions = 0
+    custom_shapes_cleared = 0
+    synthesized_actions = 0
+
     for armature in armatures:
         armature.data.display_type = "STICK"
         armature.data.pose_position = "POSE"
+        armature.data.show_bone_custom_shapes = False
+        armature.data.show_axes = False
+        armature.data.show_names = False
         armature.show_in_front = True
-        if armature.animation_data and armature.animation_data.action:
-            actions.add(armature.animation_data.action)
+        for pose_bone in armature.pose.bones:
+            if pose_bone.custom_shape is not None:
+                pose_bone.custom_shape[CUSTOM_BONE_SHAPE_PROPERTY] = True
+                pose_bone.custom_shape.hide_render = True
+                pose_bone.custom_shape.hide_viewport = True
+                pose_bone.custom_shape = None
+                custom_shapes_cleared += 1
 
-    for index, action in enumerate(sorted(actions, key=lambda item: item.name)):
-        action.name = (
-            "XivBlend | Captured Pose"
-            if index == 0
-            else f"XivBlend | Captured Pose {index + 1}"
-        )
+        if ensure_captured_pose_action(armature):
+            synthesized_actions += 1
+        action, fcurves = action_fcurves_for_armature(armature)
+        source_frames = [
+            float(point.co.x)
+            for fcurve in fcurves
+            for point in fcurve.keyframe_points
+        ]
+        if (
+            any(len(fcurve.keyframe_points) != 1 for fcurve in fcurves)
+            or not source_frames
+            or max(source_frames) - min(source_frames) > 1.0e-5
+        ):
+            raise BuildError(
+                f"Armature {armature.name} pose action is not a one-frame capture"
+            )
 
-    scene.frame_start = 0
-    scene.frame_end = 0
-    scene.frame_set(0)
+        source_frame = source_frames[0]
+        set_scene_frame(scene, source_frame)
+        captured_pose[armature] = {
+            pose_bone.name: pose_bone.matrix_basis.copy()
+            for pose_bone in armature.pose.bones
+        }
+
+        quaternion_curves: dict[str, dict[int, bpy.types.FCurve]] = {}
+        for fcurve in fcurves:
+            property_name = fcurve.data_path.rsplit(".", 1)[-1]
+            rest_channel_value(fcurve)
+            if property_name == "rotation_quaternion":
+                quaternion_curves.setdefault(fcurve.data_path, {})[
+                    fcurve.array_index
+                ] = fcurve
+            keyed_bones.add((armature.name, fcurve.data_path.rsplit(".", 1)[0]))
+
+        flipped_paths: set[str] = set()
+        for data_path, components in quaternion_curves.items():
+            if set(components) != {0, 1, 2, 3}:
+                raise BuildError(
+                    f"Captured quaternion is incomplete on {armature.name}: {data_path}"
+                )
+            if components[0].keyframe_points[0].co.y < 0.0:
+                flipped_paths.add(data_path)
+        canonicalized_quaternions += len(flipped_paths)
+
+        for fcurve in fcurves:
+            captured_key = fcurve.keyframe_points[0]
+            captured_value = float(captured_key.co.y)
+            if fcurve.data_path in flipped_paths:
+                captured_value = -captured_value
+            captured_key.co = (float(POSE_CAPTURED_FRAME), captured_value)
+            captured_key.interpolation = "LINEAR"
+            rest_key = fcurve.keyframe_points.insert(
+                float(POSE_REST_FRAME),
+                rest_channel_value(fcurve),
+                options={"FAST"},
+            )
+            rest_key.interpolation = "LINEAR"
+            fcurve.extrapolation = "CONSTANT"
+            fcurve.update()
+        curve_count += len(fcurves)
+
+        if action not in action_indices:
+            action_indices[action] = len(action_indices)
+            index = action_indices[action]
+            action.name = (
+                "XivBlend | A-Pose to Captured Pose"
+                if index == 0
+                else f"XivBlend | A-Pose to Captured Pose {index + 1}"
+            )
+            if hasattr(action, "use_frame_range"):
+                action.use_frame_range = False
+
+    for marker in list(scene.timeline_markers):
+        scene.timeline_markers.remove(marker)
+    scene.timeline_markers.new(POSE_REST_MARKER, frame=POSE_REST_FRAME)
+    scene.timeline_markers.new(POSE_CAPTURED_MARKER, frame=POSE_CAPTURED_FRAME)
+    scene.frame_start = POSE_REST_FRAME
+    scene.frame_end = POSE_CAPTURED_FRAME
+    set_scene_frame(scene, POSE_CAPTURED_FRAME)
+
+    report = {
+        "Type": "Timeline pose slider",
+        "RestFrame": POSE_REST_FRAME,
+        "CapturedFrame": POSE_CAPTURED_FRAME,
+        "SampleFrames": list(POSE_SAMPLE_FRAMES),
+        "Actions": len(action_indices),
+        "FCurves": curve_count,
+        "KeyedBones": len(keyed_bones),
+        "CanonicalizedQuaternionBones": canonicalized_quaternions,
+        "SynthesizedMissingCaptureActions": synthesized_actions,
+        "ImporterCustomShapesCleared": custom_shapes_cleared,
+    }
+    log("pose_slider_configured", **report)
+    return captured_pose, report
 
 
 def import_character(
     source: Path,
 ) -> tuple[list[bpy.types.Object], list[bpy.types.Object], list[bpy.types.Object]]:
     before = set(bpy.data.objects)
-    result = bpy.ops.import_scene.gltf(filepath=str(source))
+    result = bpy.ops.import_scene.gltf(
+        filepath=str(source),
+        disable_bone_shape=True,
+    )
     if "FINISHED" not in result:
         raise BuildError(f"Blender could not import {source.name}")
 
@@ -491,7 +679,9 @@ def organize_objects(
         "setup": setup,
     }
 
-    custom_bone_shapes = bone_custom_shapes(imported)
+    custom_bone_shapes = bone_custom_shapes(imported) | {
+        obj for obj in imported if bool(obj.get(CUSTOM_BONE_SHAPE_PROPERTY))
+    }
 
     for obj in imported:
         if obj.type == "ARMATURE":
@@ -553,6 +743,27 @@ def character_bounds(
         maximum = Vector((0.5, 0.5, 2.0))
         points = [minimum, maximum]
         return (minimum + maximum) * 0.5, maximum - minimum, points
+
+    minimum = Vector(tuple(min(point[axis] for point in points) for axis in range(3)))
+    maximum = Vector(tuple(max(point[axis] for point in points) for axis in range(3)))
+    return (minimum + maximum) * 0.5, maximum - minimum, points
+
+
+def character_bounds_across_frames(
+    scene: bpy.types.Scene,
+    objects: Iterable[bpy.types.Object],
+    frames: Iterable[int] = POSE_SAMPLE_FRAMES,
+) -> tuple[Vector, Vector, list[Vector]]:
+    """Return bounds covering both pose endpoints and useful blend samples."""
+    objects = list(objects)
+    points: list[Vector] = []
+    try:
+        for frame in frames:
+            set_scene_frame(scene, frame)
+            _, _, frame_points = character_bounds(objects)
+            points.extend(frame_points)
+    finally:
+        set_scene_frame(scene, POSE_CAPTURED_FRAME)
 
     minimum = Vector(tuple(min(point[axis] for point in points) for axis in range(3)))
     maximum = Vector(tuple(max(point[axis] for point in points) for axis in range(3)))
@@ -725,7 +936,7 @@ def configure_scene_setup(
         background.inputs["Strength"].default_value = 0.18
     scene.world = world
 
-    center, size, bounds = character_bounds(imported)
+    center, size, bounds = character_bounds_across_frames(scene, imported)
     largest = max(max(size), 0.1)
 
     # Always create an unparented camera so an imported camera's hidden state,
@@ -804,6 +1015,79 @@ def configure_scene_setup(
     bpy.context.view_layer.update()
 
 
+def saved_view_3d_spaces() -> list[tuple[str, bpy.types.SpaceView3D]]:
+    spaces: list[tuple[str, bpy.types.SpaceView3D]] = []
+    for screen in bpy.data.screens:
+        for area_index, area in enumerate(screen.areas):
+            for space_index, space in enumerate(area.spaces):
+                if space.type == "VIEW_3D":
+                    spaces.append(
+                        (f"{screen.name}/area-{area_index}/space-{space_index}", space)
+                    )
+    return spaces
+
+
+def configure_viewport_defaults() -> dict[str, Any]:
+    """Save a clean viewport without disabling any render camera or studio light."""
+    spaces = saved_view_3d_spaces()
+    if not spaces:
+        raise BuildError("The Blender file has no saved 3D Viewport to configure")
+
+    for _, space in spaces:
+        overlay = space.overlay
+        overlay.show_overlays = True
+        overlay.show_extras = False
+        overlay.show_relationship_lines = False
+        overlay.show_floor = False
+        overlay.show_ortho_grid = False
+        overlay.show_axis_x = False
+        overlay.show_axis_y = False
+        overlay.show_axis_z = False
+        overlay.show_camera_guides = False
+        overlay.show_bones = True
+        overlay.show_outline_selected = True
+
+    report = {
+        "SavedView3DSpaces": len(spaces),
+        "CameraLightExtrasVisible": False,
+        "RelationshipLinesVisible": False,
+        "FloorGridVisible": False,
+        "AxesVisible": False,
+        "BonesVisible": True,
+        "SelectionOutlineVisible": True,
+    }
+    log("viewport_defaults_configured", **report)
+    return report
+
+
+def select_primary_armature(
+    armatures: Iterable[bpy.types.Object],
+) -> bpy.types.Object:
+    armatures = list(armatures)
+    if not armatures:
+        raise BuildError("No armature is available for the saved Blender selection")
+
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError as exc:
+            raise BuildError("Could not return Blender to Object Mode") from exc
+
+    primary = max(
+        armatures,
+        key=lambda item: (len(item.data.bones), item.name.casefold()),
+    )
+    for obj in bpy.context.view_layer.objects:
+        obj.select_set(False)
+    primary.hide_set(False)
+    primary.hide_viewport = False
+    primary.select_set(True)
+    bpy.context.view_layer.objects.active = primary
+    if primary.mode != "OBJECT":
+        raise BuildError("The primary character armature is not in Object Mode")
+    return primary
+
+
 def embed_manifest(
     scene: bpy.types.Scene,
     manifest_path: Path,
@@ -879,11 +1163,19 @@ def write_embedded_readme() -> None:
         "=========================\n\n"
         "- The Rig collection contains the original FFXIV bone hierarchy, names, "
         "rest transforms, pose and deformation weights reconstructed through glTF.\n"
-        "- The captured one-frame pose is at frame 0. Set the armature to Rest Position "
-        "to inspect the rest skeleton.\n"
+        "- Use the Timeline at the bottom as the pose slider: frame 0 (XIV A-POSE) is "
+        "the exact rig rest pose, frame 100 (CAPTURED POSE) is the exported in-game pose, "
+        "and the frames between them blend smoothly. The file opens at frame 100.\n"
+        "- The armature uses Blender's compact Stick display. Camera/light icons, grid, "
+        "axes and relationship lines are hidden as viewport overlays, not disabled.\n"
         "- Press Numpad 0 for the generated camera and F12 to render.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
         "Scene Setup collection and can be hidden or replaced without touching the character.\n"
+        "- Native glTF rest/bind axes are preserved. For an FBX round trip, choose Primary "
+        "Bone Axis X and Secondary Bone Axis Y at the FBX import/export boundary; do not "
+        "remap this Blender armature in place.\n"
+        "- Animation-library export is intentionally deferred; this prototype contains "
+        "only the captured pose-to-A-pose control.\n"
         "- Textures used by the materials are packed into this file.\n"
         "- The external xivblend-manifest.json contains private character/mod paths and "
         "should not be shared casually. The embedded provenance is redacted.\n"
@@ -1058,6 +1350,217 @@ def approximately_equal(actual: float, expected: float, tolerance: float = 1.0e-
     return math.isclose(actual, expected, rel_tol=tolerance, abs_tol=tolerance)
 
 
+def matrix_maximum_delta(actual: Matrix, expected: Matrix) -> float:
+    return max(
+        abs(float(actual[row][column]) - float(expected[row][column]))
+        for row in range(4)
+        for column in range(4)
+    )
+
+
+def matrix_is_finite(matrix: Matrix) -> bool:
+    return all(math.isfinite(float(value)) for row in matrix for value in row)
+
+
+def validate_pose_control(
+    scene: bpy.types.Scene,
+    armatures: list[bpy.types.Object],
+    captured_pose: dict[bpy.types.Object, dict[str, Matrix]],
+    configured_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove that the Timeline endpoints are exact and every sample is finite."""
+    problems: list[str] = []
+    expected_markers = {
+        (POSE_REST_MARKER, POSE_REST_FRAME),
+        (POSE_CAPTURED_MARKER, POSE_CAPTURED_FRAME),
+    }
+    actual_markers = {(marker.name, marker.frame) for marker in scene.timeline_markers}
+    if actual_markers != expected_markers:
+        problems.append(f"Timeline markers changed: {sorted(actual_markers)}")
+    if (scene.frame_start, scene.frame_end) != (
+        POSE_REST_FRAME,
+        POSE_CAPTURED_FRAME,
+    ):
+        problems.append("Timeline pose-slider frame range changed")
+
+    structural_fcurves = 0
+    canonical_quaternion_w_curves = 0
+    for armature in armatures:
+        if armature.data.display_type != "STICK":
+            problems.append(f"{armature.name} is not using Stick display")
+        if armature.data.show_bone_custom_shapes:
+            problems.append(f"{armature.name} still displays custom bone shapes")
+        if armature.data.show_axes or armature.data.show_names:
+            problems.append(f"{armature.name} still displays bone axes or names")
+        assigned_shapes = [
+            pose_bone.name
+            for pose_bone in armature.pose.bones
+            if pose_bone.custom_shape is not None
+        ]
+        if assigned_shapes:
+            problems.append(
+                f"{armature.name} retains {len(assigned_shapes)} custom bone shapes"
+            )
+
+        try:
+            _, fcurves = action_fcurves_for_armature(armature)
+        except BuildError as exc:
+            problems.append(str(exc))
+            continue
+        structural_fcurves += len(fcurves)
+        for fcurve in fcurves:
+            points = list(fcurve.keyframe_points)
+            frames = [float(point.co.x) for point in points]
+            if (
+                len(points) != 2
+                or not approximately_equal(frames[0], POSE_REST_FRAME)
+                or not approximately_equal(frames[1], POSE_CAPTURED_FRAME)
+                or any(point.interpolation != "LINEAR" for point in points)
+            ):
+                problems.append(
+                    f"Invalid pose-slider keys on {armature.name}: "
+                    f"{fcurve.data_path}[{fcurve.array_index}]"
+                )
+                continue
+            expected_rest = rest_channel_value(fcurve)
+            if not approximately_equal(float(points[0].co.y), expected_rest):
+                problems.append(
+                    f"Non-rest frame-0 value on {armature.name}: "
+                    f"{fcurve.data_path}[{fcurve.array_index}]"
+                )
+            if any(not math.isfinite(float(point.co.y)) for point in points):
+                problems.append(
+                    f"Non-finite pose-slider key on {armature.name}: "
+                    f"{fcurve.data_path}[{fcurve.array_index}]"
+                )
+            if (
+                fcurve.data_path.endswith(".rotation_quaternion")
+                and fcurve.array_index == 0
+            ):
+                canonical_quaternion_w_curves += 1
+                if float(points[1].co.y) < -POSE_MATRIX_TOLERANCE:
+                    problems.append(
+                        f"Captured quaternion is not canonical on {armature.name}: "
+                        f"{fcurve.data_path}"
+                    )
+
+    identity = Matrix.Identity(4)
+    rest_basis_delta = 0.0
+    rest_pose_delta = 0.0
+    captured_basis_delta = 0.0
+    finite_values = 0
+    try:
+        for frame in POSE_SAMPLE_FRAMES:
+            set_scene_frame(scene, frame)
+            for armature in armatures:
+                reference = captured_pose.get(armature)
+                if reference is None:
+                    problems.append(f"Missing captured reference for {armature.name}")
+                    continue
+                for pose_bone in armature.pose.bones:
+                    if not matrix_is_finite(pose_bone.matrix_basis) or not matrix_is_finite(
+                        pose_bone.matrix
+                    ):
+                        problems.append(
+                            f"Non-finite pose transform at frame {frame}: "
+                            f"{armature.name}/{pose_bone.name}"
+                        )
+                        continue
+                    finite_values += 32
+                    if frame == POSE_REST_FRAME:
+                        rest_basis_delta = max(
+                            rest_basis_delta,
+                            matrix_maximum_delta(pose_bone.matrix_basis, identity),
+                        )
+                        rest_pose_delta = max(
+                            rest_pose_delta,
+                            matrix_maximum_delta(
+                                pose_bone.matrix, pose_bone.bone.matrix_local
+                            ),
+                        )
+                    elif frame == POSE_CAPTURED_FRAME:
+                        captured_matrix = reference.get(pose_bone.name)
+                        if captured_matrix is None:
+                            problems.append(
+                                f"Captured reference lost bone: "
+                                f"{armature.name}/{pose_bone.name}"
+                            )
+                        else:
+                            captured_basis_delta = max(
+                                captured_basis_delta,
+                                matrix_maximum_delta(
+                                    pose_bone.matrix_basis, captured_matrix
+                                ),
+                            )
+    finally:
+        set_scene_frame(scene, POSE_CAPTURED_FRAME)
+
+    if rest_basis_delta > POSE_MATRIX_TOLERANCE:
+        problems.append(
+            f"frame 0 does not reset pose bases (delta {rest_basis_delta:.9g})"
+        )
+    if rest_pose_delta > POSE_MATRIX_TOLERANCE:
+        problems.append(
+            f"frame 0 does not reproduce rig rest matrices (delta {rest_pose_delta:.9g})"
+        )
+    if captured_basis_delta > POSE_MATRIX_TOLERANCE:
+        problems.append(
+            "frame 100 does not reproduce captured pose matrices "
+            f"(delta {captured_basis_delta:.9g})"
+        )
+    if structural_fcurves != configured_report["FCurves"]:
+        problems.append("Pose-slider FCurve count changed after configuration")
+
+    if problems:
+        raise BuildError("Final pose-control validation failed: " + "; ".join(problems))
+
+    return {
+        **configured_report,
+        "Markers": {
+            POSE_REST_MARKER: POSE_REST_FRAME,
+            POSE_CAPTURED_MARKER: POSE_CAPTURED_FRAME,
+        },
+        "DefaultFrame": scene.frame_current,
+        "ArmaturesUsingStickDisplay": len(armatures),
+        "CustomBoneShapeAssignments": 0,
+        "CustomBoneShapeDisplay": False,
+        "CanonicalQuaternionWCurvesValidated": canonical_quaternion_w_curves,
+        "RestBasisMaximumDelta": rest_basis_delta,
+        "RestPoseMaximumDelta": rest_pose_delta,
+        "CapturedPoseMaximumDelta": captured_basis_delta,
+        "FiniteMatrixValuesChecked": finite_values,
+        "EndpointValidation": "passed",
+    }
+
+
+def validate_viewport_defaults(configured_report: dict[str, Any]) -> dict[str, Any]:
+    problems: list[str] = []
+    spaces = saved_view_3d_spaces()
+    if len(spaces) != configured_report["SavedView3DSpaces"]:
+        problems.append("saved 3D Viewport count changed")
+    for label, space in spaces:
+        overlay = space.overlay
+        if not overlay.show_overlays:
+            problems.append(f"{label} disabled all overlays, including bones")
+        if overlay.show_extras:
+            problems.append(f"{label} still shows camera/light extras")
+        if overlay.show_relationship_lines:
+            problems.append(f"{label} still shows relationship lines")
+        if overlay.show_floor or overlay.show_ortho_grid:
+            problems.append(f"{label} still shows the viewport grid")
+        if overlay.show_axis_x or overlay.show_axis_y or overlay.show_axis_z:
+            problems.append(f"{label} still shows coordinate axes")
+        if not overlay.show_bones:
+            problems.append(f"{label} hides bones")
+        if not overlay.show_outline_selected:
+            problems.append(f"{label} hides selection outlines")
+    if problems:
+        raise BuildError(
+            "Final viewport-default validation failed: " + "; ".join(problems)
+        )
+    return {**configured_report, "Validation": "passed"}
+
+
 def validate_scene_setup(
     collections: dict[str, bpy.types.Collection],
     meshes: list[bpy.types.Object],
@@ -1164,26 +1667,62 @@ def validate_scene_setup(
 
     frame_min: list[float] | None = None
     frame_max: list[float] | None = None
+    frame_reports: list[dict[str, Any]] = []
     if camera is not None and camera.type == "CAMERA":
-        _, _, bounds = character_bounds(meshes)
-        projected = [world_to_camera_view(scene, camera, point) for point in bounds]
-        if projected:
-            frame_min = [min(point[axis] for point in projected) for axis in range(3)]
-            frame_max = [max(point[axis] for point in projected) for axis in range(3)]
-            tolerance = 1.0e-4
-            if any(
-                not all(math.isfinite(value) for value in point)
-                or point.x < -tolerance
-                or point.x > 1.0 + tolerance
-                or point.y < -tolerance
-                or point.y > 1.0 + tolerance
-                or point.z < camera.data.clip_start - tolerance
-                or point.z > camera.data.clip_end + tolerance
-                for point in projected
-            ):
-                problems.append("the studio camera does not frame all visible character bounds")
-        else:
-            problems.append("no visible character bounds were available for camera validation")
+        projected_across_frames = []
+        try:
+            for frame in POSE_SAMPLE_FRAMES:
+                set_scene_frame(scene, frame)
+                _, _, bounds = character_bounds(meshes)
+                projected = [
+                    world_to_camera_view(scene, camera, point) for point in bounds
+                ]
+                if not projected:
+                    problems.append(
+                        f"no visible character bounds were available at frame {frame}"
+                    )
+                    continue
+                projected_across_frames.extend(projected)
+                minimum = [
+                    min(point[axis] for point in projected) for axis in range(3)
+                ]
+                maximum = [
+                    max(point[axis] for point in projected) for axis in range(3)
+                ]
+                frame_reports.append(
+                    {
+                        "Frame": frame,
+                        "Minimum": [round(value, 6) for value in minimum],
+                        "Maximum": [round(value, 6) for value in maximum],
+                    }
+                )
+                tolerance = 1.0e-4
+                if any(
+                    not all(math.isfinite(value) for value in point)
+                    or point.x < -tolerance
+                    or point.x > 1.0 + tolerance
+                    or point.y < -tolerance
+                    or point.y > 1.0 + tolerance
+                    or point.z < camera.data.clip_start - tolerance
+                    or point.z > camera.data.clip_end + tolerance
+                    for point in projected
+                ):
+                    problems.append(
+                        "the studio camera does not frame all visible character "
+                        f"bounds at pose-slider frame {frame}"
+                    )
+        finally:
+            set_scene_frame(scene, POSE_CAPTURED_FRAME)
+
+        if projected_across_frames:
+            frame_min = [
+                min(point[axis] for point in projected_across_frames)
+                for axis in range(3)
+            ]
+            frame_max = [
+                max(point[axis] for point in projected_across_frames)
+                for axis in range(3)
+            ]
 
     if problems:
         raise BuildError("Final Scene Setup validation failed: " + "; ".join(problems))
@@ -1194,6 +1733,8 @@ def validate_scene_setup(
         "StudioBackdrops": len(studio_backdrops),
         "CameraFrameMinimum": [round(value, 6) for value in frame_min or []],
         "CameraFrameMaximum": [round(value, 6) for value in frame_max or []],
+        "CameraFramingSamples": frame_reports,
+        "CameraFramingFrames": list(POSE_SAMPLE_FRAMES),
         "RenderEngine": scene.render.engine,
     }
 
@@ -1207,6 +1748,10 @@ def validate_output(
     removed_vertex_groups: int,
     material_mapping: dict[str, Any],
     redacted_properties: int,
+    captured_pose: dict[bpy.types.Object, dict[str, Matrix]],
+    pose_configuration: dict[str, Any],
+    viewport_configuration: dict[str, Any],
+    primary_armature: bpy.types.Object,
 ) -> dict[str, Any]:
     meshes = [obj for obj in collections["meshes"].objects if obj.type == "MESH"]
     armatures = [obj for obj in collections["rig"].objects if obj.type == "ARMATURE"]
@@ -1260,13 +1805,35 @@ def validate_output(
             + ", ".join(sorted(linked_datablocks))
         )
 
+    expected_primary = max(
+        armatures,
+        key=lambda item: (len(item.data.bones), item.name.casefold()),
+    )
+    active_object = bpy.context.view_layer.objects.active
+    if (
+        primary_armature is not expected_primary
+        or active_object is not expected_primary
+        or not expected_primary.select_get()
+        or expected_primary.mode != "OBJECT"
+    ):
+        raise BuildError(
+            "Final Blender selection is not the largest armature in Object Mode"
+        )
+
     # Appending the shader library can leave a zero-user Library ID even though
     # every material and node group was copied locally. It is safe to purge that
     # bookkeeping record once the linked-data check above has passed.
     for library in list(bpy.data.libraries):
         bpy.data.libraries.remove(library)
 
+    pose_report = validate_pose_control(
+        bpy.context.scene,
+        armatures,
+        captured_pose,
+        pose_configuration,
+    )
     setup_report = validate_scene_setup(collections, meshes)
+    viewport_report = validate_viewport_defaults(viewport_configuration)
 
     return {
         "Builder": BUILDER_NAME,
@@ -1286,6 +1853,15 @@ def validate_output(
         "PrivatePropertiesRedacted": redacted_properties,
         "Actions": len(bpy.data.actions),
         "FrameRange": [bpy.context.scene.frame_start, bpy.context.scene.frame_end],
+        "CurrentFrame": bpy.context.scene.frame_current,
+        "PrimaryArmature": {
+            "Name": primary_armature.name,
+            "Bones": len(primary_armature.data.bones),
+            "Mode": primary_armature.mode,
+            "Selected": primary_armature.select_get(),
+        },
+        "PoseControl": pose_report,
+        "ViewportDefaults": viewport_report,
         "SceneSetup": setup_report,
         "PrivatePathValidation": "passed",
         "Validation": "passed",
@@ -1369,10 +1945,11 @@ def main() -> None:
     scene = clear_scene()
     imported, armatures, character_meshes = import_character(source)
     removed_vertex_groups = remove_empty_vertex_groups(character_meshes)
-    configure_armatures(scene, armatures)
+    captured_pose, pose_configuration = configure_armatures(scene, armatures)
     material_mapping = apply_meddle_materials(source, imported, meddle_location)
     collections = organize_objects(scene, imported)
     configure_scene_setup(scene, imported, collections["setup"])
+    viewport_configuration = configure_viewport_defaults()
     embed_manifest(scene, manifest_path, document, canonical, digest, source)
     write_embedded_readme()
     material_mode = (
@@ -1386,16 +1963,23 @@ def main() -> None:
     scene["clean_extract_mapped_materials"] = material_mapping["mapped"]
     pack_resources()
     redacted_properties = sanitize_packed_provenance(imported)
+    primary_armature = select_primary_armature(armatures)
     report = validate_output(
         collections,
         removed_vertex_groups,
         material_mapping,
         redacted_properties,
+        captured_pose,
+        pose_configuration,
+        viewport_configuration,
+        primary_armature,
     )
     embed_build_report(scene, report)
     # Run the privacy assertion after the build report is embedded so every ID
     # that will actually be saved has been included in the recursive scan.
     validate_private_paths()
+    set_scene_frame(scene, POSE_CAPTURED_FRAME)
+    select_primary_armature(armatures)
     save_blend(output)
 
 

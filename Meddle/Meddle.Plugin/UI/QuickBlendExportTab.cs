@@ -74,7 +74,8 @@ public sealed class QuickBlendExportTab : ITab
 
         ImGui.Separator();
         ImGui.TextDisabled("Each export is saved in a new timestamped folder; existing exports are never overwritten.");
-        ImGui.TextDisabled("Prototype scope: static rigged character only; animation export is intentionally deferred.");
+        ImGui.TextDisabled("Blender Timeline: frame 0 = XIV A-pose; frame 100 = captured pose.");
+        ImGui.TextDisabled("The FFXIV animation library is still intentionally deferred.");
 
         fileDialog.Draw();
     }

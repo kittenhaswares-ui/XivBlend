@@ -525,7 +525,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
 
         var builderRoot = Path.GetFullPath(Path.Combine(
             pluginInterface.ConfigDirectory.FullName,
-            "XivBlendBuilder-0.2.0"));
+            "XivBlendBuilder-0.3.0"));
         Directory.CreateDirectory(builderRoot);
         var requiredPrefix = builderRoot + Path.DirectorySeparatorChar;
 

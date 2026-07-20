@@ -10,7 +10,8 @@ the strict pass/fail result in JSON while forcing a zero process exit code::
 
     blender --background character.blend --python tools/audit_blend.py -- --report-only
 
-The script never changes or saves the opened file.
+The script never saves or writes the opened file. It temporarily evaluates the
+pose-control frames in memory and restores the originally opened frame.
 """
 
 from __future__ import annotations
@@ -41,9 +42,19 @@ COMPONENT_PROPERTY = "xivblend_component"
 
 EXPECTED_STUDIO_LIGHTS = 3
 EXPECTED_RESOLUTION = (1080, 1350, 100)
+EXPECTED_POSE_FRAMES = (0, 25, 50, 75, 100)
+EXPECTED_FRAME_RANGE = (0, 100)
+EXPECTED_TIMELINE_MARKERS = (
+    ("XIV A-POSE", 0),
+    ("CAPTURED POSE", 100),
+)
 PLACEHOLDER_MATERIAL = re.compile(r"^(?:null|error)(?:\.\d+)?$", re.IGNORECASE)
+POSE_TRANSFORM_PATH = re.compile(
+    r'^pose\.bones\[.+\]\.(?:location|rotation_quaternion|rotation_euler|rotation_axis_angle|scale)$'
+)
 WEIGHT_EPSILON = 1.0e-8
 FLOAT_EPSILON = 1.0e-5
+REPORT_SAMPLE_LIMIT = 50
 
 
 def arguments() -> argparse.Namespace:
@@ -92,6 +103,25 @@ def bone_custom_shapes(armatures: Iterable[bpy.types.Object]) -> set[bpy.types.O
         for pose_bone in armature.pose.bones
         if pose_bone.custom_shape is not None
     }
+
+
+def bone_custom_shape_assignments(
+    armatures: Iterable[bpy.types.Object],
+) -> list[dict[str, str]]:
+    return sorted(
+        (
+            {
+                "armature": armature.name,
+                "bone": pose_bone.name,
+                "shape": pose_bone.custom_shape.name,
+            }
+            for armature in armatures
+            if armature.pose is not None
+            for pose_bone in armature.pose.bones
+            if pose_bone.custom_shape is not None
+        ),
+        key=lambda item: (item["armature"], item["bone"], item["shape"]),
+    )
 
 
 def collection_objects(
@@ -207,6 +237,18 @@ def audit_mesh(
 def audit_armature(obj: bpy.types.Object) -> dict[str, Any]:
     armature = obj.data
     bones = list(armature.bones)
+    custom_shape_assignments = (
+        [
+            {
+                "bone": pose_bone.name,
+                "shape": pose_bone.custom_shape.name,
+            }
+            for pose_bone in obj.pose.bones
+            if pose_bone.custom_shape is not None
+        ]
+        if obj.pose is not None
+        else []
+    )
     return {
         "name": obj.name,
         "bones": len(bones),
@@ -215,6 +257,10 @@ def audit_armature(obj: bpy.types.Object) -> dict[str, Any]:
         "zero_length_bones": [bone.name for bone in bones if bone.length <= 1.0e-7],
         "display_type": armature.display_type,
         "pose_position": armature.pose_position,
+        "show_bone_custom_shapes": armature.show_bone_custom_shapes,
+        "show_axes": armature.show_axes,
+        "show_names": armature.show_names,
+        "custom_shape_assignments": custom_shape_assignments,
         "show_in_front": obj.show_in_front,
         "world_determinant": round(obj.matrix_world.determinant(), 8),
     }
@@ -320,10 +366,237 @@ def camera_framing(
     }
 
 
+def audit_saved_view3d_overlays() -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for screen in sorted(bpy.data.screens, key=lambda item: item.name):
+        for area_index, area in enumerate(screen.areas):
+            for space_index, space in enumerate(area.spaces):
+                if space.type != "VIEW_3D":
+                    continue
+                overlay = space.overlay
+                actual = {
+                    "show_extras": overlay.show_extras,
+                    "show_relationship_lines": overlay.show_relationship_lines,
+                    "show_floor": overlay.show_floor,
+                    "show_axis_x": overlay.show_axis_x,
+                    "show_axis_y": overlay.show_axis_y,
+                    "show_axis_z": overlay.show_axis_z,
+                    "show_bones": overlay.show_bones,
+                }
+                expected = {
+                    "show_extras": False,
+                    "show_relationship_lines": False,
+                    "show_floor": False,
+                    "show_axis_x": False,
+                    "show_axis_y": False,
+                    "show_axis_z": False,
+                    "show_bones": True,
+                }
+                reports.append(
+                    {
+                        "screen": screen.name,
+                        "area_index": area_index,
+                        "space_index": space_index,
+                        # The global overlay switch is informational. XivBlend
+                        # intentionally keeps overlays enabled so stick bones can
+                        # remain visible while individual scene guides are hidden.
+                        "show_overlays": space.overlay.show_overlays,
+                        "actual": actual,
+                        "expected": expected,
+                        "valid": actual == expected,
+                    }
+                )
+    return reports
+
+
+def layered_action_fcurves(
+    action: bpy.types.Action,
+    slot_handle: int,
+) -> list[bpy.types.FCurve]:
+    """Return the Blender 5 layered Action curves belonging to one slot."""
+    fcurves: list[bpy.types.FCurve] = []
+    for layer in action.layers:
+        for strip in layer.strips:
+            for channelbag in getattr(strip, "channelbags", []):
+                if channelbag.slot_handle == slot_handle:
+                    fcurves.extend(channelbag.fcurves)
+    return fcurves
+
+
+def audit_rig_action(rig: bpy.types.Object) -> dict[str, Any]:
+    animation_data = rig.animation_data
+    action = animation_data.action if animation_data is not None else None
+    action_slot = (
+        animation_data.action_slot
+        if animation_data is not None and action is not None
+        else None
+    )
+    if action is None or action_slot is None:
+        return {
+            "rig": rig.name,
+            "action": action.name if action is not None else None,
+            "slot": action_slot.identifier if action_slot is not None else None,
+            "action_frame_range": list(action.frame_range) if action is not None else None,
+            "transform_fcurves": 0,
+            "invalid_transform_fcurves": 0,
+            "invalid_reason_counts": {"missing_active_layered_action_or_slot": 1},
+            "invalid_samples": [],
+            "valid": False,
+        }
+
+    fcurves = [
+        fcurve
+        for fcurve in layered_action_fcurves(action, action_slot.handle)
+        if POSE_TRANSFORM_PATH.fullmatch(fcurve.data_path) is not None
+    ]
+    invalid: list[dict[str, Any]] = []
+    reason_counts: Counter[str] = Counter()
+    for fcurve in fcurves:
+        keyframes = list(fcurve.keyframe_points)
+        frames = [float(point.co.x) for point in keyframes]
+        reasons: list[str] = []
+        if not any(abs(frame - EXPECTED_FRAME_RANGE[0]) <= FLOAT_EPSILON for frame in frames):
+            reasons.append("missing_frame_0_key")
+        if not any(abs(frame - EXPECTED_FRAME_RANGE[1]) <= FLOAT_EPSILON for frame in frames):
+            reasons.append("missing_frame_100_key")
+        if any(point.interpolation != "LINEAR" for point in keyframes):
+            reasons.append("non_linear_interpolation")
+        if any(
+            not math.isfinite(float(value))
+            for point in keyframes
+            for value in point.co
+        ):
+            reasons.append("nonfinite_keyframe")
+        if reasons:
+            reason_counts.update(reasons)
+            invalid.append(
+                {
+                    "data_path": fcurve.data_path,
+                    "array_index": fcurve.array_index,
+                    "frames": frames,
+                    "interpolation": sorted(
+                        {point.interpolation for point in keyframes}
+                    ),
+                    "reasons": reasons,
+                }
+            )
+
+    action_range = [float(value) for value in action.frame_range]
+    range_valid = all(
+        abs(actual - expected) <= FLOAT_EPSILON
+        for actual, expected in zip(action_range, EXPECTED_FRAME_RANGE)
+    )
+    if not range_valid:
+        reason_counts["invalid_action_frame_range"] += 1
+    if not fcurves:
+        reason_counts["missing_pose_transform_fcurves"] += 1
+
+    return {
+        "rig": rig.name,
+        "action": action.name,
+        "slot": action_slot.identifier,
+        "slot_handle": action_slot.handle,
+        "action_frame_range": action_range,
+        "expected_action_frame_range": list(EXPECTED_FRAME_RANGE),
+        "transform_fcurves": len(fcurves),
+        "invalid_transform_fcurves": len(invalid),
+        "invalid_reason_counts": dict(sorted(reason_counts.items())),
+        "invalid_samples": invalid[:REPORT_SAMPLE_LIMIT],
+        "valid": bool(fcurves) and not invalid and range_valid,
+    }
+
+
+def matrix_is_finite(matrix: Any) -> bool:
+    return all(math.isfinite(float(value)) for row in matrix for value in row)
+
+
+def matrix_identity_delta(matrix: Any) -> float:
+    return max(
+        abs(float(matrix[row][column]) - (1.0 if row == column else 0.0))
+        for row in range(4)
+        for column in range(4)
+    )
+
+
+def audit_pose_frames(
+    scene: bpy.types.Scene,
+    intended_rigs: Iterable[bpy.types.Object],
+    camera: bpy.types.Object | None,
+    character_meshes: list[bpy.types.Object],
+) -> dict[str, Any]:
+    rigs = sorted(intended_rigs, key=lambda item: item.name)
+    original_frame = scene.frame_current
+    original_subframe = scene.frame_subframe
+    frame_reports: dict[str, Any] = {}
+    framing_by_frame: dict[str, Any] = {}
+
+    try:
+        for frame in EXPECTED_POSE_FRAMES:
+            scene.frame_set(frame)
+            bpy.context.view_layer.update()
+            nonfinite_bones: list[dict[str, Any]] = []
+            nonidentity_rest_bones: list[dict[str, Any]] = []
+            checked_bones = 0
+            for rig in rigs:
+                if rig.pose is None:
+                    continue
+                for pose_bone in rig.pose.bones:
+                    checked_bones += 1
+                    basis_finite = matrix_is_finite(pose_bone.matrix_basis)
+                    pose_matrix_finite = matrix_is_finite(pose_bone.matrix)
+                    if not basis_finite or not pose_matrix_finite:
+                        nonfinite_bones.append(
+                            {
+                                "armature": rig.name,
+                                "bone": pose_bone.name,
+                                "matrix_basis_finite": basis_finite,
+                                "pose_matrix_finite": pose_matrix_finite,
+                            }
+                        )
+                        continue
+                    if frame == EXPECTED_FRAME_RANGE[0]:
+                        delta = matrix_identity_delta(pose_bone.matrix_basis)
+                        if delta > FLOAT_EPSILON:
+                            nonidentity_rest_bones.append(
+                                {
+                                    "armature": rig.name,
+                                    "bone": pose_bone.name,
+                                    "maximum_identity_delta": round(delta, 8),
+                                }
+                            )
+            frame_reports[str(frame)] = {
+                "checked_bones": checked_bones,
+                "finite": not nonfinite_bones,
+                "nonfinite_bones": nonfinite_bones,
+                "rest_identity": (
+                    not nonidentity_rest_bones
+                    if frame == EXPECTED_FRAME_RANGE[0]
+                    else None
+                ),
+                "nonidentity_rest_bones": nonidentity_rest_bones,
+            }
+            framing_by_frame[str(frame)] = camera_framing(
+                scene,
+                camera,
+                character_meshes,
+            )
+    finally:
+        scene.frame_set(original_frame, subframe=original_subframe)
+        bpy.context.view_layer.update()
+
+    return {
+        "original_frame": original_frame + original_subframe,
+        "expected_current_frame": EXPECTED_FRAME_RANGE[1],
+        "frames": frame_reports,
+        "camera_framing": framing_by_frame,
+    }
+
+
 def audit_studio(
     scene: bpy.types.Scene,
     setup_collection: bpy.types.Collection | None,
     character_meshes: list[bpy.types.Object],
+    framing_by_frame: dict[str, Any],
 ) -> dict[str, Any]:
     setup_objects = collection_objects(setup_collection)
     tagged_cameras = [
@@ -348,7 +621,7 @@ def audit_studio(
     ]
 
     active_camera = scene.camera
-    framing = camera_framing(scene, active_camera, character_meshes)
+    framing = framing_by_frame.get(str(EXPECTED_FRAME_RANGE[1]), {})
     render = scene.render
     image_settings = render.image_settings
     render_checks = {
@@ -414,8 +687,14 @@ def audit_studio(
         },
         "frame_range": {
             "actual": [scene.frame_start, scene.frame_end],
-            "expected": [0, 0],
-            "valid": [scene.frame_start, scene.frame_end] == [0, 0],
+            "expected": list(EXPECTED_FRAME_RANGE),
+            "valid": [scene.frame_start, scene.frame_end] == list(EXPECTED_FRAME_RANGE),
+        },
+        "current_frame": {
+            "actual": scene.frame_current_final,
+            "expected": EXPECTED_FRAME_RANGE[1],
+            "valid": abs(scene.frame_current_final - EXPECTED_FRAME_RANGE[1])
+            <= FLOAT_EPSILON,
         },
         "units": {
             "actual": [
@@ -469,6 +748,7 @@ def audit_studio(
         ],
         "render_checks": render_checks,
         "framing": framing,
+        "framing_by_frame": framing_by_frame,
     }
 
 
@@ -504,6 +784,21 @@ def main() -> int:
     setup_objects = collection_objects(setup_collection)
     intended_rigs = {obj for obj in rig_objects if obj.type == "ARMATURE"}
     character_meshes = [obj for obj in mesh_objects if obj.type == "MESH"]
+    intended_custom_shape_assignments = bone_custom_shape_assignments(intended_rigs)
+    viewport_overlays = audit_saved_view3d_overlays()
+    rig_action_reports = [
+        audit_rig_action(rig) for rig in sorted(intended_rigs, key=lambda item: item.name)
+    ]
+    pose_control = audit_pose_frames(
+        scene,
+        intended_rigs,
+        scene.camera,
+        character_meshes,
+    )
+    actual_timeline_markers = sorted(
+        ((marker.name, marker.frame) for marker in scene.timeline_markers),
+        key=lambda item: (item[1], item[0]),
+    )
 
     mesh_reports = [
         audit_mesh(
@@ -519,7 +814,12 @@ def main() -> int:
     armature_reports = [audit_armature(obj) for obj in all_armatures]
     material_reports = [audit_material(material) for material in bpy.data.materials]
     image_reports = [audit_image(image) for image in bpy.data.images]
-    studio = audit_studio(scene, setup_collection, character_meshes)
+    studio = audit_studio(
+        scene,
+        setup_collection,
+        character_meshes,
+        pose_control["camera_framing"],
+    )
 
     issues: dict[str, Any] = {}
     append_issue(issues, "missing_rig_collection", rig_collection is None)
@@ -540,6 +840,78 @@ def main() -> int:
         issues,
         "custom_bone_shapes_in_character_collection",
         sorted(obj.name for obj in custom_shapes if obj in character_meshes),
+    )
+    append_issue(
+        issues,
+        "invalid_intended_rig_viewport_display",
+        {
+            rig.name: {
+                "actual": {
+                    "display_type": rig.data.display_type,
+                    "show_bone_custom_shapes": rig.data.show_bone_custom_shapes,
+                    "show_axes": rig.data.show_axes,
+                    "show_names": rig.data.show_names,
+                },
+                "expected": {
+                    "display_type": "STICK",
+                    "show_bone_custom_shapes": False,
+                    "show_axes": False,
+                    "show_names": False,
+                },
+            }
+            for rig in sorted(intended_rigs, key=lambda item: item.name)
+            if rig.data.display_type != "STICK"
+            or rig.data.show_bone_custom_shapes
+            or rig.data.show_axes
+            or rig.data.show_names
+        },
+    )
+    append_issue(
+        issues,
+        "intended_rig_custom_shape_assignments",
+        intended_custom_shape_assignments,
+    )
+    append_issue(
+        issues,
+        "invalid_pose_control_actions",
+        [report for report in rig_action_reports if not report["valid"]],
+    )
+    append_issue(
+        issues,
+        "invalid_timeline_markers",
+        (
+            {
+                "actual": [list(item) for item in actual_timeline_markers],
+                "expected": [list(item) for item in EXPECTED_TIMELINE_MARKERS],
+            }
+            if actual_timeline_markers != list(EXPECTED_TIMELINE_MARKERS)
+            else None
+        ),
+    )
+    frame_zero_report = pose_control["frames"].get(str(EXPECTED_FRAME_RANGE[0]), {})
+    append_issue(
+        issues,
+        "nonidentity_xiv_a_pose_bones",
+        frame_zero_report.get("nonidentity_rest_bones", []),
+    )
+    append_issue(
+        issues,
+        "nonfinite_pose_bone_matrices",
+        {
+            frame: report["nonfinite_bones"]
+            for frame, report in pose_control["frames"].items()
+            if report["nonfinite_bones"]
+        },
+    )
+    append_issue(
+        issues,
+        "missing_saved_view3d_overlays",
+        len(viewport_overlays) == 0,
+    )
+    append_issue(
+        issues,
+        "invalid_saved_view3d_overlays",
+        [report for report in viewport_overlays if not report["valid"]],
     )
     append_issue(
         issues,
@@ -702,6 +1074,15 @@ def main() -> int:
         "character_outside_camera_frame",
         not studio["framing"]["all_bounds_in_frame"],
     )
+    append_issue(
+        issues,
+        "character_outside_camera_frame_at_pose_frames",
+        {
+            frame: framing
+            for frame, framing in studio["framing_by_frame"].items()
+            if not framing.get("all_bounds_in_frame", False)
+        },
+    )
 
     build_report_name = scene.get("xivblend_build_report_text")
     append_issue(
@@ -758,6 +1139,11 @@ def main() -> int:
             ),
             "validation": scene.get("xivblend_validation"),
             "frame_range": [scene.frame_start, scene.frame_end],
+            "current_frame": scene.frame_current_final,
+            "timeline_markers": [
+                {"name": name, "frame": frame}
+                for name, frame in actual_timeline_markers
+            ],
             "render_engine": scene.render.engine,
             "resolution": [
                 scene.render.resolution_x,
@@ -776,6 +1162,9 @@ def main() -> int:
             "meshes": len(all_meshes),
             "character_meshes": len(character_meshes),
             "custom_bone_shapes": len(custom_shapes),
+            "custom_bone_shape_assignments": len(
+                intended_custom_shape_assignments
+            ),
             "scene_setup_meshes": len(
                 [obj for obj in all_meshes if obj in setup_objects]
             ),
@@ -792,6 +1181,10 @@ def main() -> int:
             for collection in bpy.data.collections
         },
         "armatures": armature_reports,
+        "custom_bone_shape_assignments": intended_custom_shape_assignments,
+        "pose_control": pose_control,
+        "rig_actions": rig_action_reports,
+        "viewport_overlays": viewport_overlays,
         "actions": [
             {
                 "name": action.name,

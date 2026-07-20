@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.4 has passed offline build, offline inspection of a previously captured live export, and Blender validation, but still needs broader in-game testing. Animations are deliberately deferred.
+> **Prototype status:** version 0.0.5 has passed the release build, Blender reopen checks, and an offline end-to-end test using a previously captured local live-character export. Broader in-game coverage is still pending. The FFXIV animation library remains deliberately deferred.
 
 ## What it exports
 
@@ -13,7 +13,7 @@ The one-button prototype reads the final live draw object after Glamourer and Pe
 - Final Penumbra-resolved model, material, and texture data from the live draw object.
 - Glamourer state and Penumbra resource-path diagnostics when their IPC APIs are available.
 - Skeleton, skin weights, morphs, material colorsets, custom character colors, and textures.
-- A Blender 5.x scene with a rig, organized collections, a portrait camera, removable studio backdrop, three-point lighting, mapped FFXIV materials, packed images, redacted provenance, and an embedded build report.
+- A Blender 5.x scene with a clean stick rig, organized collections, a portrait camera, removable studio backdrop, three-point lighting, mapped FFXIV materials, packed images, redacted provenance, an embedded build report, and a script-free A-pose/captured-pose Timeline slider.
 
 XivBlend rejects an export as incomplete when a visible model or material fails, or when Blender cannot verify a mesh bound to the imported armature.
 
@@ -64,19 +64,27 @@ Every click creates a new timestamped folder. Earlier exports are never overwrit
 
 The `.blend` contains redacted provenance, but it is not anonymous: its filename, rig, material, and texture names may still identify the character or mods. The sidecars—especially `xivblend-manifest.json`, `*-meddle.json`, glTF/bin, and `cache`—can contain the character name, raw Glamourer state, absolute mod paths, and mod assets. Do not upload the whole folder. Review and redact anything shared in a bug report, and never upload paid mod files.
 
+## Using the generated Blender file
+
+- The file opens on Timeline frame 100, labeled `CAPTURED POSE`. Drag the ordinary Blender Timeline to frame 0, labeled `XIV A-POSE`, for the rig's standard rest A-pose; frames between them blend linearly. This control is stored as normal keyframes and requires no add-on, embedded script, or trusted-script permission.
+- The apparent blocky rig in earlier exports was caused by glTF-imported Icosphere custom bone shapes overriding Blender's `STICK` display. New files disable those widgets and show the clean stick armature by default.
+- Viewport grid, coordinate axes, relationship lines, camera, and light helpers are hidden by default. The camera and three studio lights remain active for F12 renders.
+- Native glTF rest matrices, bind transforms, and bone axes are preserved; the pose slider does not remap the rig. For an FBX round trip, use Primary Bone Axis `X` and Secondary Bone Axis `Y` at the FBX export/import boundary only.
+- Existing `.blend` files are not retroactively changed. Export again with 0.0.5 to receive these defaults.
+
 ## Verified so far
 
 - The Dalamud API 15 / .NET 10 release build completes with zero warnings and errors.
 - The Blender worker and pinned MeddleTools assets are embedded inside the plugin DLL and extract without path traversal or embedded Python bytecode/cache artifacts.
 - Blender 5.0 imports and reopens a rigged body-and-clothing fixture.
-- The reopened scene retains its armature, bound body/clothes meshes, mapped materials, packed textures, portrait camera, studio lights/backdrop, redacted provenance, and embedded build report.
+- The reopened scene retains its armature, bound body/clothes meshes, mapped materials, packed textures, portrait camera, render-active studio lights/backdrop, redacted provenance, embedded build report, clean viewport defaults, and the frame 0-to-100 pose slider.
 - The Windows x64 release package carries the plugin dependencies and visible AGPL license/notice files.
 
 The remaining important validation is real-world live FFXIV exports across different races, bodies, equipment, and mod combinations. Game updates can also change the native structures used by the extractor.
 
 ## Prototype limitations
 
-- No animation Actions or FFXIV animation library yet.
+- No FFXIV emote/action animation library yet; the two-endpoint A-pose/captured-pose Timeline control is included.
 - No cloth/hair physics, material animation, VFX, or sound conversion.
 - Mounts, ornaments, companions, and hidden weapons are excluded.
 - Materials are close translations of FFXIV shader data, not pixel-identical copies of the game renderer.
