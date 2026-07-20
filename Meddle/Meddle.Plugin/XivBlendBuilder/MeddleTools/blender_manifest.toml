@@ -1,0 +1,21 @@
+schema_version = "0.0.1"
+
+id = "meddle_tools"
+version = "0.1.10"
+name = "Meddle Tools"
+tagline = "Automatically setup FFXIV Meddle shaders and objects in Blender"
+maintainer = "PassiveModding"
+type = "add-on"
+website = "https://github.com/PassiveModding/MeddleTools"
+
+tags = ["Material"]
+
+blender_version_min = "4.5.0"
+
+license = [
+  "SPDX:AGPL-3.0-or-later",
+]
+
+[permissions]
+files = "Import files from meddle cache directory"
+network = "Checking for and downloading updates, can disable" 

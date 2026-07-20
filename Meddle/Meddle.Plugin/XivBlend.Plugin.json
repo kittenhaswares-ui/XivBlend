@@ -1,0 +1,13 @@
+{
+    "Author": "kittenhaswares-ui; based on PassiveModding/Meddle",
+    "Name": "XivBlend Prototype",
+    "Punchline": "Export your own live character to a packed Blender file.",
+    "Description": "Self-only one-button Blender export prototype built on Meddle's AGPL extractor.",
+    "InternalName": "XivBlend.Plugin",
+    "ApplicableVersion": "any",
+    "Tags": [
+        "model",
+        "blender",
+        "exporting"
+    ]
+}

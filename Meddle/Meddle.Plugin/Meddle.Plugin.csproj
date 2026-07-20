@@ -1,0 +1,71 @@
+﻿<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+    <PropertyGroup>
+        <Version>0.0.2</Version>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>Meddle.Plugin</RootNamespace>
+        <AssemblyName>XivBlend.Plugin</AssemblyName>
+        <LangVersion>14</LangVersion>
+        <TargetFramework>net10.0-windows</TargetFramework>
+        <!-- FFXIV/Dalamud is Windows x64. Pinning the RID prevents NuGet from
+             shipping unused macOS, x86 and ARM native libraries. -->
+        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <SelfContained>false</SelfContained>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.1" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.1" />
+        <PackageReference Include="Vortice.Direct3D11" Version="3.8.1" />       
+        <Reference Include="OtterTex">
+            <HintPath>..\Meddle.Utils\Lib\OtterTex.dll</HintPath>
+        </Reference>
+        <PackageReference Update="DalamudPackager" Version="15.0.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Meddle.Utils\Meddle.Utils.csproj"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- Dalamud's package contains the plugin DLL and managed dependencies.
+             Embedding the worker keeps the one-button Blender pipeline inside that
+             package; it is extracted to the plugin's private config directory. -->
+        <EmbeddedResource Include="XivBlendBuilder\**\*"
+                          Exclude="XivBlendBuilder\**\__pycache__\**;XivBlendBuilder\**\*.pyc;XivBlendBuilder\**\*.blend1">
+            <LogicalName>XivBlendBuilder/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
+        </EmbeddedResource>
+
+        <!-- Keep the license and prototype attribution visible at the root of
+             the Dalamud release zip, in addition to the worker's embedded
+             third-party notices. -->
+        <Content Include="..\..\LICENSE.txt" Link="LICENSE.txt">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </Content>
+        <Content Include="..\..\NOTICE-XIVBLEND.md" Link="NOTICE-XIVBLEND.md">
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+            <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        </Content>
+    </ItemGroup>
+
+    <PropertyGroup>
+        <Use_Custom_ClientStructs>false</Use_Custom_ClientStructs>
+        <CustomClientStructsPath>..\..\..\FFXIVClientStructs</CustomClientStructsPath>
+    </PropertyGroup>
+    <ItemGroup Condition="$(Use_Custom_ClientStructs) == false">
+        <Reference Include="InteropGenerator.Runtime" Private="false" />
+        <Reference Include="FFXIVClientStructs" Private="false" />
+    </ItemGroup>
+    <PropertyGroup Condition="$(Use_Custom_ClientStructs) == true">
+        <Use_Dalamud_FFXIVClientStructs>false</Use_Dalamud_FFXIVClientStructs>
+        <InteropGenerator_InteropNamespace>MeddlePlugin</InteropGenerator_InteropNamespace>
+        <DefineConstants>HAS_LOCAL_CS</DefineConstants>
+    </PropertyGroup>
+    <ItemGroup Condition="$(Use_Custom_ClientStructs) == true">
+        <CompilerVisibleProperty Include="InteropGenerator_InteropNamespace" />
+        <ProjectReference Include="$(CustomClientStructsPath)\InteropGenerator\InteropGenerator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+        <ProjectReference Include="$(CustomClientStructsPath)\FFXIVClientStructs\FFXIVClientStructs.csproj" Private="True" />
+        <ProjectReference Include="$(CustomClientStructsPath)\InteropGenerator.Runtime\InteropGenerator.Runtime.csproj" Private="True" />
+    </ItemGroup>
+</Project>
