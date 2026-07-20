@@ -11,4 +11,4 @@ XivBlend's prototype-specific orchestration, self-only UI, IPC manifest capture 
 
 The complete corresponding modified source for this prototype is published at `https://github.com/kittenhaswares-ui/XivBlend`. Release binaries are built from that repository and must remain accompanied by this source and the applicable AGPL notices.
 
-This is experimental software and has not been tested inside the user's live FFXIV client yet.
+This is experimental software with limited live-client testing; broader character, equipment, and mod coverage is still required.

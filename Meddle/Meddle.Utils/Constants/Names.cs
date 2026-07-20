@@ -104,25 +104,6 @@ public static class Names
             }
 
             Constants = buffer;
-            
-            void AddEnumConstants<T>() where T : struct, Enum
-            {
-                var values = Enum.GetValues<T>();
-                foreach (var value in values)
-                {
-                    ICrcPair name = new Name(value.ToString());
-                    if (name.Crc != (uint)(object)value)
-                    {
-                        name = new StubName(value.ToString(), (uint)(object)value);
-                    }
-                    
-                    // Using tryadd because we dont want to override the name if it already exists
-                    if (!buffer.ContainsKey(name.Crc))
-                    {
-                        buffer[name.Crc] = name;
-                    }
-                }
-            }
         }
         
         return Constants;

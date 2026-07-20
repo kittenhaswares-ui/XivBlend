@@ -26,13 +26,19 @@ public class CharacterComposer
     {
         public int ExpectedVisibleModels { get; internal set; }
         public int ExportedVisibleModels { get; internal set; }
+        public int NonRenderableModelsSkipped { get; internal set; }
+        public int KnownDummyModelsSkipped { get; internal set; }
         public int DisabledModelsSkipped { get; internal set; }
         public int MaterialFailures { get; internal set; }
+        public int NullMaterialMeshesSkipped { get; internal set; }
+        public List<string> SkippedModels { get; } = [];
+        public List<string> SkippedMaterialMeshes { get; } = [];
         public List<string> Failures { get; } = [];
 
         public bool IsComplete =>
             ExpectedVisibleModels > 0
-            && ExportedVisibleModels == ExpectedVisibleModels
+            && ExportedVisibleModels > 0
+            && ExportedVisibleModels + NonRenderableModelsSkipped == ExpectedVisibleModels
             && Failures.Count == 0;
 
         internal void AddFailure(string message)
@@ -50,6 +56,15 @@ public class CharacterComposer
     private readonly Dictionary<ParsedCharacterInfo, Dictionary<string, MaterialBuilder>> materialCache = new();
 
     public CompositionReport Report { get; } = new();
+
+    private static bool IsKnownNonRenderableGameModel(string gamePath, string fullPath)
+    {
+        var normalizedGamePath = gamePath.Replace('\\', '/');
+        var normalizedFullPath = fullPath.Replace('\\', '/');
+        return normalizedGamePath.Equals(normalizedFullPath, StringComparison.OrdinalIgnoreCase)
+               && normalizedGamePath.Contains("/obj/body/b0003/model/", StringComparison.OrdinalIgnoreCase)
+               && normalizedGamePath.EndsWith("_top.mdl", StringComparison.OrdinalIgnoreCase);
+    }
 
     public CharacterComposer(ComposerCache composerCache, Configuration.ExportConfiguration exportConfig, CancellationToken cancellationToken)
     {
@@ -70,6 +85,16 @@ public class CharacterComposer
     
     private void HandleModel(ParsedCharacterInfo characterInfo, ParsedModelInfo m, SceneBuilder scene, SkinningContext skinningContext)
     {
+        // FFXIV keeps a low-detail b0003 body proxy on the live draw object. It
+        // is not part of the rendered character, but exporting it produces an
+        // opaque featureless shell over the face and body in Blender.
+        if (IsKnownNonRenderableGameModel(m.Path.GamePath, m.Path.FullPath))
+        {
+            Plugin.Logger.LogInformation("Skipping known non-renderable body proxy {ModelPath}", m.Path.GamePath);
+            Report.KnownDummyModelsSkipped++;
+            return;
+        }
+
         if (!m.Enabled && exportConfig.ApplyVisibilityFlags)
         {
             Plugin.Logger.LogDebug("Skipping disabled model {ModelPath}", m.Path.GamePath);
@@ -81,13 +106,13 @@ public class CharacterComposer
         
         var mdlFile = composerCache.GetMdlFile(m.Path.FullPath);
         Plugin.Logger.LogInformation("Loaded model {modelPath}", m.Path.FullPath);
-        var materialBuilders = new MaterialBuilder[m.Materials.Length];
+        var materialBuilders = new MaterialBuilder?[m.Materials.Length];
         for (int i = 0; i < m.Materials.Length; i++)
         {
             var materialInfo = m.Materials[i];
             if (materialInfo == null)
             {
-                materialBuilders[i] = new MaterialBuilder("null");
+                materialBuilders[i] = null;
                 continue;
             }
             
@@ -105,9 +130,11 @@ public class CharacterComposer
                 }
                 else
                 {
+                    // Do not cache this result yet: the legacy hash omits live
+                    // render overrides such as decals and skin texture swaps.
                     materialBuilders[i] = composerCache.ComposeMaterial(materialInfo.Path.FullPath,
-                                                                        materialInfo: materialInfo,
-                                                                        characterInfo: characterInfo);
+                                                                         materialInfo: materialInfo,
+                                                                         characterInfo: characterInfo);
                 }
             }
             catch (Exception e)
@@ -117,7 +144,7 @@ public class CharacterComposer
                                             MaterialComposer.JsonOptions));
                 Report.MaterialFailures++;
                 Report.AddFailure($"Material {materialInfo.Path.GamePath} failed for model {m.Path.GamePath}: {e.Message}");
-                materialBuilders[i] = new MaterialBuilder("error");
+                materialBuilders[i] = null;
             }
         }
 
@@ -155,10 +182,52 @@ public class CharacterComposer
         }
 
         var enabledAttributes = Model.GetEnabledValues(model.EnabledAttributeMask, model.AttributeMasks).ToArray();
-        var meshes = ModelBuilder.BuildMeshes(model, materialBuilders, skinningContext.Bones, deform, exportConfig.CreateMeshBuilderOptions());
+        bool HasVisibleTriangles(Meddle.Utils.Export.Mesh sourceMesh)
+        {
+            if (sourceMesh.Vertices.Count == 0 || sourceMesh.Indices.Count < 3)
+            {
+                return false;
+            }
+
+            if (sourceMesh.SubMeshes.Count == 0 || !exportConfig.ApplyVisibilityFlags)
+            {
+                return true;
+            }
+
+            return sourceMesh.SubMeshes.Any(
+                subMesh => subMesh.IndexCount >= 3
+                           && subMesh.Attributes.All(attribute => enabledAttributes.Contains(attribute)));
+        }
+
+        var meshes = ModelBuilder.BuildMeshes(
+            model,
+            materialBuilders,
+            skinningContext.Bones,
+            deform,
+            exportConfig.CreateMeshBuilderOptions(),
+            (materialIndex, meshIndex, invalidIndex) =>
+            {
+                Report.NullMaterialMeshesSkipped++;
+                var message = $"{m.Path.GamePath} mesh {meshIndex} material slot {materialIndex}";
+                if (!Report.SkippedMaterialMeshes.Contains(message, StringComparer.Ordinal))
+                {
+                    Report.SkippedMaterialMeshes.Add(message);
+                }
+
+                var affectedMesh = model.Meshes.FirstOrDefault(mesh => mesh.MeshIdx == meshIndex);
+                if (invalidIndex && affectedMesh is not null && HasVisibleTriangles(affectedMesh))
+                {
+                    Report.AddFailure($"Model {m.Path.GamePath} mesh {meshIndex} referenced invalid material slot {materialIndex}.");
+                }
+            });
         var exportedMeshes = 0;
         foreach (var meshExport in meshes)
         {
+            if (!meshExport.Mesh.Primitives.Any(primitive => primitive.Triangles.Count > 0))
+            {
+                continue;
+            }
+
             var extrasDict = new Dictionary<string, string>
             {
                 {"modelGamePath", m.Path.GamePath},
@@ -240,7 +309,11 @@ public class CharacterComposer
 
         if (exportedMeshes == 0)
         {
-            Report.AddFailure($"Visible model {m.Path.GamePath} produced no exportable meshes.");
+            Report.NonRenderableModelsSkipped++;
+            Report.SkippedModels.Add(m.Path.GamePath);
+            Plugin.Logger.LogInformation(
+                "Skipping non-renderable model {ModelPath}; it produced no visible triangles",
+                m.Path.GamePath);
             return;
         }
 

@@ -19,10 +19,11 @@ public static class ModelBuilder
     
     public static IReadOnlyList<MeshExport> BuildMeshes(
         Model model,
-        IReadOnlyList<MaterialBuilder> materials,
+        IReadOnlyList<MaterialBuilder?> materials,
         IReadOnlyList<BoneNodeBuilder>? boneMap,
         (GenderRace fromDeform, GenderRace toDeform, RaceDeformer deformer)? raceDeformer,
-        MeshBuilderOptions? options = null)
+        MeshBuilderOptions? options = null,
+        Action<int, int, bool>? onMissingMaterial = null)
     {
         var meshes = new List<MeshExport>();
 
@@ -43,22 +44,28 @@ public static class ModelBuilder
             MaterialBuilder material;
             if (mesh.MaterialIdx >= materials.Count)
             {
-                if (materials.Count != 0)
-                {
-                    Global.Logger.LogWarning("[{Path}] Mesh {MeshIdx} has invalid material index {MaterialIdx}",
-                                             model.HandlePath,
-                                             mesh.MeshIdx,
-                                             mesh.MaterialIdx);
-                    material = materials.FirstOrDefault(new MaterialBuilder($"{modelPathName}_{mesh.MeshIdx}_{mesh.MaterialIdx}_fallback"));
-                }
-                else
-                {
-                    material = new MaterialBuilder($"{modelPathName}_{mesh.MeshIdx}_{mesh.MaterialIdx}_empty");
-                }
+                Global.Logger.LogWarning("[{Path}] Skipping mesh {MeshIdx} with invalid material index {MaterialIdx}",
+                                         model.HandlePath,
+                                         mesh.MeshIdx,
+                                         mesh.MaterialIdx);
+                onMissingMaterial?.Invoke(mesh.MaterialIdx, mesh.MeshIdx, true);
+                continue;
             }
             else
             {
-                material = materials[mesh.MaterialIdx];
+                var resolvedMaterial = materials[mesh.MaterialIdx];
+                if (resolvedMaterial is null)
+                {
+                    Global.Logger.LogWarning(
+                        "[{Path}] Skipping mesh {MeshIdx} because material slot {MaterialIdx} is not loaded",
+                        model.HandlePath,
+                        mesh.MeshIdx,
+                        mesh.MaterialIdx);
+                    onMissingMaterial?.Invoke(mesh.MaterialIdx, mesh.MeshIdx, false);
+                    continue;
+                }
+
+                material = resolvedMaterial;
             }
             
             if (mesh.BoneTable != null && boneMap != null)

@@ -73,6 +73,7 @@ public sealed class QuickBlendExportTab : ITab
         }
 
         ImGui.Separator();
+        ImGui.TextDisabled("Each export is saved in a new timestamped folder; existing exports are never overwritten.");
         ImGui.TextDisabled("Prototype scope: static rigged character only; animation export is intentionally deferred.");
 
         fileDialog.Draw();

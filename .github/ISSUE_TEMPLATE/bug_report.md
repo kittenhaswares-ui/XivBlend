@@ -27,6 +27,6 @@ Describe the visible problem and include the exact red error shown by XivBlend.
 
 ## Diagnostics
 
-Attach a **redacted** `xivblend-export-report.json` if one was created. Diagnostic files can contain the character name and local mod paths; remove those before uploading.
+Attach only a **reviewed and redacted** `xivblend-export-report.json` if one was created, plus the relevant error text.
 
-Do not attach game files, paid mod files, authentication data, or an unredacted Glamourer state.
+Do not upload `xivblend-manifest.json`, `*-meddle.json`, glTF/bin files, the `cache` directory, or the whole export folder. They can contain the character name, raw Glamourer state, absolute mod paths, game files, and mod assets. Never attach paid mod files or authentication data.

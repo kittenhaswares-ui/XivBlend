@@ -140,8 +140,9 @@ public sealed class QuickBlendExportService : IService, IDisposable
             exportConfig.ExportType = ExportType.GLTF;
 
             var safeName = characterName.SanitizeFileName();
-            var timestamp = DateTime.Now.ToString("yyyy-MM-dd-HH-mm-ss");
-            var outputDirectory = Path.Combine(configuration.ExportDirectory, $"XivBlend-{safeName}-{timestamp}");
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd-HH-mm-ss-fff");
+            var outputBaseName = $"XivBlend-{safeName}-{timestamp}";
+            var outputDirectory = ReserveUniqueOutputDirectory(configuration.ExportDirectory, outputBaseName);
 
             exportTask = Task.Run(
                 () => ExportCapturedCharacter(characterInfo, snapshot, exportConfig, outputDirectory, safeName),
@@ -154,6 +155,95 @@ public sealed class QuickBlendExportService : IService, IDisposable
             Status = "Export could not start.";
             log.LogError(exception, "XivBlend export capture failed");
             return false;
+        }
+    }
+
+    private static string ReserveUniqueOutputDirectory(string exportRoot, string outputBaseName)
+    {
+        Directory.CreateDirectory(exportRoot);
+
+        // Build the reservation under a private, practically unique name first.
+        // Moving a directory within the same parent is atomic on Windows and
+        // fails when the destination already exists, so we never adopt or write
+        // into a directory created by another process between a check and use.
+        var stagingPath = Path.Combine(
+            exportRoot,
+            $".xivblend-reservation-{Guid.NewGuid():N}");
+        var reservationPath = Path.Combine(stagingPath, ".xivblend-reserved");
+        var markerCreated = false;
+
+        try
+        {
+            Directory.CreateDirectory(stagingPath);
+            using (new FileStream(
+                       reservationPath,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None))
+            {
+                markerCreated = true;
+            }
+
+            try
+            {
+                File.SetAttributes(reservationPath, FileAttributes.Hidden);
+            }
+            catch (IOException)
+            {
+                // The marker remains permanent even if it cannot be hidden.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // The marker remains permanent even if it cannot be hidden.
+            }
+
+            for (var collision = 1; collision <= 10_000; collision++)
+            {
+                var candidateName = collision == 1 ? outputBaseName : $"{outputBaseName}-{collision}";
+                var candidatePath = Path.Combine(exportRoot, candidateName);
+                if (Directory.Exists(candidatePath) || File.Exists(candidatePath))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Directory.Move(stagingPath, candidatePath);
+                    return candidatePath;
+                }
+                catch (IOException) when (
+                    Directory.Exists(candidatePath) || File.Exists(candidatePath))
+                {
+                    // Another exporter won the atomic move. Try the next suffix.
+                }
+            }
+
+            throw new IOException("Could not reserve a unique XivBlend export directory after 10,000 attempts.");
+        }
+        catch
+        {
+            // Best-effort cleanup of only the private directory created above.
+            // Avoid recursive deletion: unexpected third-party content is left
+            // untouched rather than being removed with the reservation.
+            try
+            {
+                if (markerCreated)
+                {
+                    File.Delete(reservationPath);
+                }
+
+                Directory.Delete(stagingPath, recursive: false);
+            }
+            catch (IOException)
+            {
+                // Preserve the original reservation error.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Preserve the original reservation error.
+            }
+
+            throw;
         }
     }
 
@@ -300,7 +390,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         if (blenderPath is null)
         {
             throw new FileNotFoundException(
-                "Blender was not found. Set its path in the plugin configuration or install Blender 5.0 or newer.");
+                "Blender was not found. Set its path in the plugin configuration or install Blender 5.x.");
         }
 
         var builderDirectory = ExtractBuilderAssets();
@@ -435,7 +525,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
 
         var builderRoot = Path.GetFullPath(Path.Combine(
             pluginInterface.ConfigDirectory.FullName,
-            "XivBlendBuilder-0.1.0"));
+            "XivBlendBuilder-0.2.0"));
         Directory.CreateDirectory(builderRoot);
         var requiredPrefix = builderRoot + Path.DirectorySeparatorChar;
 
