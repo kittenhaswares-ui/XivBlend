@@ -3,10 +3,10 @@
     "Author": "kittenhaswares-ui; based on PassiveModding/Meddle",
     "Name": "XivBlend Prototype",
     "InternalName": "XivBlend.Plugin",
-    "Punchline": "Export your own live character to a packed Blender file.",
-    "Description": "Self-only one-button Blender export prototype built on Meddle's AGPL extractor.",
-    "AssemblyVersion": "0.0.5.0",
-    "TestingAssemblyVersion": "0.0.5.0",
+    "Punchline": "Export your character and preview vanilla emotes in Blender.",
+    "Description": "Self-only Blender export with a local, on-demand vanilla player-emote browser, built on Meddle's AGPL extractor.",
+    "AssemblyVersion": "0.0.6.0",
+    "TestingAssemblyVersion": "0.0.6.0",
     "RepoUrl": "https://github.com/kittenhaswares-ui/XivBlend",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
@@ -14,10 +14,11 @@
     "Tags": [
       "model",
       "blender",
-      "exporting"
+      "exporting",
+      "animation"
     ],
-    "DownloadLinkInstall": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.5/latest.zip",
-    "DownloadLinkTesting": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.5/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.5/latest.zip"
+    "DownloadLinkInstall": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.6/latest.zip",
+    "DownloadLinkTesting": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.6/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.6/latest.zip"
   }
 ]

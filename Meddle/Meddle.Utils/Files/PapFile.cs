@@ -24,14 +24,16 @@ public class PapFile
         Animations = reader.Read<PapAnimation>(FileHeader.AnimationCount).ToArray();
     }
 
+    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = 40)]
     public unsafe struct PapAnimation
     {
         public fixed byte Name[32];
         public ushort Type;
         public short HavokIndex;
-        public bool IsFace;
+        public int IsFaceRaw;
         
         public string GetName => GetNameString();
+        public bool IsFace => IsFaceRaw != 0;
         
         private string GetNameString()
         {

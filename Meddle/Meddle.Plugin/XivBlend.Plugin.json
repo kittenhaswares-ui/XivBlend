@@ -1,13 +1,14 @@
 {
     "Author": "kittenhaswares-ui; based on PassiveModding/Meddle",
     "Name": "XivBlend Prototype",
-    "Punchline": "Export your own live character to a packed Blender file.",
-    "Description": "Self-only one-button Blender export prototype built on Meddle's AGPL extractor.",
+    "Punchline": "Export your character and preview vanilla emotes in Blender.",
+    "Description": "Self-only Blender export with a local, on-demand vanilla player-emote browser, built on Meddle's AGPL extractor.",
     "InternalName": "XivBlend.Plugin",
     "ApplicableVersion": "any",
     "Tags": [
         "model",
         "blender",
-        "exporting"
+        "exporting",
+        "animation"
     ]
 }

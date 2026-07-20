@@ -135,7 +135,8 @@ public class SqPack : IDisposable
 
                 if (category.TryGetFile(hash.Index2Hash, fileType, out var data2))
                 {
-                    var descriptor = new SqPackFileDescriptor(repo, category, category.UnifiedIndexEntries[hash.Index2Hash].Hash, data, path);                    ResolveDescriptor(descriptor);
+                    var descriptor = new SqPackFileDescriptor(repo, category, category.UnifiedIndexEntries[hash.Index2Hash].Hash, data2, path);
+                    ResolveDescriptor(descriptor);
                     return descriptor;
                 }
             }

@@ -25,7 +25,8 @@ from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.3.0"
+BUILDER_VERSION = "0.4.0"
+ANIMATION_CATALOG_SCHEMA = 1
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
 README_TEXT_NAME = "README_XIVBLEND.txt"
@@ -1103,6 +1104,7 @@ def embed_manifest(
         "PenumbraResourcePaths", document.get("penumbra_resource_paths", {})
     )
     warnings = document.get("Warnings", document.get("warnings", []))
+    race_code, face_skeleton = read_animation_identity(document)
     summary = {
         "SchemaVersion": document.get(
             "SchemaVersion", document.get("schemaVersion", document.get("schema_version"))
@@ -1111,6 +1113,9 @@ def embed_manifest(
             "CapturedAtUtc", document.get("capturedAtUtc", document.get("captured_at_utc"))
         ),
         "Source": document.get("Source", document.get("source")),
+        "RaceCode": race_code,
+        "FaceSkeleton": face_skeleton,
+        "AnimationCatalogSchema": ANIMATION_CATALOG_SCHEMA,
         "GlamourerStateCaptured": bool(
             document.get(
                 "GlamourerStateBase64",
@@ -1141,6 +1146,11 @@ def embed_manifest(
     scene["xivblend_manifest_sha256_canonical"] = digest
     scene["xivblend_manifest_filename"] = manifest_path.name
     scene["xivblend_source_filename"] = source.name
+    scene["xivblend_animation_catalog_schema"] = ANIMATION_CATALOG_SCHEMA
+    if race_code is not None:
+        scene["xivblend_race_code"] = race_code
+    if face_skeleton is not None:
+        scene["xivblend_face_skeleton"] = face_skeleton
 
     # Preserve the original prototype keys for scripts that inspected 0.0.2/0.0.3.
     scene["clean_extract_builder"] = BUILDER_NAME
@@ -1154,6 +1164,51 @@ def embed_manifest(
     if isinstance(schema_value, (str, int, float)) and not isinstance(schema_value, bool):
         scene["xivblend_snapshot_schema"] = str(schema_value)[:128]
         scene["clean_extract_snapshot_schema"] = str(schema_value)[:128]
+
+
+def read_animation_identity(
+    document: dict[str, Any],
+) -> tuple[int | None, str | None]:
+    """Return only validated, path-free identifiers safe to embed in a .blend."""
+    raw_race = document.get(
+        "RaceCode", document.get("raceCode", document.get("race_code"))
+    )
+    if isinstance(raw_race, bool):
+        race_code = None
+    elif isinstance(raw_race, int):
+        race_code = raw_race
+    elif isinstance(raw_race, str) and re.fullmatch(r"\d{1,4}", raw_race.strip()):
+        race_code = int(raw_race.strip())
+    else:
+        race_code = None
+    if race_code is not None and not 1 <= race_code <= 9999:
+        race_code = None
+
+    raw_face = document.get(
+        "FaceSkeleton",
+        document.get("faceSkeleton", document.get("face_skeleton")),
+    )
+    face_skeleton = (
+        raw_face.strip().lower() if isinstance(raw_face, str) else None
+    )
+    if face_skeleton is not None and re.fullmatch(r"f\d{4}", face_skeleton) is None:
+        face_skeleton = None
+
+    return race_code, face_skeleton
+
+
+def apply_animation_identity(
+    scene: bpy.types.Scene,
+    primary_armature: bpy.types.Object,
+) -> None:
+    """Copy the safe animation lookup keys onto the add-on's primary target rig."""
+    for key in (
+        "xivblend_race_code",
+        "xivblend_face_skeleton",
+        "xivblend_animation_catalog_schema",
+    ):
+        if key in scene:
+            primary_armature[key] = scene[key]
 
 
 def write_embedded_readme() -> None:
@@ -1174,8 +1229,13 @@ def write_embedded_readme() -> None:
         "- Native glTF rest/bind axes are preserved. For an FBX round trip, choose Primary "
         "Bone Axis X and Secondary Bone Axis Y at the FBX import/export boundary; do not "
         "remap this Blender armature in place.\n"
-        "- Animation-library export is intentionally deferred; this prototype contains "
-        "only the captured pose-to-A-pose control.\n"
+        "- When the XivBlend Animation Browser add-on is installed, open the sidebar "
+        "with N and use XivBlend > Animations to search by the in-game emote icons.\n"
+        "- Animation clips are prepared on demand in XivBlend's shared local cache. The "
+        "catalog, game icons and game animation assets are not embedded in this file; only "
+        "an action you explicitly load is added to the character.\n"
+        "- The animation browser is deliberately limited to vanilla player emotes and "
+        "facial expressions. Combat actions, weapons and VFX are not included.\n"
         "- Textures used by the materials are packed into this file.\n"
         "- The external xivblend-manifest.json contains private character/mod paths and "
         "should not be shared casually. The embedded provenance is redacted.\n"
@@ -1964,6 +2024,7 @@ def main() -> None:
     pack_resources()
     redacted_properties = sanitize_packed_provenance(imported)
     primary_armature = select_primary_armature(armatures)
+    apply_animation_identity(scene, primary_armature)
     report = validate_output(
         collections,
         removed_vertex_groups,

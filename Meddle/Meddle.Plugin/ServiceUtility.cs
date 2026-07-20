@@ -14,6 +14,7 @@ public static class ServiceUtility
     {
         return services
                .AddSingleton<ITab, QuickBlendExportTab>()
+               .AddSingleton<ITab, AnimationLibraryTab>()
                .AddSingleton<MainWindow>()
                .AddSingleton(new WindowSystem("XivBlend"))
                .AddHostedService<WindowManager>();

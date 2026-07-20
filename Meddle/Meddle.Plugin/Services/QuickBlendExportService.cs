@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
@@ -24,6 +25,9 @@ public sealed class QuickBlendExportService : IService, IDisposable
 {
     private const string GlamourerStateLabel = "Glamourer.GetStateBase64";
     private const string PenumbraResourcePathsLabel = "Penumbra.GetGameObjectResourcePaths.V5";
+    private static readonly Regex FaceSkeletonFilePattern = new(
+        @"skl_(?<race>c\d{4})(?<face>f\d{4})\.sklb(?:$|[|?#&])",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     private readonly ILogger<QuickBlendExportService> log;
     private readonly IObjectTable objectTable;
@@ -114,6 +118,19 @@ public sealed class QuickBlendExportService : IService, IDisposable
             Status = "Capturing your live character...";
             var characterInfo = resolverService.ParseCharacter(character)
                 ?? throw new InvalidOperationException("The live character could not be resolved.");
+
+            var raceCode = checked((ushort)characterInfo.GenderRace);
+            var faceSkeleton = FindFaceSkeletonToken(characterInfo, raceCode);
+            snapshot = snapshot with
+            {
+                RaceCode = raceCode,
+                FaceSkeleton = faceSkeleton,
+                Warnings = faceSkeleton is null
+                    ? snapshot.Warnings.Append(
+                        "The captured face skeleton resource did not expose a standard fNNNN token; " +
+                        "facial animation browsing will be unavailable for this export.").ToArray()
+                    : snapshot.Warnings,
+            };
 
             var currentLocalPlayer = objectTable.LocalPlayer;
             if (currentLocalPlayer is null
@@ -286,15 +303,43 @@ public sealed class QuickBlendExportService : IService, IDisposable
         }
 
         return new SnapshotManifest(
-            SchemaVersion: 1,
+            SchemaVersion: 2,
             CapturedAtUtc: DateTimeOffset.UtcNow,
             CharacterName: characterName,
             ObjectIndex: objectIndex,
+            RaceCode: 0,
+            FaceSkeleton: null,
             Source: "LocalPlayer only",
             GlamourerErrorCode: glamourerErrorCode,
             GlamourerStateBase64: glamourerStateBase64,
             PenumbraResourcePaths: resourcePaths,
             Warnings: warnings);
+    }
+
+    private static string? FindFaceSkeletonToken(
+        Models.Layout.ParsedCharacterInfo characterInfo,
+        ushort raceCode)
+    {
+        var expectedRace = $"c{raceCode:D4}";
+        foreach (var partialSkeleton in characterInfo.Skeleton.PartialSkeletons)
+        {
+            if (string.IsNullOrWhiteSpace(partialSkeleton.HandlePath))
+            {
+                continue;
+            }
+
+            var match = FaceSkeletonFilePattern.Match(partialSkeleton.HandlePath);
+            if (match.Success
+                && string.Equals(
+                    match.Groups["race"].Value,
+                    expectedRace,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return match.Groups["face"].Value.ToLowerInvariant();
+            }
+        }
+
+        return null;
     }
 
     private void ExportCapturedCharacter(
@@ -525,7 +570,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
 
         var builderRoot = Path.GetFullPath(Path.Combine(
             pluginInterface.ConfigDirectory.FullName,
-            "XivBlendBuilder-0.3.0"));
+            "XivBlendBuilder-0.4.0"));
         Directory.CreateDirectory(builderRoot);
         var requiredPrefix = builderRoot + Path.DirectorySeparatorChar;
 
@@ -579,6 +624,8 @@ public sealed class QuickBlendExportService : IService, IDisposable
         DateTimeOffset CapturedAtUtc,
         string CharacterName,
         ushort ObjectIndex,
+        ushort RaceCode,
+        string? FaceSkeleton,
         string Source,
         int? GlamourerErrorCode,
         string? GlamourerStateBase64,

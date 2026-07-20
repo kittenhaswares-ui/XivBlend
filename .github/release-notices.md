@@ -1,28 +1,37 @@
-# XivBlend Prototype 0.0.5
+# XivBlend Prototype 0.0.6
 
-This release makes the generated Blender rig cleaner to inspect and adds a beginner-friendly, script-free pose control.
+This release adds an optional, beginner-friendly Blender browser for vanilla player emotes and facial expressions without embedding the complete animation library in every character file.
 
 ## Install
 
 Add the repository URL from the README to Dalamud's Custom Plugin Repositories, or download and extract `latest.zip` and add the exact `XivBlend.Plugin.dll` under Dev Plugin Locations.
 
-Disable the original Meddle plugin before loading XivBlend. Blender 5.x, Penumbra, and Glamourer are recommended.
+Disable the original Meddle plugin before loading XivBlend. Blender 5.x is required for character export; Penumbra and Glamourer are recommended for a modded appearance.
 
-## Current scope
+## Animation browser
 
-- Exports only the logged-in local player.
-- Includes visible body, face, hair, equipment, weapons, live materials/textures, morphs, skin weights, and rig.
-- Excludes the known non-rendering b0003 body proxy instead of placing an opaque shell over the character.
-- Creates a packed portrait-oriented Blender scene with fitted camera, three-point lighting, and a removable studio backdrop.
-- Disables the glTF-imported Icosphere custom bone widgets that overrode Blender's `STICK` setting and caused the apparent blocky armature. New files open with the clean stick rig visible.
-- Hides the viewport grid, coordinate axes, relationship lines, camera, and light helpers by default while keeping the camera and studio lights active for rendering.
-- Adds a normal Blender Timeline slider: frame 0 is labeled `XIV A-POSE`, frame 100 is labeled `CAPTURED POSE`, and the file opens at frame 100. It uses ordinary linear keyframes, so it needs no add-on or trusted embedded script.
-- Preserves the native glTF rest matrices, bind transforms, and bone axes. Primary `X` / Secondary `Y` is the FFXIV FBX round-trip convention only at the FBX boundary; the Blender rig is not remapped.
-- Removes empty vertex groups and performs stronger mesh/weight/material validation.
+- Adds an **Animations** tab with one-click setup/update of the local catalog and Blender sidebar.
+- Shows the game's own emote icons in Blender with search, category filters, paging, looping playback, and **Stop / Restore Captured Pose**.
+- Strictly scopes the current validated catalog to 279 primary icon-click animations: 150 General, 100 Special, and 29 Expressions; commandless internal/event variants are excluded.
+- Includes only vanilla player emotes and facial expressions from timeline slot zero.
+- Excludes combat/job actions, weapon timelines, draw/sheathe, weapons, VFX, sound, props, mounts, movement, NPC-only animations, and every modded PAP.
+- Reads canonical paths from the live SqPack and bypasses Penumbra. XivBlend refuses when Dalamud reports modification, but current Dalamud cannot independently prove that a live index was never changed by TexTools; restore TexTools index modifications first.
+- Stores the catalog, locally converted icons, and requested clips in a versioned shared cache under `%LOCALAPPDATA%\XivBlend\AnimationLibrary`.
+- Decodes only the icon clicked. Keep FFXIV running with XivBlend loaded on the first uncached click; later playback uses the cached clip.
+- Treats preview Actions as runtime-only: Blender restores the exported captured pose and removes the preview Action before writing the `.blend`, then can resume it in the open session.
+- Ships no FFXIV PAP, SKLB, icon, generated clip, or other game asset.
+
+Only the primary PAP clip is sampled in this first version. TMB orchestration and auxiliary multi-clip layers are not merged, so some ear/tail/part/additive motion can be missing; a deterministic main-track fallback is used for known PAP/TMB naming mismatches but is not yet audited across the full catalog. Props and VFX remain intentionally out of scope.
+
+## Character export
+
+- Exports only the logged-in local player, including visible body, face, hair, equipment, weapons, live materials/textures, morphs, skin weights, and rig.
+- Creates a packed portrait scene with a clean stick armature, fitted camera, three-point lighting, and removable studio backdrop.
+- Keeps the script-free Timeline control: frame 0 is `XIV A-POSE`, frame 100 is `CAPTURED POSE`, and files open at frame 100.
+- Embeds safe race and captured face-skeleton identifiers for the animation browser, while keeping private paths and full manifests external.
+- Preserves native glTF rest matrices and bone axes. Primary `X` / Secondary `Y` remains an FBX-boundary convention only.
 - Creates a unique timestamped folder for every export and never overwrites or auto-deletes earlier exports.
-- Embeds redacted provenance and a build report instead of the full private snapshot manifest.
-- Does not include the FFXIV emote/action animation library, physics, VFX, mounts, ornaments, or companions yet.
 
-Existing `.blend` files are not retroactively changed; export again with 0.0.5 for the new rig, viewport, and Timeline defaults.
+Existing `.blend` files are not retroactively changed. Export again with 0.0.6 to add the animation lookup metadata.
 
-Version 0.0.5 passed the release build, Blender reopen checks, and an offline end-to-end test using a previously captured local live-character export. Broader live in-game coverage is still pending. External manifests, Meddle snapshots, glTF/bin files, and caches remain private diagnostics; do not upload an export folder wholesale. Report failures with the red plugin error and a reviewed, redacted `xivblend-export-report.json`.
+The 0.0.6 implementation passes the current .NET build and Blender-side metadata/add-on checks. Broad live first-click decoding across every race, face rig, and emote remains pending. External manifests, Meddle snapshots, glTF/bin files, caches, icons, and generated animation clips are private diagnostics/assets; do not upload an export or animation-cache folder wholesale. Report failures with the red plugin error and only reviewed, redacted text diagnostics.
