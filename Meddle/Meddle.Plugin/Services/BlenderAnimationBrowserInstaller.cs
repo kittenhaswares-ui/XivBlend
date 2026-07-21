@@ -13,7 +13,7 @@ namespace Meddle.Plugin.Services;
 /// </summary>
 public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
 {
-    public const string BrowserVersion = "0.3.0";
+    public const string BrowserVersion = "0.4.0";
 
     private const string ResourcePrefix = "XivBlendBuilder/";
     private const string InstallerResource = ResourcePrefix + "install_animation_browser.py";
@@ -66,7 +66,7 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
         {
             var blenderPath = FindBlenderExecutable()
                 ?? throw new FileNotFoundException(
-                    "Blender was not found. Select Blender 4.2 or newer in the Export tab first.");
+                    "Blender was not found. Select Blender 5.x in the Export tab first.");
             var installerPath = ExtractReviewedAssets();
             cancellationToken.ThrowIfCancellationRequested();
 

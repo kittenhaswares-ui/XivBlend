@@ -32,13 +32,14 @@ namespace Meddle.Plugin.Services;
 /// </remarks>
 public sealed class VanillaPapAnimationExporter : IService
 {
-    public const int ConverterVersion = 1;
+    public const int ConverterVersion = 2;
     public const int FramesPerSecond = 30;
 
     private const float TranslationEpsilon = 1.0e-7f;
     private const float ScaleEpsilon = 1.0e-7f;
     private const float RotationDotEpsilon = 1.0e-7f;
     private const float MaximumDurationSeconds = 300.0f;
+    private const int MaximumSampledTransforms = 2_000_000;
 
     private readonly ILogger<VanillaPapAnimationExporter> logger;
 
@@ -56,7 +57,8 @@ public sealed class VanillaPapAnimationExporter : IService
         byte[] skeletonBytes,
         string actionName,
         string animationKey,
-        bool faceAnimation)
+        bool faceAnimation,
+        bool exactName = false)
     {
         ArgumentNullException.ThrowIfNull(papBytes);
         ArgumentNullException.ThrowIfNull(skeletonBytes);
@@ -67,10 +69,10 @@ public sealed class VanillaPapAnimationExporter : IService
             throw new InvalidDataException("The requested animation is not a PAP file.");
         }
 
-        var selected = SelectAnimation(pap, animationKey, faceAnimation);
-        if (selected.HavokIndex < 0)
+        var selected = SelectAnimation(pap, animationKey, faceAnimation, exactName);
+        if (selected.Animation.HavokIndex < 0)
         {
-            throw new InvalidDataException($"PAP animation '{selected.GetName}' has no Havok track.");
+            throw new InvalidDataException($"PAP animation '{selected.Animation.GetName}' has no Havok track.");
         }
 
         var sklb = new SklbFile(skeletonBytes);
@@ -92,11 +94,11 @@ public sealed class VanillaPapAnimationExporter : IService
         // PAP HavokIndex addresses the binding/motion table. Animation and
         // binding arrays are commonly parallel, but that is not a format
         // guarantee and multi-clip containers need not preserve that shape.
-        var havokIndex = selected.HavokIndex;
+        var havokIndex = selected.Animation.HavokIndex;
         if (havokIndex >= animationContainer->Bindings.Length)
         {
             throw new InvalidDataException(
-                $"PAP animation '{selected.GetName}' refers to missing Havok binding {havokIndex}.");
+                $"PAP animation '{selected.Animation.GetName}' refers to missing Havok binding {havokIndex}.");
         }
 
         var binding = animationContainer->Bindings[havokIndex].ptr;
@@ -114,7 +116,8 @@ public sealed class VanillaPapAnimationExporter : IService
             skeletonContainer->Skeletons[0].ptr,
             binding,
             actionName,
-            selected.GetName);
+            selected.Animation.GetName,
+            selected.Index);
     }
 
     /// <summary>
@@ -218,19 +221,38 @@ public sealed class VanillaPapAnimationExporter : IService
             outputPath);
     }
 
-    private static PapFile.PapAnimation SelectAnimation(
+    private static SelectedPapAnimation SelectAnimation(
         PapFile pap,
         string animationKey,
-        bool faceAnimation)
+        bool faceAnimation,
+        bool exactName)
     {
         if (pap.Animations.Length == 0)
         {
             throw new InvalidDataException("The PAP contains no animations.");
         }
 
+        if (exactName)
+        {
+            for (var index = 0; index < pap.Animations.Length; index++)
+            {
+                var animation = pap.Animations[index];
+                if (animation.HavokIndex >= 0
+                    && string.Equals(animation.GetName, animationKey, StringComparison.OrdinalIgnoreCase)
+                    && (!faceAnimation || animation.IsFace
+                        || animation.GetName.StartsWith("cfxf_", StringComparison.OrdinalIgnoreCase)))
+                {
+                    return new SelectedPapAnimation(animation, index);
+                }
+            }
+
+            throw new InvalidDataException(
+                $"PAP contains {pap.Animations.Length} animations but no exact track named '{animationKey}'.");
+        }
+
         if (pap.Animations.Length == 1)
         {
-            return pap.Animations[0];
+            return new SelectedPapAnimation(pap.Animations[0], 0);
         }
 
         var leaf = animationKey.Replace('\\', '/').Split('/').LastOrDefault() ?? animationKey;
@@ -243,12 +265,15 @@ public sealed class VanillaPapAnimationExporter : IService
 
         foreach (var candidate in candidates)
         {
-            var match = pap.Animations.FirstOrDefault(
-                animation => animation.HavokIndex >= 0
-                             && string.Equals(animation.GetName, candidate, StringComparison.OrdinalIgnoreCase));
-            if (match.HavokIndex >= 0 && !string.IsNullOrWhiteSpace(match.GetName))
+            for (var index = 0; index < pap.Animations.Length; index++)
             {
-                return match;
+                var match = pap.Animations[index];
+                if (match.HavokIndex >= 0
+                    && !string.IsNullOrWhiteSpace(match.GetName)
+                    && string.Equals(match.GetName, candidate, StringComparison.OrdinalIgnoreCase))
+                {
+                    return new SelectedPapAnimation(match, index);
+                }
             }
         }
 
@@ -258,18 +283,20 @@ public sealed class VanillaPapAnimationExporter : IService
         // does not evaluate TMB/C010 layers, but the primary type-0 skeletal
         // body track is still deterministic.  Likewise, prefer an explicitly
         // facial track when resolving a face pack.
-        var fallback = faceAnimation
-            ? pap.Animations.FirstOrDefault(animation =>
-                animation.HavokIndex >= 0
-                && (animation.IsFace
-                    || animation.GetName.StartsWith("cfxf_", StringComparison.OrdinalIgnoreCase)))
-            : pap.Animations.FirstOrDefault(animation =>
-                animation.HavokIndex >= 0
-                && animation.Type == 0
-                && !animation.IsFace);
-        if (fallback.HavokIndex >= 0 && !string.IsNullOrWhiteSpace(fallback.GetName))
+        for (var index = 0; index < pap.Animations.Length; index++)
         {
-            return fallback;
+            var fallback = pap.Animations[index];
+            var suitable = faceAnimation
+                ? fallback.HavokIndex >= 0
+                  && (fallback.IsFace
+                      || fallback.GetName.StartsWith("cfxf_", StringComparison.OrdinalIgnoreCase))
+                : fallback.HavokIndex >= 0
+                  && fallback.Type == 0
+                  && !fallback.IsFace;
+            if (suitable && !string.IsNullOrWhiteSpace(fallback.GetName))
+            {
+                return new SelectedPapAnimation(fallback, index);
+            }
         }
 
         throw new InvalidDataException(
@@ -280,7 +307,8 @@ public sealed class VanillaPapAnimationExporter : IService
         hkaSkeleton* skeleton,
         hkaAnimationBinding* binding,
         string actionName,
-        string sourceAnimationName)
+        string sourceAnimationName,
+        int sourceAnimationIndex)
     {
         if (skeleton == null)
         {
@@ -319,6 +347,14 @@ public sealed class VanillaPapAnimationExporter : IService
         if (animatedIndices.Count == 0)
         {
             throw new InvalidDataException("The selected PAP binding animates no target bones.");
+        }
+
+        var sampledTransformCount = checked(frameCount * animatedIndices.Count);
+        if (sampledTransformCount > MaximumSampledTransforms)
+        {
+            throw new InvalidDataException(
+                $"The PAP would require {sampledTransformCount:N0} sampled bone frames; " +
+                $"XivBlend's safety limit is {MaximumSampledTransforms:N0}.");
         }
 
         var bones = new List<SampledBone>(boneCount);
@@ -446,12 +482,15 @@ public sealed class VanillaPapAnimationExporter : IService
         return new SampledAnimation(
             actionName,
             sourceAnimationName,
+            sourceAnimationIndex,
             duration,
             FramesPerSecond,
             frameCount,
             animatedIndices.Count,
             bones);
     }
+
+    private readonly record struct SelectedPapAnimation(PapFile.PapAnimation Animation, int Index);
 
     private static Dictionary<float, Vector3> ToTranslationKeys(IReadOnlyList<SampledTransform> frames) =>
         Enumerable.Range(0, frames.Count)
@@ -602,6 +641,7 @@ public sealed class VanillaPapAnimationExporter : IService
 public sealed record SampledAnimation(
     string ActionName,
     string SourceAnimationName,
+    int SourceAnimationIndex,
     float DurationSeconds,
     int FramesPerSecond,
     int FrameCount,

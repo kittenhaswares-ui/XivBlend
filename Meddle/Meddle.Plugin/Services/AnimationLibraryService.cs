@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Dalamud.Plugin.Services;
@@ -15,20 +17,33 @@ namespace Meddle.Plugin.Services;
 
 /// <summary>
 /// Builds and serves a tightly scoped, local-only library of player emote
-/// skeletal motion read from the live SqPack. Penumbra paths, combat actions,
-/// weapon timelines, VFX, props, mounts, movement sets and NPC animations are
-/// never queried. Current Dalamud builds cannot prove that a live SqPack index
+/// bundles read from the live SqPack. Body and facial PAPs share their original
+/// TMB timing; visible emote event metadata is preserved for Blender-side
+/// playback. Combat actions, weapon timelines, mounts, movement sets and NPC
+/// animations are never queried. Current Dalamud builds cannot prove that a live SqPack index
 /// has not previously been modified by TexTools; that boundary is surfaced in
 /// the UI and documentation rather than presented as a cryptographic guarantee.
 /// </summary>
 public sealed partial class AnimationLibraryService : IService, IDisposable
 {
-    public const int CatalogSchemaVersion = 1;
-    public const int QueueSchemaVersion = 1;
+    public const int CatalogSchemaVersion = 2;
+    public const int QueueSchemaVersion = 2;
+    public const int BundleSchemaVersion = 1;
+
+    private const long MaximumBundleJsonBytes = 4_194_304;
+    private const int MaximumBundleLayers = 1_024;
+    private const int MaximumBundleVisualEffects = 4_096;
+    private const int MaximumBundleProps = 1_024;
+    private const int MaximumBundleWarnings = 256;
+    private const int MaximumBundleWarningLength = 4_096;
+    private const int MaximumBundleFrame = 10_000_000;
+    private const int MaximumUniqueFacialTracks = 128;
+    private const long MaximumBundleSampledTransforms = 4_000_000;
 
     private const string ScopeDescription =
-        "Vanilla player emotes and facial expressions: primary icon-click skeletal motion only. " +
-        "Combat, job/weapon timelines, weapons, VFX, props, mounts, movement, NPC and modded PAPs are excluded.";
+        "Vanilla player emotes and facial expressions: primary icon-click body motion, synchronized facial PAP layers, " +
+        "visible prop/VFX timeline metadata, and explicitly imported active Penumbra body-PAP overrides. " +
+        "Combat, job/weapon timelines, mounts, movement and NPC animation are excluded.";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -48,6 +63,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
     private readonly IFramework framework;
     private readonly SqPack sqPack;
     private readonly VanillaPapAnimationExporter papExporter;
+    private readonly PenumbraAnimationModService customMods;
     private readonly SemaphoreSlim operationGate = new(1, 1);
     private readonly CancellationTokenSource disposeToken = new();
     private readonly object stateLock = new();
@@ -66,7 +82,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         IClientState clientState,
         IFramework framework,
         SqPack sqPack,
-        VanillaPapAnimationExporter papExporter)
+        VanillaPapAnimationExporter papExporter,
+        PenumbraAnimationModService customMods)
     {
         this.logger = logger;
         this.dataManager = dataManager;
@@ -74,6 +91,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         this.framework = framework;
         this.sqPack = sqPack;
         this.papExporter = papExporter;
+        this.customMods = customMods;
 
         Directory.CreateDirectory(LibraryRoot);
         Directory.CreateDirectory(RequestsDirectory);
@@ -99,6 +117,23 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
     public int CatalogEntryCount => catalog?.Entries.Count ?? 0;
     public int IconProgress => Volatile.Read(ref iconProgress);
     public int IconTotal => Volatile.Read(ref iconTotal);
+
+    public IReadOnlyList<AnimationCatalogEntry> GetVanillaEntriesSnapshot()
+    {
+        lock (stateLock)
+        {
+            if (catalog is not null)
+            {
+                return catalog.Entries
+                    .Where(item => string.Equals(item.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase))
+                    .ToArray();
+            }
+        }
+
+        return BuildCatalog().Entries
+            .Where(item => string.Equals(item.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+    }
 
     public bool StartPrepareLibrary()
     {
@@ -147,7 +182,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         var source = HasModifiedGameData
             ? "Dalamud reports modified live SqPacks, so extraction is blocked."
             : "Penumbra is bypassed; current Dalamud cannot independently verify TexTools index integrity.";
-        return $"{CatalogEntryCount} primary clips. {source}";
+        return $"{CatalogEntryCount} animation cards (vanilla plus explicitly imported custom sources). {source}";
     }
 
     private AnimationCatalog BuildCatalog()
@@ -187,7 +222,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 continue;
             }
 
-            var key = timeline.Value.Key.ToString().Trim().Replace('\\', '/');
+            var timelineKey = timeline.Value.Key.ToString().Trim().Replace('\\', '/');
+            var key = timelineKey;
             var kind = ResolveKind(timeline.Value.LoadType, key);
             if (kind is null)
             {
@@ -211,7 +247,10 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             var variantId = $"emote-{emote.RowId:D4}-timeline-{timeline.Value.RowId:D5}";
             var cacheTemplate = kind == "Face"
                 ? $"clips/{{race}}/{{face}}/face/{variantId}.glb"
-                : $"clips/{{race}}/body/{variantId}.glb";
+                : $"clips/{{race}}/{{faceKey}}/body/{variantId}.glb";
+            var bundleTemplate = kind == "Face"
+                ? $"bundles/{{race}}/{{face}}/face/{variantId}.json"
+                : $"bundles/{{race}}/{{faceKey}}/body/{variantId}.json";
             var variant = new AnimationCatalogVariant(
                 VariantId: variantId,
                 ActionTimelineId: timeline.Value.RowId,
@@ -219,10 +258,12 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 Label: "Default / Loop",
                 Kind: kind,
                 Key: key,
+                TimelineKey: timelineKey,
                 LoadType: timeline.Value.LoadType,
                 IsDefault: true,
                 IsLoop: timeline.Value.IsLoop,
-                CacheRelativePathTemplate: cacheTemplate);
+                CacheRelativePathTemplate: cacheTemplate,
+                BundleRelativePathTemplate: bundleTemplate);
 
             var resolvedIconId = emote.Icon;
             var category = emote.EmoteCategory.ValueNullable?.Name.ToString().Trim();
@@ -238,6 +279,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             }
 
             entries.Add(new AnimationCatalogEntry(
+                EntryId: $"vanilla:emote:{emote.RowId}",
                 EmoteId: emote.RowId,
                 Name: name,
                 Command: command,
@@ -245,6 +287,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 ResolvedIconId: resolvedIconId,
                 IconRelativePath: $"icons/{resolvedIconId:D6}.png",
                 Category: category,
+                SourceKind: "Vanilla",
+                SourceDisplayName: "FINAL FANTASY XIV",
                 DefaultVariantId: variantId,
                 Variants: [variant]));
         }
@@ -254,6 +298,9 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             throw new InvalidOperationException("The live Emote sheet produced no scoped player animations.");
         }
 
+        var vanillaEntries = entries.ToArray();
+        entries.AddRange(customMods.BuildCatalogEntries(vanillaEntries));
+
         return new AnimationCatalog(
             SchemaVersion: CatalogSchemaVersion,
             ConverterVersion: VanillaPapAnimationExporter.ConverterVersion,
@@ -261,7 +308,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             Language: clientState.ClientLanguage.ToString(),
             GeneratedAtUtc: DateTimeOffset.UtcNow,
             Scope: ScopeDescription,
-            Entries: entries.OrderBy(entry => entry.EmoteId).ToArray());
+            Entries: entries.OrderBy(entry => entry.EmoteId ?? uint.MaxValue).ToArray());
     }
 
     private async Task PrepareLibraryFilesAsync(AnimationCatalog preparedCatalog, CancellationToken cancellationToken)
@@ -309,7 +356,11 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                     CatalogRelativePath: relativeCatalogPath);
                 AtomicWriteJson(Path.Combine(LibraryRoot, "current.json"), pointer);
 
-                Status = $"Animation browser ready: {preparedCatalog.Entries.Count} vanilla player clips.";
+                var customCount = preparedCatalog.Entries.Count(item =>
+                    !string.Equals(item.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase));
+                Status = customCount == 0
+                    ? $"Animation browser ready: {preparedCatalog.Entries.Count} vanilla player emotes."
+                    : $"Animation browser ready: {preparedCatalog.Entries.Count - customCount} vanilla emotes and {customCount} custom animation(s).";
                 logger.LogInformation(
                     "Prepared XivBlend animation catalog {GameVersion}/{Language}: {Count} entries",
                     preparedCatalog.GameVersion,
@@ -438,83 +489,69 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                         $"{activeCatalog.GameVersion}. Refresh the animation browser catalog.");
                 }
 
-                if (HasModifiedGameData)
-                {
-                    throw new InvalidOperationException(
-                        "Dalamud reports modified live SqPack files. XivBlend refused the request because " +
-                        "this library is vanilla-only; disable/restore TexTools index modifications first.");
-                }
-
-                var entry = activeCatalog.Entries.FirstOrDefault(item => item.EmoteId == request.EmoteId)
-                    ?? throw new KeyNotFoundException($"Emote {request.EmoteId} is not in the scoped player catalog.");
+                var entry = FindRequestedEntry(activeCatalog, request)
+                    ?? throw new KeyNotFoundException("The requested animation entry is not in the current player catalog.");
                 var variant = entry.Variants.FirstOrDefault(item => item.VariantId == request.VariantId)
                     ?? throw new KeyNotFoundException($"Animation variant '{request.VariantId}' was not found.");
                 ValidateVariantRequest(request, variant);
 
+                if (entry.SourceKind == "Vanilla" && HasModifiedGameData)
+                {
+                    throw new InvalidOperationException(
+                        "Dalamud reports modified live SqPack files. XivBlend refused this vanilla request; " +
+                        "disable or restore TexTools index modifications first.");
+                }
+
                 var buildRoot = GetBuildRoot(activeCatalog);
                 var relativeClipPath = ResolveClipRelativePath(variant, request);
                 var outputPath = ResolveInside(buildRoot, relativeClipPath);
-                if (IsValidAnimationGlb(outputPath))
+                var relativeBundlePath = ResolveBundleRelativePath(variant, request);
+                var bundlePath = ResolveInside(buildRoot, relativeBundlePath);
+                var cachedBundle = ReadValidBundle(bundlePath, entry, variant, request);
+                if (cachedBundle is not null)
                 {
                     WriteResponse(new AnimationLibraryResponse(
-                        QueueSchemaVersion,
-                        request.RequestId,
-                        "ready",
-                        Path.GetRelativePath(LibraryRoot, outputPath).Replace(Path.DirectorySeparatorChar, '/'),
-                        null,
-                        null,
-                        null,
-                        null,
-                        null));
+                        SchemaVersion: QueueSchemaVersion,
+                        RequestId: request.RequestId,
+                        Status: "ready",
+                        ClipRelativePath: ToLibraryRelative(outputPath),
+                        BundleRelativePath: ToLibraryRelative(bundlePath),
+                        Error: null,
+                        FrameCount: cachedBundle.FrameEnd - cachedBundle.FrameStart + 1,
+                        DurationSeconds: (cachedBundle.FrameEnd - cachedBundle.FrameStart)
+                            / (float)cachedBundle.FramesPerSecond,
+                        AnimatedBoneCount: null,
+                        SourcePap: cachedBundle.Layers.FirstOrDefault()?.SourcePap,
+                        Warnings: cachedBundle.Warnings));
                     Status = $"Animation cache hit: {entry.Name}.";
                     return;
                 }
 
-                if (File.Exists(outputPath))
-                {
-                    logger.LogWarning("Rebuilding invalid XivBlend animation cache file {Path}", outputPath);
-                }
-
-                Status = $"Decoding vanilla animation: {entry.Name}...";
-                var source = ResolveVanillaSource(request, variant);
-                var actionName = $"XIV Emote - {entry.Name}";
-                var sampled = await framework.RunOnFrameworkThread(
-                    () =>
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        return papExporter.Sample(
-                            source.PapBytes,
-                            source.SkeletonBytes,
-                            actionName,
-                            variant.Key,
-                            variant.Kind == "Face");
-                    })
+                Status = $"Decoding synchronized animation bundle: {entry.Name}...";
+                var built = await BuildAnimationBundleAsync(
+                        activeCatalog,
+                        entry,
+                        variant,
+                        request,
+                        outputPath,
+                        cancellationToken)
                     .ConfigureAwait(false);
-
-                cancellationToken.ThrowIfCancellationRequested();
-                Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-                var tempOutput = outputPath + $".{Guid.NewGuid():N}.tmp";
-                try
-                {
-                    await Task.Run(() => papExporter.WriteGlb(sampled, tempOutput), cancellationToken)
-                        .ConfigureAwait(false);
-                    File.Move(tempOutput, outputPath, true);
-                }
-                finally
-                {
-                    TryDeletePrivateFile(tempOutput);
-                }
+                Directory.CreateDirectory(Path.GetDirectoryName(bundlePath)!);
+                AtomicWriteJson(bundlePath, built.Manifest, MaximumBundleJsonBytes);
 
                 WriteResponse(new AnimationLibraryResponse(
-                    QueueSchemaVersion,
-                    request.RequestId,
-                    "ready",
-                    Path.GetRelativePath(LibraryRoot, outputPath).Replace(Path.DirectorySeparatorChar, '/'),
-                    null,
-                    sampled.FrameCount,
-                    sampled.DurationSeconds,
-                    sampled.AnimatedBoneCount,
-                    source.PapPath));
+                    SchemaVersion: QueueSchemaVersion,
+                    RequestId: request.RequestId,
+                    Status: "ready",
+                    ClipRelativePath: ToLibraryRelative(outputPath),
+                    BundleRelativePath: ToLibraryRelative(bundlePath),
+                    Error: null,
+                    FrameCount: built.Manifest.FrameEnd - built.Manifest.FrameStart + 1,
+                    DurationSeconds: (built.Manifest.FrameEnd - built.Manifest.FrameStart)
+                        / (float)built.Manifest.FramesPerSecond,
+                    AnimatedBoneCount: null,
+                    SourcePap: built.Manifest.Layers.FirstOrDefault()?.SourcePap,
+                    Warnings: built.Manifest.Warnings));
                 Status = $"Animation ready in Blender: {entry.Name}.";
             }
             finally
@@ -534,21 +571,753 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             if (request is not null && Guid.TryParseExact(request.RequestId, "D", out _))
             {
                 WriteResponse(new AnimationLibraryResponse(
-                    QueueSchemaVersion,
-                    request.RequestId,
-                    "error",
-                    null,
-                    exception.Message,
-                    null,
-                    null,
-                    null,
-                    null));
+                    SchemaVersion: QueueSchemaVersion,
+                    RequestId: request.RequestId,
+                    Status: "error",
+                    ClipRelativePath: null,
+                    BundleRelativePath: null,
+                    Error: exception.Message,
+                    FrameCount: null,
+                    DurationSeconds: null,
+                    AnimatedBoneCount: null,
+                    SourcePap: null));
             }
         }
         finally
         {
             TryDeletePrivateFile(processingPath);
         }
+    }
+
+    private async Task<BuiltAnimationBundle> BuildAnimationBundleAsync(
+        AnimationCatalog activeCatalog,
+        AnimationCatalogEntry entry,
+        AnimationCatalogVariant variant,
+        AnimationLibraryRequest request,
+        string primaryOutputPath,
+        CancellationToken cancellationToken)
+    {
+        var warnings = new List<string>();
+        var layers = new List<AnimationBundleLayer>();
+        var visualEffects = new List<AnimationBundleVisualEvent>();
+        var props = new List<AnimationBundlePropEvent>();
+        var source = string.Equals(entry.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase)
+            ? ResolveVanillaSource(request, variant)
+            : string.Equals(entry.SourceKind, "PenumbraMod", StringComparison.OrdinalIgnoreCase)
+                ? ResolveCustomSource(request, variant)
+                : throw new InvalidOperationException($"Unsupported animation source '{entry.SourceKind}'.");
+        TmbTimelineFile? actionTimeline = null;
+        TmbTimelineFile? embeddedTimeline = null;
+        string requestedTrack = variant.Key;
+        var exactTrack = false;
+
+        if (variant.Kind == "Body")
+        {
+            actionTimeline = TryReadVanillaTimeline(
+                $"chara/action/{variant.TimelineKey}.tmb",
+                warnings,
+                "The emote action timeline could not be read");
+            var bodyEvent = actionTimeline?.Animations
+                .Where(item => item.Magic == "C010")
+                .OrderBy(item => item.Time)
+                .ThenBy(item => item.TrackOrder ?? int.MaxValue)
+                .FirstOrDefault(item => item.Path.StartsWith("cbem_", StringComparison.OrdinalIgnoreCase))
+                ?? actionTimeline?.Animations
+                    .Where(item => item.Magic == "C010")
+                    .OrderBy(item => item.Time)
+                    .FirstOrDefault();
+            if (bodyEvent is not null)
+            {
+                requestedTrack = bodyEvent.Path;
+                exactTrack = true;
+            }
+            else
+            {
+                warnings.Add("The TMB did not name a primary body track; XivBlend used its deterministic PAP fallback.");
+            }
+        }
+
+        var actionName = $"XIV Emote - {entry.Name}";
+        SampledAnimation primary;
+        try
+        {
+            primary = await SampleOnFrameworkThreadAsync(
+                    source,
+                    actionName,
+                    requestedTrack,
+                    variant.Kind == "Face",
+                    exactTrack,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidDataException) when (
+            exactTrack
+            && string.Equals(entry.SourceKind, "PenumbraMod", StringComparison.OrdinalIgnoreCase))
+        {
+            // Animation replacers frequently preserve the canonical PAP path
+            // but rename the single internal Havok track. For an explicitly
+            // trusted mod source, deterministic type-zero fallback is the
+            // useful behavior; facial event tracks remain strict.
+            warnings.Add(
+                $"The mod renamed body track '{requestedTrack}'; XivBlend selected its primary type-zero PAP track instead.");
+            primary = await SampleOnFrameworkThreadAsync(
+                    source,
+                    actionName,
+                    variant.Key,
+                    false,
+                    false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        await WriteAnimationGlbAsync(primary, primaryOutputPath, cancellationToken).ConfigureAwait(false);
+
+        var primaryFrames = Math.Max(1, primary.FrameCount - 1);
+        layers.Add(new AnimationBundleLayer(
+            Kind: variant.Kind,
+            ClipRelativePath: ToLibraryRelative(primaryOutputPath),
+            StartFrame: 0,
+            DurationFrames: primaryFrames,
+            SourceStartFrame: 0.0f,
+            SourceEndFrame: primaryFrames,
+            TrackOrder: -1,
+            ItemOrder: -1,
+            SourcePap: source.PapPath,
+            SourceAnimation: primary.SourceAnimationName));
+
+        if (variant.Kind == "Body")
+        {
+            try
+            {
+                var pap = new PapFile(source.PapBytes);
+                embeddedTimeline = new TmbTimelineFile(pap.GetTimelineData(primary.SourceAnimationIndex));
+            }
+            catch (Exception exception) when (exception is InvalidDataException or ArgumentOutOfRangeException)
+            {
+                warnings.Add($"The body PAP timeline could not be read, so facial and visible events were skipped: {exception.Message}");
+            }
+
+            if (embeddedTimeline is not null)
+            {
+                AddVisibleTimelineEvents(embeddedTimeline, visualEffects, props, warnings);
+                await AddFacialLayersAsync(
+                        activeCatalog,
+                        entry,
+                        request,
+                        actionTimeline,
+                        embeddedTimeline,
+                        layers,
+                        warnings,
+                        checked((long)primary.FrameCount * primary.AnimatedBoneCount),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        var frameEnd = Math.Max(primaryFrames, embeddedTimeline?.TimelineLengthFrames ?? 0);
+        foreach (var layer in layers)
+        {
+            frameEnd = Math.Max(frameEnd, checked(layer.StartFrame + layer.DurationFrames));
+        }
+
+        foreach (var item in visualEffects)
+        {
+            frameEnd = Math.Max(frameEnd, checked(item.StartFrame + Math.Max(0, item.DurationFrames)));
+        }
+
+        foreach (var item in props)
+        {
+            frameEnd = Math.Max(frameEnd, checked(item.StartFrame + Math.Max(0, item.DurationFrames)));
+        }
+
+        var manifest = new AnimationBundleManifest(
+            SchemaVersion: BundleSchemaVersion,
+            ConverterVersion: VanillaPapAnimationExporter.ConverterVersion,
+            GameVersion: activeCatalog.GameVersion,
+            EntryId: entry.EntryId,
+            VariantId: variant.VariantId,
+            RaceCode: request.RaceCode,
+            FaceSkeleton: request.FaceSkeleton ?? string.Empty,
+            DisplayName: entry.Name,
+            SourceKind: entry.SourceKind,
+            FramesPerSecond: VanillaPapAnimationExporter.FramesPerSecond,
+            FrameStart: 0,
+            FrameEnd: frameEnd,
+            IsLoop: variant.IsLoop,
+            Layers: layers,
+            VisualEffects: visualEffects,
+            Props: props,
+            Warnings: NormalizeBundleWarnings(warnings));
+        if (!HasValidBundleShape(manifest, entry, variant, request))
+        {
+            throw new InvalidDataException("The generated animation bundle failed XivBlend's safety validation.");
+        }
+
+        foreach (var layer in manifest.Layers)
+        {
+            if (!IsValidAnimationGlb(ResolveInside(LibraryRoot, layer.ClipRelativePath)))
+            {
+                throw new InvalidDataException(
+                    $"The generated animation layer '{layer.ClipRelativePath}' is missing or invalid.");
+            }
+        }
+
+        return new BuiltAnimationBundle(manifest);
+    }
+
+    private async Task AddFacialLayersAsync(
+        AnimationCatalog activeCatalog,
+        AnimationCatalogEntry entry,
+        AnimationLibraryRequest request,
+        TmbTimelineFile? actionTimeline,
+        TmbTimelineFile embeddedTimeline,
+        ICollection<AnimationBundleLayer> layers,
+        ICollection<string> warnings,
+        long retainedSampledTransforms,
+        CancellationToken cancellationToken)
+    {
+        var allFaceEvents = embeddedTimeline.Animations
+            .Where(item => item.Path.StartsWith("cfxf_", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(item => item.Time)
+            .ThenBy(item => item.TrackOrder ?? int.MaxValue)
+            .ThenBy(item => item.ItemOrder)
+            .ToArray();
+        if (allFaceEvents.Length == 0)
+        {
+            return;
+        }
+
+        var availableLayerSlots = Math.Max(0, MaximumBundleLayers - layers.Count);
+        var faceEvents = allFaceEvents.Take(availableLayerSlots).ToArray();
+        if (faceEvents.Length < allFaceEvents.Length)
+        {
+            warnings.Add(
+                $"{allFaceEvents.Length - faceEvents.Length:N0} facial timeline event(s) exceeded the per-emote safety limit and were skipped.");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.FaceSkeleton))
+        {
+            warnings.Add("This exported rig has no face skeleton tag, so synchronized facial motion was skipped.");
+            return;
+        }
+
+        var faceLibrary = actionTimeline?.FaceLibrary;
+        var sampledByTrack = new Dictionary<
+            string,
+            (SampledAnimation Sampled, string Path, ResolvedAnimationSource Source)>(
+            StringComparer.OrdinalIgnoreCase);
+        var attemptedTracks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rejectedTracks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var uniqueTrackLimitReported = false;
+        var transformLimitReported = false;
+        foreach (var faceEvent in faceEvents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (rejectedTracks.Contains(faceEvent.Path))
+            {
+                continue;
+            }
+
+            if (!sampledByTrack.TryGetValue(faceEvent.Path, out var cached))
+            {
+                if (retainedSampledTransforms >= MaximumBundleSampledTransforms)
+                {
+                    rejectedTracks.Add(faceEvent.Path);
+                    if (!transformLimitReported)
+                    {
+                        warnings.Add(
+                            $"Additional facial motion was skipped after the {MaximumBundleSampledTransforms:N0}-transform per-emote safety budget.");
+                        transformLimitReported = true;
+                    }
+
+                    continue;
+                }
+
+                if (attemptedTracks.Count >= MaximumUniqueFacialTracks)
+                {
+                    rejectedTracks.Add(faceEvent.Path);
+                    if (!uniqueTrackLimitReported)
+                    {
+                        warnings.Add(
+                            $"Additional facial tracks were skipped after the {MaximumUniqueFacialTracks:N0}-track per-emote safety limit.");
+                        uniqueTrackLimitReported = true;
+                    }
+
+                    continue;
+                }
+
+                attemptedTracks.Add(faceEvent.Path);
+
+                try
+                {
+                    var faceSource = ResolveFaceTrackSource(request, faceLibrary, faceEvent.Path);
+                    var sampled = await SampleOnFrameworkThreadAsync(
+                            faceSource,
+                            $"XIV Face - {entry.Name} - {faceEvent.Path}",
+                            faceEvent.Path,
+                            true,
+                            true,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    var sampledTransforms = checked((long)sampled.FrameCount * sampled.AnimatedBoneCount);
+                    if (sampledTransforms > MaximumBundleSampledTransforms - retainedSampledTransforms)
+                    {
+                        rejectedTracks.Add(faceEvent.Path);
+                        if (!transformLimitReported)
+                        {
+                            warnings.Add(
+                                $"Additional facial motion was skipped after the {MaximumBundleSampledTransforms:N0}-transform per-emote safety budget.");
+                            transformLimitReported = true;
+                        }
+
+                        continue;
+                    }
+
+                    retainedSampledTransforms += sampledTransforms;
+                    var clipPath = ResolveFaceLayerPath(
+                        GetBuildRoot(activeCatalog),
+                        request,
+                        faceSource.PapPath,
+                        faceEvent.Path);
+                    await WriteAnimationGlbAsync(sampled, clipPath, cancellationToken).ConfigureAwait(false);
+                    cached = (sampled, clipPath, faceSource);
+                    sampledByTrack.Add(faceEvent.Path, cached);
+                }
+                catch (Exception exception) when (exception is InvalidDataException or FileNotFoundException)
+                {
+                    rejectedTracks.Add(faceEvent.Path);
+                    warnings.Add($"Facial track '{faceEvent.Path}' was skipped: {exception.Message}");
+                    continue;
+                }
+            }
+
+            var sampledFrames = Math.Max(1, cached.Sampled.FrameCount - 1);
+            var controlled = (faceEvent.Flags & 0x01) != 0
+                             && float.IsFinite(faceEvent.AnimationStart)
+                             && float.IsFinite(faceEvent.AnimationEnd)
+                             && faceEvent.AnimationEnd > faceEvent.AnimationStart;
+            var sourceStart = Math.Clamp(controlled ? faceEvent.AnimationStart : 0.0f, 0.0f, sampledFrames);
+            var sourceEnd = Math.Clamp(controlled ? faceEvent.AnimationEnd : sampledFrames, sourceStart, sampledFrames);
+            if (sourceEnd <= sourceStart)
+            {
+                sourceStart = 0.0f;
+                sourceEnd = sampledFrames;
+            }
+
+            var startFrame = Math.Clamp(faceEvent.Time, 0, MaximumBundleFrame - 1);
+            var requestedDuration = faceEvent.Duration > 0
+                ? (long)faceEvent.Duration
+                : Math.Max(1L, (long)MathF.Ceiling(sourceEnd - sourceStart));
+            var duration = (int)Math.Clamp(requestedDuration, 1L, MaximumBundleFrame - (long)startFrame);
+            layers.Add(new AnimationBundleLayer(
+                Kind: "Face",
+                ClipRelativePath: ToLibraryRelative(cached.Path),
+                StartFrame: startFrame,
+                DurationFrames: duration,
+                SourceStartFrame: sourceStart,
+                SourceEndFrame: sourceEnd,
+                TrackOrder: faceEvent.TrackOrder ?? int.MaxValue,
+                ItemOrder: faceEvent.ItemOrder,
+                SourcePap: cached.Source.PapPath,
+                SourceAnimation: cached.Sampled.SourceAnimationName));
+        }
+    }
+
+    private static void AddVisibleTimelineEvents(
+        TmbTimelineFile timeline,
+        ICollection<AnimationBundleVisualEvent> visualEffects,
+        ICollection<AnimationBundlePropEvent> props,
+        ICollection<string> warnings)
+    {
+        var usableVisualEffects = timeline.VisualEffects
+            .Where(item => !string.IsNullOrWhiteSpace(item.Path))
+            .Take(MaximumBundleVisualEffects)
+            .ToArray();
+        if (usableVisualEffects.Length < timeline.VisualEffects.Count)
+        {
+            warnings.Add(
+                $"{timeline.VisualEffects.Count - usableVisualEffects.Length:N0} invalid or excessive VFX event(s) were skipped.");
+        }
+
+        foreach (var item in usableVisualEffects)
+        {
+            var startFrame = Math.Clamp(item.Time, 0, MaximumBundleFrame);
+            visualEffects.Add(new AnimationBundleVisualEvent(
+                Kind: item.Magic == "C173" ? "AsyncVfx" : "Vfx",
+                StartFrame: startFrame,
+                DurationFrames: (int)Math.Clamp(
+                    Math.Max(0L, item.Duration),
+                    0L,
+                    MaximumBundleFrame - (long)startFrame),
+                GamePath: item.Path,
+                BindPoint1: item.BindPoint1,
+                BindPoint2: item.BindPoint2,
+                BindPoint3: item.BindPoint3,
+                BindPoint4: item.BindPoint4,
+                ScaleX: FiniteOr(item.Scale.X, 1.0f),
+                ScaleY: FiniteOr(item.Scale.Y, 1.0f),
+                ScaleZ: FiniteOr(item.Scale.Z, 1.0f),
+                RotationX: FiniteOr(item.Rotation.X, 0.0f),
+                RotationY: FiniteOr(item.Rotation.Y, 0.0f),
+                RotationZ: FiniteOr(item.Rotation.Z, 0.0f),
+                PositionX: FiniteOr(item.Position.X, 0.0f),
+                PositionY: FiniteOr(item.Position.Y, 0.0f),
+                PositionZ: FiniteOr(item.Position.Z, 0.0f),
+                ColorR: FiniteOr(item.Color.X, 1.0f),
+                ColorG: FiniteOr(item.Color.Y, 1.0f),
+                ColorB: FiniteOr(item.Color.Z, 1.0f),
+                ColorA: FiniteOr(item.Color.W, 1.0f),
+                Visibility: item.Visibility,
+                TrackOrder: item.TrackOrder ?? int.MaxValue,
+                ItemOrder: item.ItemOrder));
+        }
+
+        var summonVisibleFrame = timeline.Visibility
+            .Where(item => item.EndVisibility > 0.001f
+                           && (!item.EnableFilter || (item.Filter & 0x08) != 0))
+            .OrderBy(item => item.Time)
+            .Select(item => (int?)Math.Max(0, item.Time))
+            .FirstOrDefault();
+        var usableProps = timeline.Props.Take(MaximumBundleProps).ToArray();
+        if (usableProps.Length < timeline.Props.Count)
+        {
+            warnings.Add(
+                $"{timeline.Props.Count - usableProps.Length:N0} prop event(s) exceeded the per-emote safety limit and were skipped.");
+        }
+
+        foreach (var item in usableProps)
+        {
+            var authoredStart = Math.Clamp(item.Time, 0, MaximumBundleFrame);
+            var visibleStart = summonVisibleFrame is { } frame
+                ? Math.Max(authoredStart, frame)
+                : authoredStart;
+            visibleStart = Math.Clamp(visibleStart, 0, MaximumBundleFrame);
+            var authoredEnd = (int)Math.Clamp(
+                authoredStart + Math.Max(0L, item.Duration),
+                authoredStart,
+                MaximumBundleFrame);
+            props.Add(new AnimationBundlePropEvent(
+                Kind: "Model",
+                StartFrame: visibleStart,
+                DurationFrames: Math.Max(0, authoredEnd - visibleStart),
+                ModelId: item.ModelId,
+                BodyId: item.BodyId,
+                Variant: item.Variant,
+                TrackOrder: item.TrackOrder ?? int.MaxValue,
+                ItemOrder: item.ItemOrder));
+        }
+    }
+
+    private static float FiniteOr(float value, float fallback) => float.IsFinite(value) ? value : fallback;
+
+    private async Task<SampledAnimation> SampleOnFrameworkThreadAsync(
+        ResolvedAnimationSource source,
+        string actionName,
+        string animationKey,
+        bool faceAnimation,
+        bool exactName,
+        CancellationToken cancellationToken)
+    {
+        return await framework.RunOnFrameworkThread(
+                () =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return papExporter.Sample(
+                        source.PapBytes,
+                        source.SkeletonBytes,
+                        actionName,
+                        animationKey,
+                        faceAnimation,
+                        exactName);
+                })
+            .ConfigureAwait(false);
+    }
+
+    private async Task WriteAnimationGlbAsync(
+        SampledAnimation sampled,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        if (IsValidAnimationGlb(outputPath))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var tempOutput = outputPath + $".{Guid.NewGuid():N}.tmp";
+        try
+        {
+            await Task.Run(() => papExporter.WriteGlb(sampled, tempOutput), cancellationToken)
+                .ConfigureAwait(false);
+            File.Move(tempOutput, outputPath, true);
+        }
+        finally
+        {
+            TryDeletePrivateFile(tempOutput);
+        }
+    }
+
+    private TmbTimelineFile? TryReadVanillaTimeline(
+        string gamePath,
+        ICollection<string> warnings,
+        string failurePrefix)
+    {
+        try
+        {
+            var descriptor = sqPack.GetFile(gamePath);
+            if (descriptor is null)
+            {
+                warnings.Add($"{failurePrefix}: {gamePath} is missing.");
+                return null;
+            }
+
+            return new TmbTimelineFile(descriptor.File.RawData);
+        }
+        catch (InvalidDataException exception)
+        {
+            warnings.Add($"{failurePrefix}: {exception.Message}");
+            return null;
+        }
+    }
+
+    private ResolvedAnimationSource ResolveFaceTrackSource(
+        AnimationLibraryRequest request,
+        string? faceLibrary,
+        string animationName)
+    {
+        var race = $"c{request.RaceCode:D4}";
+        var face = request.FaceSkeleton
+            ?? throw new InvalidDataException("A facial PAP library requires a captured face skeleton.");
+        if (!string.IsNullOrWhiteSpace(faceLibrary) && !SafeAnimationKey().IsMatch(faceLibrary))
+        {
+            throw new InvalidDataException("The TMB facial library key is not a safe game path.");
+        }
+
+        if (!SafeAnimationKey().IsMatch(animationName))
+        {
+            throw new InvalidDataException("The scheduled facial animation name is not safe.");
+        }
+
+        var skeletonPath = $"chara/human/{race}/skeleton/face/{face}/skl_{race}{face}.sklb";
+        var skeletonDescriptor = sqPack.GetFile(skeletonPath)
+            ?? throw new FileNotFoundException("The captured face skeleton is missing.", skeletonPath);
+        var derivedLibrary = animationName.StartsWith("cfxf_", StringComparison.OrdinalIgnoreCase)
+            ? animationName["cfxf_".Length..]
+            : animationName;
+        var candidates = new List<string>();
+        if (!string.IsNullOrWhiteSpace(faceLibrary))
+        {
+            candidates.Add($"chara/human/{race}/animation/{face}/nonresident/{faceLibrary}.pap");
+        }
+
+        // A few vanilla TMBs omit TMPP entirely, while others schedule a
+        // resident expression alongside their declared nonresident pack.
+        // The exact cfxf_* name gives a deterministic second candidate.
+        if (!string.IsNullOrWhiteSpace(derivedLibrary) && SafeAnimationKey().IsMatch(derivedLibrary))
+        {
+            candidates.Add($"chara/human/{race}/animation/{face}/nonresident/{derivedLibrary}.pap");
+        }
+
+        candidates.Add($"chara/human/{race}/animation/{face}/resident/face.pap");
+        foreach (var papPath in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var papDescriptor = sqPack.GetFile(papPath);
+            if (papDescriptor is null)
+            {
+                continue;
+            }
+
+            var papBytes = papDescriptor.File.RawData.ToArray();
+            var pap = new PapFile(papBytes);
+            if (!pap.Animations.Any(item =>
+                    item.HavokIndex >= 0
+                    && string.Equals(item.GetName, animationName, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            return new ResolvedAnimationSource(
+                papPath,
+                papBytes,
+                skeletonPath,
+                skeletonDescriptor.File.RawData.ToArray());
+        }
+
+        throw new FileNotFoundException(
+            $"No vanilla facial PAP candidate contains exact track '{animationName}'.");
+    }
+
+    private static string ResolveFaceLayerPath(
+        string buildRoot,
+        AnimationLibraryRequest request,
+        string facePackIdentity,
+        string animationName)
+    {
+        var identity = $"{facePackIdentity}\n{animationName}";
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..16]
+            .ToLowerInvariant();
+        var safeName = SafeDirectorySegment().Replace(animationName, "_").Trim('_');
+        if (string.IsNullOrWhiteSpace(safeName))
+        {
+            safeName = "face";
+        }
+
+        var relative = Path.Combine(
+            "clips",
+            $"c{request.RaceCode:D4}",
+            request.FaceSkeleton!,
+            "face-layers",
+            $"{safeName}-{digest}.glb");
+        return ResolveInside(buildRoot, relative);
+    }
+
+    private static IReadOnlyList<string> NormalizeBundleWarnings(IEnumerable<string> warnings)
+    {
+        var unique = warnings
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item.Trim().Length > MaximumBundleWarningLength
+                ? item.Trim()[..MaximumBundleWarningLength]
+                : item.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .Take(MaximumBundleWarnings + 1)
+            .ToArray();
+        if (unique.Length <= MaximumBundleWarnings)
+        {
+            return unique;
+        }
+
+        return unique
+            .Take(MaximumBundleWarnings - 1)
+            .Append("Additional animation warnings were omitted by the per-emote safety limit.")
+            .ToArray();
+    }
+
+    private static bool HasValidBundleShape(
+        AnimationBundleManifest? manifest,
+        AnimationCatalogEntry entry,
+        AnimationCatalogVariant variant,
+        AnimationLibraryRequest request)
+    {
+        return manifest is not null
+               && manifest.SchemaVersion == BundleSchemaVersion
+               && manifest.ConverterVersion == VanillaPapAnimationExporter.ConverterVersion
+               && string.Equals(manifest.EntryId, entry.EntryId, StringComparison.Ordinal)
+               && string.Equals(manifest.VariantId, variant.VariantId, StringComparison.Ordinal)
+               && manifest.RaceCode == request.RaceCode
+               && string.Equals(manifest.FaceSkeleton, request.FaceSkeleton ?? string.Empty, StringComparison.Ordinal)
+               && manifest.FrameStart >= 0
+               && manifest.FrameEnd > manifest.FrameStart
+               && manifest.FrameEnd <= MaximumBundleFrame
+               && manifest.FramesPerSecond == VanillaPapAnimationExporter.FramesPerSecond
+               && manifest.Layers is { Count: > 0 and <= MaximumBundleLayers }
+               && manifest.VisualEffects is { Count: <= MaximumBundleVisualEffects }
+               && manifest.Props is { Count: <= MaximumBundleProps }
+               && manifest.Warnings is { Count: <= MaximumBundleWarnings }
+               && !manifest.Layers.Any(layer =>
+                   layer is null
+                   || string.IsNullOrWhiteSpace(layer.Kind)
+                   || string.IsNullOrWhiteSpace(layer.ClipRelativePath)
+                   || layer.ClipRelativePath.Length > 32_768
+                   || layer.StartFrame < manifest.FrameStart
+                   || layer.DurationFrames <= 0
+                   || layer.StartFrame > manifest.FrameEnd - layer.DurationFrames
+                   || !float.IsFinite(layer.SourceStartFrame)
+                   || !float.IsFinite(layer.SourceEndFrame)
+                   || layer.SourceStartFrame < 0
+                   || layer.SourceEndFrame < layer.SourceStartFrame)
+               && !manifest.VisualEffects.Any(item =>
+                   item is null
+                   || string.IsNullOrWhiteSpace(item.GamePath)
+                   || item.GamePath.Length > 4_096
+                   || item.StartFrame < manifest.FrameStart
+                   || item.DurationFrames < 0
+                   || item.StartFrame > manifest.FrameEnd - item.DurationFrames
+                   || !float.IsFinite(item.ScaleX)
+                   || !float.IsFinite(item.ScaleY)
+                   || !float.IsFinite(item.ScaleZ)
+                   || !float.IsFinite(item.RotationX)
+                   || !float.IsFinite(item.RotationY)
+                   || !float.IsFinite(item.RotationZ)
+                   || !float.IsFinite(item.PositionX)
+                   || !float.IsFinite(item.PositionY)
+                   || !float.IsFinite(item.PositionZ)
+                   || !float.IsFinite(item.ColorR)
+                   || !float.IsFinite(item.ColorG)
+                   || !float.IsFinite(item.ColorB)
+                   || !float.IsFinite(item.ColorA))
+               && !manifest.Props.Any(item =>
+                   item is null
+                   || string.IsNullOrWhiteSpace(item.Kind)
+                   || item.StartFrame < manifest.FrameStart
+                   || item.DurationFrames < 0
+                   || item.StartFrame > manifest.FrameEnd - item.DurationFrames)
+               && !manifest.Warnings.Any(item =>
+                   item is null || item.Length > MaximumBundleWarningLength);
+    }
+
+    private AnimationBundleManifest? ReadValidBundle(
+        string bundlePath,
+        AnimationCatalogEntry entry,
+        AnimationCatalogVariant variant,
+        AnimationLibraryRequest request)
+    {
+        try
+        {
+            var info = new FileInfo(bundlePath);
+            if (!info.Exists || info.Length is <= 0 or > MaximumBundleJsonBytes)
+            {
+                return null;
+            }
+
+            var manifest = JsonSerializer.Deserialize<AnimationBundleManifest>(
+                File.ReadAllText(bundlePath),
+                JsonOptions);
+            if (!HasValidBundleShape(manifest, entry, variant, request))
+            {
+                return null;
+            }
+
+            foreach (var layer in manifest!.Layers)
+            {
+                if (!IsValidAnimationGlb(ResolveInside(LibraryRoot, layer.ClipRelativePath)))
+                {
+                    return null;
+                }
+            }
+
+            return manifest;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or JsonException
+                or InvalidDataException
+                or ArgumentException
+                or OverflowException)
+        {
+            logger.LogDebug(exception, "Ignoring invalid XivBlend animation bundle {Path}", bundlePath);
+            return null;
+        }
+    }
+
+    private static AnimationCatalogEntry? FindRequestedEntry(
+        AnimationCatalog activeCatalog,
+        AnimationLibraryRequest request)
+    {
+        if (!string.IsNullOrWhiteSpace(request.EntryId))
+        {
+            return activeCatalog.Entries.FirstOrDefault(
+                item => string.Equals(item.EntryId, request.EntryId, StringComparison.Ordinal));
+        }
+
+        return request.EmoteId is { } emoteId
+            ? activeCatalog.Entries.FirstOrDefault(item => item.EmoteId == emoteId)
+            : null;
+    }
+
+    private static string ToLibraryRelative(string path)
+    {
+        var resolved = ResolveInside(LibraryRoot, Path.GetRelativePath(LibraryRoot, path));
+        return Path.GetRelativePath(LibraryRoot, resolved).Replace(Path.DirectorySeparatorChar, '/');
     }
 
     private async Task<AnimationCatalog> GetOrBuildCatalogForQueueAsync(CancellationToken cancellationToken)
@@ -646,9 +1415,32 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             skeletonDescriptor.File.RawData.ToArray());
     }
 
+    private ResolvedAnimationSource ResolveCustomSource(
+        AnimationLibraryRequest request,
+        AnimationCatalogVariant variant)
+    {
+        if (variant.Kind != "Body")
+        {
+            throw new InvalidOperationException("The first custom importer supports body emote PAP overrides only.");
+        }
+
+        var trusted = customMods.ReadTrustedPap(variant, request.RaceCode);
+        var sourceRace = $"c{trusted.SourceRaceCode:D4}";
+        var skeletonPath = $"chara/human/{sourceRace}/skeleton/base/b0001/skl_{sourceRace}b0001.sklb";
+        var skeletonDescriptor = sqPack.GetFile(skeletonPath)
+            ?? throw new FileNotFoundException(
+                "The vanilla skeleton required by the custom PAP is unavailable.",
+                skeletonPath);
+        return new ResolvedAnimationSource(
+            trusted.DisplayPath,
+            trusted.Bytes,
+            skeletonPath,
+            skeletonDescriptor.File.RawData.ToArray());
+    }
+
     private static void ValidateRequest(AnimationLibraryRequest request)
     {
-        if (request.SchemaVersion != QueueSchemaVersion)
+        if (request.SchemaVersion is not 1 and not QueueSchemaVersion)
         {
             throw new InvalidDataException($"Unsupported animation queue schema {request.SchemaVersion}.");
         }
@@ -663,9 +1455,15 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             throw new InvalidDataException($"Race code {request.RaceCode:D4} is not a player race/sex rig.");
         }
 
-        if (request.EmoteId == 0)
+        if (request.SchemaVersion == 1 && request.EmoteId is null or 0)
         {
             throw new InvalidDataException("Animation request has no emote ID.");
+        }
+
+        if (request.SchemaVersion >= 2
+            && (string.IsNullOrWhiteSpace(request.EntryId) || !SafeEntryId().IsMatch(request.EntryId)))
+        {
+            throw new InvalidDataException("Animation request has no valid catalog entry ID.");
         }
 
         if (string.IsNullOrWhiteSpace(request.GameVersion) || request.GameVersion.Length > 128)
@@ -685,9 +1483,13 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         AnimationLibraryRequest request,
         AnimationCatalogVariant variant)
     {
-        if (variant.Kind == "Face"
-            && (string.IsNullOrWhiteSpace(request.FaceSkeleton)
-                || !FaceSkeletonId().IsMatch(request.FaceSkeleton)))
+        if (!string.IsNullOrWhiteSpace(request.FaceSkeleton)
+            && !FaceSkeletonId().IsMatch(request.FaceSkeleton))
+        {
+            throw new InvalidDataException("The captured face skeleton must look like f0002.");
+        }
+
+        if (variant.Kind == "Face" && string.IsNullOrWhiteSpace(request.FaceSkeleton))
         {
             throw new InvalidDataException("Facial animations require a captured face skeleton such as f0002.");
         }
@@ -703,9 +1505,23 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         AnimationCatalogVariant variant,
         AnimationLibraryRequest request)
     {
+        var faceKey = string.IsNullOrWhiteSpace(request.FaceSkeleton) ? "noface" : request.FaceSkeleton;
         return variant.CacheRelativePathTemplate
             .Replace("{race}", $"c{request.RaceCode:D4}", StringComparison.Ordinal)
             .Replace("{face}", request.FaceSkeleton ?? string.Empty, StringComparison.Ordinal)
+            .Replace("{faceKey}", faceKey, StringComparison.Ordinal)
+            .Replace('/', Path.DirectorySeparatorChar);
+    }
+
+    private static string ResolveBundleRelativePath(
+        AnimationCatalogVariant variant,
+        AnimationLibraryRequest request)
+    {
+        var faceKey = string.IsNullOrWhiteSpace(request.FaceSkeleton) ? "noface" : request.FaceSkeleton;
+        return variant.BundleRelativePathTemplate
+            .Replace("{race}", $"c{request.RaceCode:D4}", StringComparison.Ordinal)
+            .Replace("{face}", request.FaceSkeleton ?? string.Empty, StringComparison.Ordinal)
+            .Replace("{faceKey}", faceKey, StringComparison.Ordinal)
             .Replace('/', Path.DirectorySeparatorChar);
     }
 
@@ -794,7 +1610,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         return version;
     }
 
-    private static void AtomicWriteJson<T>(string outputPath, T value)
+    private static void AtomicWriteJson<T>(string outputPath, T value, long? maximumBytes = null)
     {
         var parent = Path.GetDirectoryName(outputPath)
             ?? throw new InvalidOperationException("JSON output has no parent directory.");
@@ -805,6 +1621,12 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 JsonSerializer.Serialize(stream, value, JsonOptions);
+                if (maximumBytes is { } limit && stream.Length > limit)
+                {
+                    throw new InvalidDataException(
+                        $"JSON output exceeded XivBlend's {limit:N0}-byte safety limit.");
+                }
+
                 stream.Flush(true);
             }
 
@@ -866,6 +1688,9 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
     [GeneratedRegex(@"^[a-zA-Z0-9_-]{1,128}$", RegexOptions.CultureInvariant)]
     private static partial Regex SafeVariantId();
 
+    [GeneratedRegex(@"^[a-zA-Z0-9:_-]{1,192}$", RegexOptions.CultureInvariant)]
+    private static partial Regex SafeEntryId();
+
     [GeneratedRegex(@"[^a-zA-Z0-9._-]+", RegexOptions.CultureInvariant)]
     private static partial Regex SafeDirectorySegment();
 
@@ -874,4 +1699,6 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         byte[] PapBytes,
         string SkeletonPath,
         byte[] SkeletonBytes);
+
+    private sealed record BuiltAnimationBundle(AnimationBundleManifest Manifest);
 }

@@ -15,13 +15,18 @@ public sealed class AnimationLibraryTab : ITab
 {
     private readonly AnimationLibraryService library;
     private readonly BlenderAnimationBrowserInstaller installer;
+    private readonly PenumbraAnimationModService customMods;
+    private string selectedModIdentifier = string.Empty;
+    private string selectedImportedModIdentifier = string.Empty;
 
     public AnimationLibraryTab(
         AnimationLibraryService library,
-        BlenderAnimationBrowserInstaller installer)
+        BlenderAnimationBrowserInstaller installer,
+        PenumbraAnimationModService customMods)
     {
         this.library = library;
         this.installer = installer;
+        this.customMods = customMods;
     }
 
     public string Name => "Animations";
@@ -32,7 +37,7 @@ public sealed class AnimationLibraryTab : ITab
     {
         ImGui.TextWrapped(
             "Adds a simple XivBlend sidebar to Blender with the game's own emote icons. " +
-            "Clicking an icon loads that one vanilla animation and plays it on a loop.");
+            "Clicking an icon loads one synchronized body/face bundle and plays it on a loop.");
         ImGui.Spacing();
 
         if (library.HasModifiedGameData)
@@ -102,12 +107,117 @@ public sealed class AnimationLibraryTab : ITab
             });
         }
 
+        DrawCustomAnimations(busy);
+
         ImGui.Separator();
         ImGui.TextDisabled("In Blender: press N in the 3D View, open XivBlend, then click Player Emotes.");
         ImGui.TextDisabled("Keep XivBlend open in FFXIV the first time a clip is clicked; later plays use the local cache.");
-        ImGui.TextDisabled("Included: player emotes and facial expressions. Excluded: combat, weapons, VFX, mounts and mods.");
-        ImGui.TextDisabled("Penumbra is bypassed. Current Dalamud cannot independently prove TexTools index integrity.");
-        ImGui.TextDisabled("Only the currently previewed Action is loaded, and runtime Actions are removed before saving.");
+        ImGui.TextDisabled("Included: player emote body/face timing and visible event metadata. Combat and weapon actions stay excluded.");
+        ImGui.TextDisabled("Vanilla extraction bypasses Penumbra. Custom imports ask Penumbra only for your active winning PAP paths.");
+        ImGui.TextDisabled("Only the selected preview bundle is loaded; its runtime Actions and effects are removed before saving.");
+    }
+
+    private void DrawCustomAnimations(bool busy)
+    {
+        ImGui.Separator();
+        ImGui.Text("Custom Animation Mods");
+        ImGui.TextWrapped(
+            "Choose an installed Penumbra animation mod. XivBlend adds only its active, winning emote PAPs " +
+            "for your own current character; it does not change the mod or its options.");
+
+        if (ImGui.Button("Refresh Penumbra Mods"))
+        {
+            customMods.RefreshInstalledMods();
+            if (!customMods.InstalledMods.Any(item => item.ModIdentifier == selectedModIdentifier))
+            {
+                selectedModIdentifier = customMods.InstalledMods.FirstOrDefault()?.ModIdentifier ?? string.Empty;
+            }
+        }
+
+        var selected = customMods.InstalledMods.FirstOrDefault(
+            item => item.ModIdentifier == selectedModIdentifier);
+        var preview = selected?.DisplayName ?? "Choose a mod...";
+        if (ImGui.BeginCombo("Animation mod", preview))
+        {
+            foreach (var mod in customMods.InstalledMods)
+            {
+                var isSelected = mod.ModIdentifier == selectedModIdentifier;
+                if (ImGui.Selectable($"{mod.DisplayName}##{mod.ModIdentifier}", isSelected))
+                {
+                    selectedModIdentifier = mod.ModIdentifier;
+                }
+
+                if (isSelected)
+                {
+                    ImGui.SetItemDefaultFocus();
+                }
+            }
+
+            ImGui.EndCombo();
+        }
+
+        ImGui.BeginDisabled(
+            busy
+            || string.IsNullOrWhiteSpace(selectedModIdentifier)
+            || !customMods.IsAvailable);
+        if (ImGui.Button("Add Active Animation Overrides", new Vector2(-1, 38)))
+        {
+            if (customMods.ImportActiveOverrides(
+                    selectedModIdentifier,
+                    library.GetVanillaEntriesSnapshot()))
+            {
+                library.StartPrepareLibrary();
+            }
+        }
+        ImGui.EndDisabled();
+
+        var importedSources = customMods.ImportedSources;
+        if (!importedSources.Any(item => item.ModIdentifier == selectedImportedModIdentifier))
+        {
+            selectedImportedModIdentifier = importedSources.FirstOrDefault()?.ModIdentifier ?? string.Empty;
+        }
+
+        if (importedSources.Count > 0)
+        {
+            var imported = importedSources.FirstOrDefault(
+                item => item.ModIdentifier == selectedImportedModIdentifier);
+            if (ImGui.BeginCombo("Saved source", imported?.DisplayName ?? "Choose a saved source..."))
+            {
+                foreach (var source in importedSources)
+                {
+                    var isSelected = source.ModIdentifier == selectedImportedModIdentifier;
+                    if (ImGui.Selectable($"{source.DisplayName}##saved-{source.ModIdentifier}", isSelected))
+                    {
+                        selectedImportedModIdentifier = source.ModIdentifier;
+                    }
+
+                    if (isSelected)
+                    {
+                        ImGui.SetItemDefaultFocus();
+                    }
+                }
+
+                ImGui.EndCombo();
+            }
+
+            ImGui.BeginDisabled(busy || string.IsNullOrWhiteSpace(selectedImportedModIdentifier));
+            if (ImGui.Button("Remove Saved Source from XivBlend"))
+            {
+                if (customMods.RemoveSource(selectedImportedModIdentifier))
+                {
+                    selectedImportedModIdentifier = string.Empty;
+                    library.StartPrepareLibrary();
+                }
+            }
+            ImGui.EndDisabled();
+        }
+
+        ImGui.TextWrapped(customMods.Status);
+        ImGui.TextDisabled($"Saved custom sources: {customMods.ImportedSourceCount}");
+        if (!string.IsNullOrWhiteSpace(customMods.LastError))
+        {
+            ImGui.TextColored(ImGuiColors.DalamudRed, customMods.LastError);
+        }
     }
 
     public void Dispose()

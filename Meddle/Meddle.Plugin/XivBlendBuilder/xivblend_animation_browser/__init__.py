@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -23,6 +23,7 @@ from pathlib import Path
 import time
 import uuid
 
+import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import IntProperty, StringProperty
@@ -43,6 +44,7 @@ POLL_SECONDS = 0.75
 REQUEST_TIMEOUT_SECONDS = 300.0
 TRANSIENT_PROPERTY = "xivblend_runtime_animation"
 SOURCE_CLIP_PROPERTY = "xivblend_source_clip"
+TRANSIENT_NLA_PREFIX = "XivBlend Runtime |"
 CAPTURED_ACTION_PREFIX = "XivBlend | A-Pose to Captured Pose"
 CAPTURED_MARKER = "CAPTURED POSE"
 STUDIO_COMPONENT_PROPERTY = "xivblend_component"
@@ -52,8 +54,14 @@ SCENE_SETUP_COLLECTION = "Scene Setup"
 CHARACTER_COLLECTION = "FFXIV Character"
 CHARACTER_MESH_COMPONENT = "Meshes"
 MAX_CAMERA_ACTION_SAMPLES = 96
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_CATALOG_ENTRIES = 20_000
+MAX_BUNDLE_LAYERS = 4_096
+MAX_BUNDLE_VISUALS = 65_536
+MAX_BUNDLE_PROPS = 16_384
 FAST_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
 FAST_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
+RUNTIME_EFFECT_COLLECTION_PREFIX = "XivBlend Runtime Effects |"
 
 _catalog = None
 _catalog_signature = None
@@ -62,6 +70,7 @@ _preview_paths = {}
 _pending_requests = {}
 _captured_actions = {}
 _scene_settings = {}
+_action_settings = {}
 _runtime_sessions = {}
 _save_sessions = []
 _fast_preview_session = None
@@ -105,8 +114,28 @@ def _id_text(value):
     return str(value if value is not None else "")
 
 
+def _number(value, fallback, caster):
+    try:
+        return caster(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+
+
+def _int_value(value, fallback=0):
+    return _number(value, fallback, int)
+
+
+def _float_value(value, fallback=0.0):
+    return _number(value, fallback, float)
+
+
 def _read_json(path):
     try:
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_JSON_BYTES:
+            raise CatalogError(
+                f"{path.name} has invalid size {size} bytes (limit {MAX_JSON_BYTES} bytes)"
+            )
         with path.open("r", encoding="utf-8-sig") as stream:
             document = json.load(stream)
     except FileNotFoundError as error:
@@ -215,22 +244,26 @@ def _load_catalog(force=False):
     entries = _field(document, "Entries", "Emotes", "Animations")
     if not isinstance(entries, list):
         raise CatalogError(f"{catalog_path.name} does not contain an Entries array")
+    if len(entries) > MAX_CATALOG_ENTRIES:
+        raise CatalogError(
+            f"{catalog_path.name} contains too many entries ({len(entries)})"
+        )
 
     usable_entries = []
     for raw_entry in entries:
         if not isinstance(raw_entry, dict):
             continue
-        emote_id = _field(raw_entry, "EmoteId", "Id")
+        entry_id = _field(raw_entry, "EntryId", "EmoteId", "Id")
         name = str(_field(raw_entry, "Name", default="") or "").strip()
         variants = [item for item in _as_list(_field(raw_entry, "Variants")) if isinstance(item, dict)]
-        if emote_id is None or not name or not variants:
+        if entry_id is None or not str(entry_id).strip() or not name or not variants:
             continue
         usable_entries.append(raw_entry)
 
     usable_entries.sort(key=lambda item: (
         str(_field(item, "Category", default="Other") or "Other").casefold(),
         str(_field(item, "Name", default="")).casefold(),
-        _id_text(_field(item, "EmoteId", "Id")),
+        _id_text(_field(item, "EntryId", "EmoteId", "Id")),
     ))
     game_version = str(
         _field(document, "GameVersion", default=_field(current, "GameVersion", default="")) or ""
@@ -239,6 +272,13 @@ def _load_catalog(force=False):
         "document": document,
         "entries": usable_entries,
         "game_version": game_version,
+        "schema_version": max(
+            1,
+            _int_value(
+                _field(document, "SchemaVersion", default=_field(current, "SchemaVersion", default=1)),
+                1,
+            ),
+        ),
         "catalog_path": catalog_path,
         "catalog_parent": catalog_path.parent.resolve(),
         "library_root": library_root,
@@ -258,6 +298,10 @@ def _catalog_or_error(force=False):
 
 
 def _entry_id(entry):
+    return _field(entry, "EntryId", "EmoteId", "Id")
+
+
+def _entry_emote_id(entry):
     return _field(entry, "EmoteId", "Id")
 
 
@@ -273,6 +317,35 @@ def _entry_category(entry):
     return str(_field(entry, "Category", default="Other") or "Other")
 
 
+def _entry_source_kind(entry):
+    return str(_field(entry, "SourceKind", default="Vanilla") or "Vanilla").strip()
+
+
+def _entry_source_name(entry):
+    return str(_field(entry, "SourceDisplayName", default="") or "").strip()
+
+
+def _entry_source_badge(entry):
+    source = _entry_source_kind(entry).casefold()
+    if source in {"", "vanilla", "game", "builtin", "built-in"}:
+        return ""
+    if source in {
+        "custom", "mod", "penumbra", "penumbramod", "penumbra mod",
+        "modoverride", "mod override",
+    }:
+        return "MOD"
+    cleaned = "".join(character for character in _entry_source_kind(entry).upper() if character.isalnum())
+    return cleaned[:6] or "CUSTOM"
+
+
+def _entry_source_description(entry):
+    badge = _entry_source_badge(entry)
+    if not badge:
+        return "FFXIV game animation"
+    name = _entry_source_name(entry)
+    return f"{badge}: {name}" if name else f"{badge} animation source"
+
+
 def _variant_id(variant):
     return _field(variant, "VariantId", "Id")
 
@@ -282,14 +355,51 @@ def _find_entry(catalog, emote_id):
     return next((entry for entry in catalog["entries"] if _id_text(_entry_id(entry)) == wanted), None)
 
 
-def _find_variant(entry, variant_id=""):
-    variants = _as_list(_field(entry, "Variants"))
+def _race_number(race):
+    text = str(race or "").strip().lower()
+    if text.startswith("c"):
+        text = text[1:]
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _variant_supports_race(variant, race):
+    configured = _field(variant, "CompatibleRaceCodes", default=None)
+    if configured is None:
+        return True
+    wanted = _race_number(race)
+    if wanted is None:
+        return False
+    supported = {
+        value for item in _as_list(configured)
+        if (value := _race_number(item)) is not None
+    }
+    return wanted in supported
+
+
+def _entry_supports_race(entry, race):
+    return any(
+        _variant_supports_race(variant, race)
+        for variant in _as_list(_field(entry, "Variants"))
+        if isinstance(variant, dict)
+    )
+
+
+def _find_variant(entry, variant_id="", race=""):
+    variants = [
+        variant for variant in _as_list(_field(entry, "Variants"))
+        if isinstance(variant, dict) and (not race or _variant_supports_race(variant, race))
+    ]
     requested = variant_id or _field(entry, "DefaultVariantId", default="")
     if requested:
         wanted = _id_text(requested)
         match = next((variant for variant in variants if _id_text(_variant_id(variant)) == wanted), None)
         if match is not None:
             return match
+        if race:
+            return None
     return next((variant for variant in variants if bool(_field(variant, "IsDefault", default=False))), variants[0] if variants else None)
 
 
@@ -389,11 +499,9 @@ def _rig_identity(context, target, require_face=True):
     return race, face
 
 
-def _format_clip_path(catalog, entry, variant, race, face):
-    template = _field(variant, "CacheRelativePathTemplate", "CacheRelativePath")
-    if not template:
-        raise ClipError(f"'{_entry_name(entry)}' has no CacheRelativePathTemplate")
-    values = {
+def _template_values(entry, variant, race, face):
+    face_key = face or "noface"
+    return {
         "race": race,
         "Race": race,
         "raceCode": race,
@@ -402,19 +510,153 @@ def _format_clip_path(catalog, entry, variant, race, face):
         "Face": face,
         "faceSkeleton": face,
         "FaceSkeleton": face,
-        "emoteId": _entry_id(entry),
-        "EmoteId": _entry_id(entry),
+        "faceKey": face_key,
+        "FaceKey": face_key,
+        "entryId": _entry_id(entry),
+        "EntryId": _entry_id(entry),
+        "emoteId": _entry_emote_id(entry),
+        "EmoteId": _entry_emote_id(entry),
         "variantId": _variant_id(variant),
         "VariantId": _variant_id(variant),
     }
+
+
+def _format_template_path(catalog, entry, variant, race, face, template, label, suffixes):
     try:
-        relative = str(template).format_map(values)
+        relative = str(template).format_map(_template_values(entry, variant, race, face))
     except (KeyError, ValueError) as error:
-        raise ClipError(f"Invalid clip path template for '{_entry_name(entry)}': {error}") from error
-    candidate = _resolve_child(catalog["catalog_parent"], relative, "CacheRelativePathTemplate")
-    if candidate.suffix.casefold() not in {".glb", ".gltf"}:
-        raise ClipError(f"Animation clip must be a .glb or .gltf file: {candidate.name}")
+        raise ClipError(f"Invalid {label} for '{_entry_name(entry)}': {error}") from error
+    candidate = _resolve_child(catalog["catalog_parent"], relative, label)
+    if candidate.suffix.casefold() not in suffixes:
+        expected = "/".join(sorted(suffixes))
+        raise ClipError(f"{label} must point to {expected}: {candidate.name}")
     return candidate
+
+
+def _format_clip_path(catalog, entry, variant, race, face):
+    template = _field(variant, "CacheRelativePathTemplate", "CacheRelativePath")
+    if not template:
+        raise ClipError(f"'{_entry_name(entry)}' has no CacheRelativePathTemplate")
+    return _format_template_path(
+        catalog, entry, variant, race, face, template,
+        "CacheRelativePathTemplate", {".glb", ".gltf"},
+    )
+
+
+def _format_bundle_path(catalog, entry, variant, race, face):
+    template = _field(variant, "BundleRelativePathTemplate", "BundleRelativePath")
+    if not template:
+        return None
+    return _format_template_path(
+        catalog, entry, variant, race, face, template,
+        "BundleRelativePathTemplate", {".json"},
+    )
+
+
+def _expected_animation_asset(catalog, entry, variant, race, face):
+    bundle_path = _format_bundle_path(catalog, entry, variant, race, face)
+    if bundle_path is not None:
+        return "bundle", bundle_path
+    return "clip", _format_clip_path(catalog, entry, variant, race, face)
+
+
+def _read_bundle_manifest(catalog, bundle_path):
+    bundle_path = Path(bundle_path).resolve()
+    if not _inside(bundle_path, catalog["default_root"]):
+        raise ClipError("Animation bundle is outside XivBlend/AnimationLibrary")
+    document = _read_json(bundle_path)
+    if not isinstance(document, dict):
+        raise ClipError(f"{bundle_path.name} must contain a JSON object")
+    schema = _int_value(_field(document, "SchemaVersion"), 0)
+    if schema != 1:
+        raise ClipError(f"Animation bundle {bundle_path.name} uses unsupported schema {schema}")
+    layers = _field(document, "Layers")
+    if not isinstance(layers, list) or not any(isinstance(layer, dict) for layer in layers):
+        raise ClipError(f"Animation bundle {bundle_path.name} contains no playable layers")
+    visuals = _field(document, "VisualEffects", default=[])
+    props = _field(document, "Props", default=[])
+    warnings = _field(document, "Warnings", default=[])
+    if len(layers) > MAX_BUNDLE_LAYERS:
+        raise ClipError(f"Animation bundle contains too many layers ({len(layers)})")
+    if not isinstance(visuals, list) or len(visuals) > MAX_BUNDLE_VISUALS:
+        raise ClipError("Animation bundle contains an invalid visual-event list")
+    if not isinstance(props, list) or len(props) > MAX_BUNDLE_PROPS:
+        raise ClipError("Animation bundle contains an invalid prop-event list")
+    if not isinstance(warnings, list) or len(warnings) > 4_096:
+        raise ClipError("Animation bundle contains an invalid warning list")
+    frame_start = _int_value(_field(document, "FrameStart"), -1)
+    frame_end = _int_value(_field(document, "FrameEnd"), -1)
+    if frame_start < 0 or frame_end <= frame_start or frame_end > 10_000_000:
+        raise ClipError("Animation bundle has an invalid frame range")
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ClipError("Animation bundle contains a malformed layer")
+        relative = str(_field(layer, "ClipRelativePath", default="") or "")
+        start = _int_value(_field(layer, "StartFrame"), -1)
+        duration = _int_value(_field(layer, "DurationFrames"), -1)
+        source_start = _float_value(_field(layer, "SourceStartFrame"), math.nan)
+        source_end = _float_value(_field(layer, "SourceEndFrame"), math.nan)
+        if (
+            not relative or len(relative) > 32_768
+            or start < frame_start or duration <= 0 or start + duration > frame_end
+            or not math.isfinite(source_start) or not math.isfinite(source_end)
+            or source_start < 0.0 or source_end < source_start
+        ):
+            raise ClipError("Animation bundle contains an invalid timed layer")
+    return document
+
+
+def _bundle_layer_path(catalog, layer):
+    relative = _field(layer, "ClipRelativePath")
+    try:
+        path = _resolve_child(catalog["library_root"], relative, "ClipRelativePath")
+    except CatalogError as error:
+        raise ClipError(str(error)) from error
+    if path.suffix.casefold() not in {".glb", ".gltf"}:
+        raise ClipError(f"Animation layer must be a .glb or .gltf file: {path.name}")
+    return path
+
+
+def _validate_bundle_identity(manifest, catalog, entry, variant):
+    if _id_text(_field(manifest, "EntryId")) != _id_text(_entry_id(entry)):
+        raise ClipError("Animation bundle entry identity does not match the selected card")
+    if _id_text(_field(manifest, "VariantId")) != _id_text(_variant_id(variant)):
+        raise ClipError("Animation bundle variant identity does not match the selected card")
+    bundle_game = str(_field(manifest, "GameVersion", default="") or "").strip()
+    if bundle_game != str(catalog.get("game_version", "")).strip():
+        raise ClipError("Animation bundle game version does not match the active catalog")
+
+
+def _valid_animation_layer_file(path):
+    try:
+        if not path.is_file():
+            return False
+        if path.suffix.casefold() != ".glb":
+            return True
+        size = path.stat().st_size
+        if size < 20 or size > 512 * 1024 * 1024:
+            return False
+        with path.open("rb") as stream:
+            header = stream.read(12)
+        return (
+            len(header) == 12 and header[:4] == b"glTF"
+            and int.from_bytes(header[4:8], "little") == 2
+            and int.from_bytes(header[8:12], "little") == size
+        )
+    except OSError:
+        return False
+
+
+def _bundle_is_ready(catalog, bundle_path, entry, variant):
+    try:
+        manifest = _read_bundle_manifest(catalog, bundle_path)
+        _validate_bundle_identity(manifest, catalog, entry, variant)
+        return all(
+            _valid_animation_layer_file(_bundle_layer_path(catalog, layer))
+            for layer in _as_list(_field(manifest, "Layers"))
+        )
+    except (CatalogError, ClipError, OSError):
+        return False
 
 
 def _icon_value(catalog, entry):
@@ -443,14 +685,27 @@ def _icon_value(catalog, entry):
         return 0
 
 
-def _filtered_entries(scene, catalog):
+def _filtered_entries(context, catalog):
+    scene = context.scene
     search = str(getattr(scene, "xivblend_animation_search", "") or "").strip().casefold()
     category = str(getattr(scene, "xivblend_animation_category", "") or "")
+    race = ""
+    target = _target_armature(context)
+    if target is not None:
+        try:
+            race, _ = _rig_identity(context, target, require_face=False)
+        except ClipError:
+            pass
     result = []
     for entry in catalog["entries"]:
+        if race and not _entry_supports_race(entry, race):
+            continue
         if category and category != "__ALL__" and _entry_category(entry) != category:
             continue
-        searchable = " ".join((_entry_name(entry), _entry_command(entry), _entry_category(entry))).casefold()
+        searchable = " ".join((
+            _entry_name(entry), _entry_command(entry), _entry_category(entry),
+            _entry_source_kind(entry), _entry_source_name(entry),
+        )).casefold()
         if search and search not in searchable:
             continue
         result.append(entry)
@@ -555,20 +810,110 @@ def _remove_action(action):
         pass
 
 
+def _remove_runtime_visuals(target=None):
+    target_name = target.name if target is not None else None
+    collections = [
+        collection for collection in bpy.data.collections
+        if bool(collection.get(TRANSIENT_PROPERTY, False))
+        and str(collection.name).startswith(RUNTIME_EFFECT_COLLECTION_PREFIX)
+        and (
+            target_name is None
+            or str(collection.get("xivblend_runtime_target", "")) == target_name
+        )
+    ]
+    for collection in collections:
+        orphan_data = []
+        orphan_actions = []
+        orphan_materials = []
+        for obj in list(collection.all_objects):
+            if obj.animation_data is not None and obj.animation_data.action is not None:
+                orphan_actions.append(obj.animation_data.action)
+            if getattr(obj, "data", None) is not None:
+                orphan_data.append(obj.data)
+            for slot in getattr(obj, "material_slots", ()):
+                if slot.material is not None:
+                    orphan_materials.append(slot.material)
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except (ReferenceError, RuntimeError):
+                pass
+        try:
+            bpy.data.collections.remove(collection)
+        except (ReferenceError, RuntimeError):
+            pass
+        for action in orphan_actions:
+            _remove_action(action)
+        for data_block in orphan_data:
+            try:
+                collection_name = data_block.bl_rna.identifier.lower() + "s"
+                data_collection = getattr(bpy.data, collection_name, None)
+                if data_collection is not None and data_block.users == 0:
+                    data_collection.remove(data_block)
+            except (AttributeError, ReferenceError, RuntimeError):
+                pass
+        for material in orphan_materials:
+            try:
+                if material.users == 0 and bool(material.get(TRANSIENT_PROPERTY, False)):
+                    bpy.data.materials.remove(material)
+            except (ReferenceError, RuntimeError):
+                pass
+    for data_collection in (bpy.data.meshes, bpy.data.materials):
+        for data_block in list(data_collection):
+            try:
+                if data_block.users == 0 and bool(data_block.get(TRANSIENT_PROPERTY, False)):
+                    data_collection.remove(data_block)
+            except (ReferenceError, RuntimeError):
+                pass
+
+
+def _runtime_nla_tracks(animation_data):
+    if animation_data is None:
+        return []
+    return [
+        track for track in animation_data.nla_tracks
+        if str(track.name).startswith(TRANSIENT_NLA_PREFIX)
+    ]
+
+
+def _remove_runtime_nla(animation_data):
+    actions = []
+    for track in _runtime_nla_tracks(animation_data):
+        for strip in track.strips:
+            action = getattr(strip, "action", None)
+            if action is not None and action not in actions:
+                actions.append(action)
+        try:
+            animation_data.nla_tracks.remove(track)
+        except (ReferenceError, RuntimeError):
+            pass
+    return actions
+
+
 def _restore_target(target, restore_scene=True):
     if target is None or target.type != "ARMATURE":
         return
+    _remove_runtime_visuals(target)
     animation_data = target.animation_data
     transient = animation_data.action if animation_data is not None else None
     if transient is not None and not bool(transient.get(TRANSIENT_PROPERTY, False)):
         transient = None
+    layered_actions = _remove_runtime_nla(animation_data)
     captured = _captured_action_for(target)
     if animation_data is None and captured is not None:
         animation_data = target.animation_data_create()
     if animation_data is not None:
         animation_data.action = captured
+        settings = _action_settings.pop(target.name, None)
+        if settings is not None:
+            blend_type, extrapolation, influence = settings
+            animation_data.action_blend_type = blend_type
+            animation_data.action_extrapolation = extrapolation
+            animation_data.action_influence = influence
     if transient is not None:
         _remove_action(transient)
+    for action in layered_actions:
+        if action != transient:
+            _remove_action(action)
     _runtime_sessions.pop(target.name, None)
 
     if restore_scene:
@@ -587,12 +932,17 @@ def _purge_transient_actions(restore=True):
         if obj.type != "ARMATURE" or obj.animation_data is None:
             continue
         action = obj.animation_data.action
-        if action is not None and bool(action.get(TRANSIENT_PROPERTY, False)):
+        has_runtime_tracks = bool(_runtime_nla_tracks(obj.animation_data))
+        if (action is not None and bool(action.get(TRANSIENT_PROPERTY, False))) or has_runtime_tracks:
             if restore:
                 _restore_target(obj, restore_scene=False)
             else:
+                layered_actions = _remove_runtime_nla(obj.animation_data)
                 obj.animation_data.action = None
                 _remove_action(action)
+                for layered_action in layered_actions:
+                    if layered_action != action:
+                        _remove_action(layered_action)
     for action in list(bpy.data.actions):
         if bool(action.get(TRANSIENT_PROPERTY, False)) and action.users == 0:
             _remove_action(action)
@@ -641,6 +991,25 @@ def _set_object_mode(context):
             raise ClipError("Switch to Object Mode before playing an animation") from error
 
 
+def _set_action_slot(holder, selected, label):
+    current = getattr(holder, "action_slot", None)
+    selected_handle = getattr(selected, "handle", None)
+    if current is not None and getattr(current, "handle", None) == selected_handle:
+        return
+    try:
+        if hasattr(holder, "action_slot_handle") and selected_handle is not None:
+            # Blender 5.0/5.2 can crash in RNA when the slot pointer itself is
+            # assigned. The integer handle is Blender's safe binding path.
+            holder.action_slot_handle = selected_handle
+        else:  # Legacy slot API, if a future/older compatible build exposes it.
+            holder.action_slot = selected
+    except Exception as error:
+        raise ClipError(f"{label} could not bind to its armature slot: {error}") from error
+    current = getattr(holder, "action_slot", None)
+    if current is None or getattr(current, "handle", None) != selected_handle:
+        raise ClipError(f"{label} did not bind to its expected armature slot")
+
+
 def _bind_action_slot(animation_data, action, source_slot_identifier):
     """Bind a layered Action's copied slot to the target armature.
 
@@ -672,16 +1041,7 @@ def _bind_action_slot(animation_data, action, source_slot_identifier):
         raise ClipError(
             f"Animation Action '{action.name}' has no unambiguous armature slot"
         )
-    try:
-        animation_data.action_slot = selected
-    except Exception as error:
-        raise ClipError(
-            f"Animation Action '{action.name}' could not bind to its armature slot: {error}"
-        ) from error
-    if animation_data.action_slot is None:
-        raise ClipError(
-            f"Animation Action '{action.name}' did not bind to its armature slot"
-        )
+    _set_action_slot(animation_data, selected, f"Animation Action '{action.name}'")
 
 
 def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
@@ -752,6 +1112,13 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
             pass
 
     animation_data = target.animation_data_create()
+    new_action_settings = target.name not in _action_settings
+    if new_action_settings:
+        _action_settings[target.name] = (
+            animation_data.action_blend_type,
+            animation_data.action_extrapolation,
+            float(animation_data.action_influence),
+        )
     old_action = animation_data.action
     old_action_slot = getattr(animation_data, "action_slot", None)
     if old_action is not None and not bool(old_action.get(TRANSIENT_PROPERTY, False)):
@@ -760,21 +1127,34 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
     try:
         animation_data.action = copied_action
         _bind_action_slot(animation_data, copied_action, source_slot_identifier)
+        animation_data.action_blend_type = "REPLACE"
+        animation_data.action_extrapolation = "HOLD"
+        animation_data.action_influence = 1.0
     except Exception as error:
         try:
             animation_data.action = old_action
             if old_action_slot is not None and hasattr(animation_data, "action_slot"):
-                animation_data.action_slot = old_action_slot
+                _set_action_slot(animation_data, old_action_slot, "Previous Action")
         except Exception:
             animation_data.action = None
+        if new_action_settings:
+            blend_type, extrapolation, influence = _action_settings.pop(target.name)
+            animation_data.action_blend_type = blend_type
+            animation_data.action_extrapolation = extrapolation
+            animation_data.action_influence = influence
         _remove_action(copied_action)
         scene.render.fps = previous_scene_settings[2]
         scene.render.fps_base = previous_scene_settings[3]
         raise ClipError(f"The clip Action is incompatible with armature '{target.name}': {error}") from error
     if new_scene_session:
         _scene_settings[target.name] = previous_scene_settings
+    old_layered_actions = _remove_runtime_nla(animation_data)
     if old_action is not None and bool(old_action.get(TRANSIENT_PROPERTY, False)):
         _remove_action(old_action)
+    for old_layered_action in old_layered_actions:
+        if old_layered_action != old_action:
+            _remove_action(old_layered_action)
+    _remove_runtime_visuals(target)
 
     target.data.display_type = "STICK"
     target.data.show_bone_custom_shapes = False
@@ -801,6 +1181,467 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
     return copied_action
 
 
+def _import_layer_action(context, clip_path, entry, variant, layer, layer_index):
+    """Import one external layer and retain only its copied transient Action."""
+    if not clip_path.is_file():
+        raise ClipError(f"Animation layer is not ready: {clip_path.name}")
+    snapshot = _data_snapshot()
+    original_active = getattr(context.view_layer.objects, "active", None)
+    original_selected = list(getattr(context, "selected_objects", []))
+    copied_action = None
+    source_slot_identifier = None
+    try:
+        _set_object_mode(context)
+        result = bpy.ops.import_scene.gltf(filepath=str(clip_path), disable_bone_shape=True)
+        if "FINISHED" not in result:
+            raise ClipError(f"Blender could not import {clip_path.name}")
+        imported_objects = [
+            obj for obj in bpy.data.objects
+            if obj not in snapshot.get("objects", set())
+        ]
+        source_action = None
+        for imported in imported_objects:
+            if imported.type != "ARMATURE" or imported.animation_data is None:
+                continue
+            if imported.animation_data.action is not None:
+                source_action = imported.animation_data.action
+                source_slot = getattr(imported.animation_data, "action_slot", None)
+                if source_slot is not None:
+                    source_slot_identifier = source_slot.identifier
+                break
+        if source_action is None:
+            new_actions = [
+                action for action in bpy.data.actions
+                if action not in snapshot.get("actions", set())
+            ]
+            source_action = new_actions[0] if new_actions else None
+        if source_action is None:
+            raise ClipError(f"{clip_path.name} contains no animation Action")
+
+        kind = str(_field(layer, "Kind", default="Layer") or "Layer")
+        source_name = str(_field(layer, "SourceAnimation", default="") or "").strip()
+        copied_action = source_action.copy()
+        copied_action.name = (
+            f"XivBlend Runtime | {_entry_name(entry)} | {kind} {layer_index + 1}"
+            f"{f' | {source_name}' if source_name else ''}"
+        )
+        copied_action.use_fake_user = False
+        copied_action[TRANSIENT_PROPERTY] = True
+        copied_action[SOURCE_CLIP_PROPERTY] = str(clip_path)
+        copied_action["xivblend_entry_id"] = _id_text(_entry_id(entry))
+        copied_action["xivblend_emote_id"] = _id_text(_entry_emote_id(entry))
+        copied_action["xivblend_variant_id"] = _id_text(_variant_id(variant))
+        copied_action["xivblend_layer_kind"] = kind
+    except Exception:
+        _cleanup_import(snapshot, keep_action=copied_action)
+        if copied_action is not None:
+            _remove_action(copied_action)
+        raise
+    else:
+        _cleanup_import(snapshot, keep_action=copied_action)
+    finally:
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj in original_selected:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if original_active is not None and original_active.name in bpy.data.objects:
+                context.view_layer.objects.active = original_active
+        except Exception:
+            pass
+    return copied_action, source_slot_identifier
+
+
+def _bind_nla_slot(strip, action, source_slot_identifier):
+    if not hasattr(strip, "action_slot"):
+        return
+    slots = list(getattr(action, "slots", ()))
+    if not slots:
+        return
+    selected = next((
+        slot for slot in slots
+        if slot.identifier == source_slot_identifier
+        and getattr(slot, "target_id_type", "OBJECT") == "OBJECT"
+    ), None)
+    compatible = [
+        slot for slot in slots
+        if getattr(slot, "target_id_type", "OBJECT") == "OBJECT"
+    ]
+    if selected is None and len(compatible) == 1:
+        selected = compatible[0]
+    if selected is None:
+        raise ClipError(f"Animation Action '{action.name}' has no unambiguous armature slot")
+    _set_action_slot(strip, selected, f"Animation layer '{action.name}'")
+
+
+def _add_runtime_layer(animation_data, action, source_slot_identifier, layer, layer_index):
+    kind = str(_field(layer, "Kind", default="Layer") or "Layer")
+    track_order = _int_value(_field(layer, "TrackOrder"), 0)
+    item_order = _int_value(_field(layer, "ItemOrder"), layer_index)
+    start_frame = _int_value(_field(layer, "StartFrame"), 0)
+    duration_frames = max(1, _int_value(_field(layer, "DurationFrames"), 1))
+    action_start, action_end = (float(value) for value in action.frame_range)
+    source_start = _float_value(_field(layer, "SourceStartFrame"), action_start)
+    source_end = _float_value(_field(layer, "SourceEndFrame"), action_end)
+    source_span = source_end - source_start
+    # A held expression can contain a single sampled frame.  Give the NLA strip
+    # a one-frame source window and stretch that constant value over the event;
+    # interpolating between fabricated keys would make the face flicker.
+    if source_span <= 1.0e-6:
+        source_end = source_start + 1.0
+        source_span = 1.0
+
+    track = animation_data.nla_tracks.new()
+    track.name = (
+        f"{TRANSIENT_NLA_PREFIX}{track_order:04d}.{item_order:04d} | "
+        f"{kind} {layer_index + 1}"
+    )
+    try:
+        strip = track.strips.new(action.name, start_frame, action)
+        strip.action_frame_start = source_start
+        strip.action_frame_end = source_end
+        strip.repeat = 1.0
+        strip.scale = max(float(duration_frames) / source_span, 1.0e-6)
+        strip.frame_start = float(start_frame)
+        strip.frame_end = float(start_frame + duration_frames)
+        strip.extrapolation = "NOTHING"
+        strip.blend_type = "REPLACE"
+        strip.blend_in = 0.0
+        strip.blend_out = 0.0
+        strip.use_auto_blend = False
+        _bind_nla_slot(strip, action, source_slot_identifier)
+    except Exception:
+        try:
+            animation_data.nla_tracks.remove(track)
+        except (ReferenceError, RuntimeError):
+            pass
+        raise
+    return track
+
+
+def _ordered_bundle_layers(manifest):
+    indexed = [
+        (index, layer) for index, layer in enumerate(_as_list(_field(manifest, "Layers")))
+        if isinstance(layer, dict)
+    ]
+    return sorted(indexed, key=lambda item: (
+        _int_value(_field(item[1], "TrackOrder"), 0),
+        _int_value(_field(item[1], "ItemOrder"), item[0]),
+        item[0],
+    ))
+
+
+def _runtime_effect_collection(scene, target):
+    collection = bpy.data.collections.new(f"{RUNTIME_EFFECT_COLLECTION_PREFIX}{target.name}")
+    collection[TRANSIENT_PROPERTY] = True
+    collection["xivblend_runtime_target"] = target.name
+    scene.collection.children.link(collection)
+    return collection
+
+
+def _runtime_material(name, color, emission_strength=0.0):
+    material = bpy.data.materials.new(name)
+    material[TRANSIENT_PROPERTY] = True
+    material.diffuse_color = (*color[:3], color[3])
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    if emission_strength > 0.0:
+        shader = nodes.new("ShaderNodeEmission")
+        shader.inputs["Color"].default_value = color
+        shader.inputs["Strength"].default_value = emission_strength
+    else:
+        shader = nodes.new("ShaderNodeBsdfPrincipled")
+        shader.inputs["Base Color"].default_value = color
+        shader.inputs["Roughness"].default_value = 0.42
+    links.new(shader.outputs[0], output.inputs["Surface"])
+    return material
+
+
+def _runtime_mesh_object(collection, name, shape, material):
+    mesh = bpy.data.meshes.new(f"{name} Mesh")
+    mesh[TRANSIENT_PROPERTY] = True
+    bm = bmesh.new()
+    try:
+        if shape == "apple":
+            result = bmesh.ops.create_uvsphere(
+                bm, u_segments=20, v_segments=12, radius=1.0
+            )
+            bmesh.ops.scale(
+                bm, vec=Vector((0.064, 0.064, 0.058)), verts=result["verts"]
+            )
+        else:
+            bmesh.ops.create_cone(
+                bm, cap_ends=True, cap_tris=False, segments=16,
+                radius1=0.011, radius2=0.011, depth=0.23,
+            )
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+    for polygon in mesh.polygons:
+        polygon.use_smooth = True
+    obj = bpy.data.objects.new(name, mesh)
+    obj[TRANSIENT_PROPERTY] = True
+    obj["xivblend_runtime_approximation"] = True
+    collection.objects.link(obj)
+    obj.data.materials.append(material)
+    return obj
+
+
+def _parent_runtime_effect(obj, target, preferred_bone, fallback_bone, location, rotation=(0.0, 0.0, 0.0)):
+    bone_name = next((
+        name for name in (preferred_bone, fallback_bone)
+        if name and target.pose.bones.get(name) is not None
+    ), None)
+    if bone_name is None:
+        return False
+    obj.parent = target
+    obj.parent_type = "BONE"
+    obj.parent_bone = bone_name
+    obj.location = location
+    obj.rotation_euler = rotation
+    return True
+
+
+def _discard_runtime_object(obj):
+    data = getattr(obj, "data", None)
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    except (ReferenceError, RuntimeError):
+        return
+    try:
+        if data is not None and data.users == 0:
+            bpy.data.meshes.remove(data)
+    except (ReferenceError, RuntimeError):
+        pass
+
+
+def _key_runtime_visibility(obj, start_frame, duration_frames):
+    start = int(start_frame)
+    end = start + max(1, int(duration_frames))
+    for frame, hidden in ((start - 1, True), (start, False), (end, True)):
+        obj.hide_viewport = hidden
+        obj.hide_render = hidden
+        obj.keyframe_insert(data_path="hide_viewport", frame=frame)
+        obj.keyframe_insert(data_path="hide_render", frame=frame)
+    action = obj.animation_data.action if obj.animation_data is not None else None
+    if action is not None:
+        action[TRANSIENT_PROPERTY] = True
+        action["xivblend_runtime_effect"] = True
+
+
+def _is_apple_prop(event):
+    return (
+        str(_field(event, "Kind", default="") or "").casefold() in {"c198", "model"}
+        and _int_value(_field(event, "ModelId"), -1) == 9901
+        and _int_value(_field(event, "BodyId"), -1) == 16
+        and _int_value(_field(event, "Variant"), -1) == 1
+    )
+
+
+def _glowstick_color(path):
+    lowered = str(path or "").casefold()
+    colors = (
+        ("yellow", (1.0, 0.72, 0.06, 1.0)),
+        ("orange", (1.0, 0.28, 0.03, 1.0)),
+        ("red", (1.0, 0.025, 0.02, 1.0)),
+        ("pink", (1.0, 0.06, 0.42, 1.0)),
+        ("purple", (0.55, 0.08, 1.0, 1.0)),
+        ("violet", (0.55, 0.08, 1.0, 1.0)),
+        ("blue", (0.02, 0.28, 1.0, 1.0)),
+        ("green", (0.03, 1.0, 0.18, 1.0)),
+        ("white", (0.82, 0.92, 1.0, 1.0)),
+    )
+    return next((color for token, color in colors if token in lowered), (0.08, 0.55, 1.0, 1.0))
+
+
+def _is_glowstick_vfx(event):
+    path = str(_field(event, "GamePath", default="") or "").casefold()
+    return "cyalume" in path or "cyalu" in path
+
+
+def _create_bundle_visuals(context, target, manifest):
+    props = [event for event in _as_list(_field(manifest, "Props")) if isinstance(event, dict)]
+    effects = [event for event in _as_list(_field(manifest, "VisualEffects")) if isinstance(event, dict)]
+    apple_events = [event for event in props if _is_apple_prop(event)]
+    glow_events = [event for event in effects if _is_glowstick_vfx(event)]
+    if not apple_events and not glow_events:
+        return []
+
+    collection = _runtime_effect_collection(context.scene, target)
+    warnings = []
+    apple_material = None
+    for index, event in enumerate(apple_events):
+        if apple_material is None:
+            apple_material = _runtime_material(
+                "XivBlend Runtime Apple Material", (0.52, 0.018, 0.012, 1.0)
+            )
+        obj = _runtime_mesh_object(
+            collection, f"XivBlend Runtime Approximation | Eat Apple {index + 1}",
+            "apple", apple_material,
+        )
+        if not _parent_runtime_effect(
+            obj, target, "n_buki_r", "j_te_r", (0.0, 0.045, 0.02)
+        ):
+            warnings.append("Apple prop could not attach because the right-hand bones are missing")
+            _discard_runtime_object(obj)
+            continue
+        start = _int_value(_field(event, "StartFrame"), 0)
+        duration = _int_value(_field(event, "DurationFrames"), 1)
+        _key_runtime_visibility(obj, start, duration)
+
+    # A cheer PAP may contain separate left/right AVFX records for the same
+    # color and time. Group them so the approximation creates exactly one pair.
+    grouped_glows = {}
+    for event in glow_events:
+        start = _int_value(_field(event, "StartFrame"), 0)
+        duration = max(1, _int_value(_field(event, "DurationFrames"), 1))
+        color = _glowstick_color(_field(event, "GamePath"))
+        grouped_glows.setdefault((start, duration, color), event)
+    for index, ((start, duration, color), _event) in enumerate(grouped_glows.items()):
+        material = _runtime_material(
+            f"XivBlend Runtime Glowstick Material {index + 1}", color, emission_strength=8.0
+        )
+        for side, preferred, fallback, offset in (
+            ("R", "n_buki_r", "j_te_r", (0.0, 0.085, 0.0)),
+            ("L", "n_buki_l", "j_te_l", (0.0, 0.085, 0.0)),
+        ):
+            obj = _runtime_mesh_object(
+                collection,
+                f"XivBlend Runtime Approximation | Glowstick {index + 1}{side}",
+                "glowstick", material,
+            )
+            if not _parent_runtime_effect(
+                obj, target, preferred, fallback, offset, (math.pi / 2.0, 0.0, 0.0)
+            ):
+                warnings.append(f"Glowstick could not attach because the {side.lower()}-hand bones are missing")
+                _discard_runtime_object(obj)
+                continue
+            _key_runtime_visibility(obj, start, duration)
+    return warnings
+
+
+def _bundle_runtime_warnings(manifest):
+    warnings = [str(value).strip() for value in _as_list(_field(manifest, "Warnings")) if str(value).strip()]
+    approximated = any(
+        isinstance(value, dict) and _is_glowstick_vfx(value)
+        for value in _as_list(_field(manifest, "VisualEffects"))
+    ) or any(
+        isinstance(value, dict) and _is_apple_prop(value)
+        for value in _as_list(_field(manifest, "Props"))
+    )
+    if approximated:
+        warnings.append("Apple/glowsticks use lightweight procedural previews; complex AVFX is not decoded yet")
+    visual_count = len([
+        value for value in _as_list(_field(manifest, "VisualEffects"))
+        if isinstance(value, dict) and not _is_glowstick_vfx(value)
+    ])
+    prop_count = len([
+        value for value in _as_list(_field(manifest, "Props"))
+        if isinstance(value, dict) and not _is_apple_prop(value)
+    ])
+    if visual_count:
+        warnings.append(f"{visual_count} complex VFX event(s) are not previewed yet")
+    if prop_count:
+        warnings.append(f"{prop_count} unsupported prop event(s) are not previewed yet")
+    return warnings
+
+
+def _import_bundle(context, target, bundle_path, catalog, entry, variant, auto_play=True):
+    manifest = _read_bundle_manifest(catalog, bundle_path)
+    _validate_bundle_identity(manifest, catalog, entry, variant)
+    ordered_layers = _ordered_bundle_layers(manifest)
+    if not ordered_layers:
+        raise ClipError(f"Animation bundle {Path(bundle_path).name} contains no playable layers")
+    primary = next((item for item in ordered_layers if str(
+        _field(item[1], "Kind", default="") or ""
+    ).casefold() == "body"), ordered_layers[0])
+    primary_index, primary_layer = primary
+    primary_path = _bundle_layer_path(catalog, primary_layer)
+    if not primary_path.is_file():
+        raise ClipError(f"Animation bundle layer is not ready: {primary_path.name}")
+
+    created_actions = []
+    layered_actions = {}
+    try:
+        primary_action = _import_clip(
+            context, target, primary_path, entry, variant, auto_play=False
+        )
+        created_actions.append(primary_action)
+        animation_data = target.animation_data_create()
+        # Blender evaluates the active Action after its NLA stack. COMBINE lets
+        # timed facial strips contribute on facial bones even when the body GLB
+        # contains harmless identity channels for those bones.
+        if len(ordered_layers) > 1:
+            animation_data.action_blend_type = "COMBINE"
+        for layer_index, layer in ordered_layers:
+            if layer_index == primary_index:
+                continue
+            layer_path = _bundle_layer_path(catalog, layer)
+            layer_key = os.path.normcase(str(layer_path.resolve()))
+            if layer_key not in layered_actions:
+                action, slot_identifier = _import_layer_action(
+                    context, layer_path, entry, variant, layer, layer_index
+                )
+                layered_actions[layer_key] = (action, slot_identifier)
+                created_actions.append(action)
+            else:
+                action, slot_identifier = layered_actions[layer_key]
+            _add_runtime_layer(
+                animation_data, action, slot_identifier, layer, layer_index
+            )
+    except Exception:
+        _restore_target(target, restore_scene=True)
+        for action in created_actions:
+            _remove_action(action)
+        raise
+
+    try:
+        visual_warnings = _create_bundle_visuals(context, target, manifest)
+    except Exception as error:
+        _remove_runtime_visuals(target)
+        visual_warnings = [f"Runtime prop/VFX approximation failed: {error}"]
+
+    scene = context.scene
+    fps = max(1, min(240, _int_value(_field(manifest, "FramesPerSecond"), 30)))
+    frame_start = _int_value(_field(manifest, "FrameStart"), int(math.floor(primary_action.frame_range[0])))
+    frame_end = _int_value(_field(manifest, "FrameEnd"), int(math.ceil(primary_action.frame_range[1])))
+    frame_end = max(frame_start + 1, frame_end)
+    scene.render.fps = fps
+    scene.render.fps_base = 1.0
+    scene.use_preview_range = False
+    scene.frame_start = frame_start
+    scene.frame_end = frame_end
+    scene.frame_set(frame_start)
+    warnings = _bundle_runtime_warnings(manifest) + visual_warnings
+    _runtime_sessions[target.name] = {
+        "target": target.name,
+        "asset_kind": "bundle",
+        "bundle_path": str(Path(bundle_path).resolve()),
+        "clip_path": str(primary_path),
+        "entry": entry,
+        "variant": variant,
+        "frame": frame_start,
+        "playing": bool(auto_play),
+        "warnings": warnings,
+    }
+    if auto_play:
+        _start_playback()
+    return primary_action, manifest, warnings
+
+
+def _import_animation_asset(context, target, asset_kind, asset_path, catalog, entry, variant, auto_play=True):
+    if asset_kind == "bundle" or Path(asset_path).suffix.casefold() == ".json":
+        action, manifest, warnings = _import_bundle(
+            context, target, asset_path, catalog, entry, variant, auto_play=auto_play
+        )
+        return action, manifest, warnings
+    action = _import_clip(context, target, asset_path, entry, variant, auto_play=auto_play)
+    return action, None, []
+
+
 def _request_paths(library_root, request_id):
     return (
         library_root / "responses" / f"{request_id}.json",
@@ -809,7 +1650,7 @@ def _request_paths(library_root, request_id):
     )
 
 
-def _atomic_request(catalog, entry, variant, race, face, expected_path, target):
+def _atomic_request(catalog, entry, variant, race, face, expected_kind, expected_path, target):
     request_id = str(uuid.uuid4())
     request_folder = (catalog["library_root"] / "requests").resolve()
     if not _inside(request_folder, catalog["default_root"]):
@@ -817,10 +1658,10 @@ def _atomic_request(catalog, entry, variant, race, face, expected_path, target):
     request_folder.mkdir(parents=True, exist_ok=True)
     destination = request_folder / f"{request_id}.json"
     temporary = request_folder / f".{request_id}.{uuid.uuid4().hex}.tmp"
+    request_schema = 2 if catalog.get("schema_version", 1) >= 2 or _field(entry, "EntryId") else 1
     payload = {
-        "schemaVersion": 1,
+        "schemaVersion": request_schema,
         "requestId": request_id,
-        "emoteId": _entry_id(entry),
         "variantId": _variant_id(variant),
         # The cache path uses FFXIV's c0801 notation, while the C# request
         # contract intentionally serializes RaceCode as an unsigned number.
@@ -828,6 +1669,13 @@ def _atomic_request(catalog, entry, variant, race, face, expected_path, target):
         "faceSkeleton": face,
         "gameVersion": catalog["game_version"],
     }
+    if request_schema >= 2:
+        payload["entryId"] = _id_text(_entry_id(entry))
+        emote_id = _entry_emote_id(entry)
+        if emote_id is not None:
+            payload["emoteId"] = emote_id
+    else:
+        payload["emoteId"] = _entry_emote_id(entry)
     try:
         with temporary.open("x", encoding="utf-8", newline="\n") as stream:
             json.dump(payload, stream, ensure_ascii=False, indent=2)
@@ -844,6 +1692,7 @@ def _atomic_request(catalog, entry, variant, race, face, expected_path, target):
 
     _pending_requests[request_id] = {
         "created": time.monotonic(),
+        "expected_kind": expected_kind,
         "expected_path": str(expected_path),
         "target": target.name,
         "entry_id": _id_text(_entry_id(entry)),
@@ -871,18 +1720,46 @@ def _response_state(record):
         if status in {"failed", "error", "rejected"}:
             return str(_field(response, "Error", "Message", default="Animation extraction failed")), None
         if status in {"ready", "complete", "completed", "success"}:
-            relative = _field(response, "ClipRelativePath")
-            if relative:
+            for field_name, kind, suffixes in (
+                ("BundleRelativePath", "bundle", {".json"}),
+                ("ClipRelativePath", "clip", {".glb", ".gltf"}),
+            ):
+                relative = _field(response, field_name)
+                if not relative:
+                    continue
                 try:
-                    clip_path = _resolve_child(
-                        Path(record["library_root"]), relative, "ClipRelativePath"
+                    asset_path = _resolve_child(
+                        Path(record["library_root"]), relative, field_name
                     )
                 except CatalogError as error:
                     return str(error), None
-                if clip_path.suffix.casefold() not in {".glb", ".gltf"}:
-                    return "The animation response did not point to a GLB/glTF clip", None
-                return None, clip_path
+                if asset_path.suffix.casefold() not in suffixes:
+                    return f"The animation response has an invalid {field_name}", None
+                return None, {
+                    "kind": kind,
+                    "path": asset_path,
+                    "warnings": [
+                        str(value).strip() for value in _as_list(_field(response, "Warnings"))
+                        if str(value).strip()
+                    ],
+                }
+            return "The completed animation response contains no clip or bundle path", None
     return None, None
+
+
+def _playing_status(entry, warnings=None):
+    source = _entry_source_description(entry)
+    base = f"Playing {_entry_name(entry)} on a loop"
+    if _entry_source_badge(entry):
+        base += f" • {source}"
+    clean_warnings = list(dict.fromkeys(
+        str(value).strip() for value in (warnings or []) if str(value).strip()
+    ))
+    if clean_warnings:
+        base += f" • Warning: {clean_warnings[0]}"
+        if len(clean_warnings) > 1:
+            base += f" (+{len(clean_warnings) - 1} more)"
+    return base
 
 
 def _cleanup_response_files(record):
@@ -914,34 +1791,43 @@ def _poll_requests():
             _cleanup_response_files(record)
             _set_status(f"Timed out waiting for {_entry_name(record['entry'])}. Try Refresh and play it again.")
             continue
-        error, response_clip = _response_state(record)
+        error, response_asset = _response_state(record)
         if error:
             _pending_requests.pop(request_id, None)
             _cleanup_response_files(record)
             _set_status(error)
             continue
 
-        clip_path = response_clip or Path(record["expected_path"])
-        if not clip_path.is_file():
+        asset_kind = response_asset["kind"] if response_asset else record.get("expected_kind", "clip")
+        asset_path = response_asset["path"] if response_asset else Path(record["expected_path"])
+        response_warnings = response_asset.get("warnings", []) if response_asset else []
+        catalog, catalog_error = _catalog_or_error(force=False)
+        if catalog is None:
+            _pending_requests.pop(request_id, None)
+            _cleanup_response_files(record)
+            _set_status(catalog_error or "The animation catalog could not be reloaded")
+            continue
+        if not asset_path.is_file():
             # A catalog replacement can publish a changed deterministic path.
-            catalog, _ = _catalog_or_error(force=False)
-            if catalog is not None:
-                entry = _find_entry(catalog, record["entry_id"])
-                variant = _find_variant(entry, record["variant_id"]) if entry is not None else None
-                target = bpy.data.objects.get(record["target"])
-                if variant is not None and target is not None:
-                    try:
-                        kind = str(_field(variant, "Kind", default="Body") or "Body")
-                        race, face = _rig_identity(
-                            bpy.context, target, require_face=kind.casefold() == "face"
-                        )
-                        clip_path = _format_clip_path(catalog, entry, variant, race, face)
-                        record["expected_path"] = str(clip_path)
-                        record["entry"] = entry
-                        record["variant"] = variant
-                    except Exception:
-                        pass
-        if not clip_path.is_file():
+            entry = _find_entry(catalog, record["entry_id"])
+            variant = _find_variant(entry, record["variant_id"]) if entry is not None else None
+            target = bpy.data.objects.get(record["target"])
+            if variant is not None and target is not None:
+                try:
+                    kind = str(_field(variant, "Kind", default="Body") or "Body")
+                    race, face = _rig_identity(
+                        bpy.context, target, require_face=kind.casefold() == "face"
+                    )
+                    asset_kind, asset_path = _expected_animation_asset(
+                        catalog, entry, variant, race, face
+                    )
+                    record["expected_kind"] = asset_kind
+                    record["expected_path"] = str(asset_path)
+                    record["entry"] = entry
+                    record["variant"] = variant
+                except Exception:
+                    pass
+        if not asset_path.is_file():
             continue
 
         target = bpy.data.objects.get(record["target"])
@@ -951,7 +1837,10 @@ def _poll_requests():
             _set_status("The target armature was removed before the animation was ready")
             continue
         try:
-            _import_clip(bpy.context, target, clip_path, record["entry"], record["variant"], auto_play=True)
+            _, _, bundle_warnings = _import_animation_asset(
+                bpy.context, target, asset_kind, asset_path, catalog,
+                record["entry"], record["variant"], auto_play=True,
+            )
         except Exception as error:
             record["import_failures"] += 1
             if record["import_failures"] >= 3:
@@ -961,7 +1850,7 @@ def _poll_requests():
             continue
         _pending_requests.pop(request_id, None)
         _cleanup_response_files(record)
-        _set_status(f"Playing {_entry_name(record['entry'])} on a loop")
+        _set_status(_playing_status(record["entry"], response_warnings + bundle_warnings))
     return POLL_SECONDS if _pending_requests else None
 
 
@@ -973,11 +1862,11 @@ def _ensure_poll_timer():
         bpy.app.timers.register(_poll_requests, first_interval=POLL_SECONDS, persistent=True)
 
 
-def _play(context, emote_id, variant_id=""):
+def _play(context, entry_id, variant_id=""):
     catalog = _load_catalog()
-    entry = _find_entry(catalog, emote_id)
+    entry = _find_entry(catalog, entry_id)
     if entry is None:
-        raise ClipError(f"Emote {emote_id} is no longer in the animation catalog")
+        raise ClipError(f"Animation {entry_id} is no longer in the animation catalog")
     variant = _find_variant(entry, variant_id)
     if variant is None:
         raise ClipError(f"'{_entry_name(entry)}' has no playable variant")
@@ -986,18 +1875,30 @@ def _play(context, emote_id, variant_id=""):
     if target is None:
         raise ClipError("No armature was found. Open an XivBlend character file first.")
     race, face = _rig_identity(context, target, require_face=kind.casefold() == "face")
-    clip_path = _format_clip_path(catalog, entry, variant, race, face)
-    if clip_path.is_file():
-        _import_clip(context, target, clip_path, entry, variant, auto_play=True)
-        return f"Playing {_entry_name(entry)} on a loop"
+    variant = _find_variant(entry, variant_id, race)
+    if variant is None:
+        raise ClipError(
+            f"'{_entry_name(entry)}' is not compatible with this character's {race} rig."
+        )
+    asset_kind, asset_path = _expected_animation_asset(catalog, entry, variant, race, face)
+    asset_ready = asset_path.is_file() and (
+        asset_kind != "bundle" or _bundle_is_ready(catalog, asset_path, entry, variant)
+    )
+    if asset_ready:
+        _, _, warnings = _import_animation_asset(
+            context, target, asset_kind, asset_path, catalog, entry, variant, auto_play=True
+        )
+        return _playing_status(entry, warnings)
 
     duplicate = next((
         request_id for request_id, record in _pending_requests.items()
-        if record["expected_path"] == str(clip_path) and record["target"] == target.name
+        if record["expected_path"] == str(asset_path) and record["target"] == target.name
     ), None)
     if duplicate:
         return f"Waiting for {_entry_name(entry)} (request {duplicate[:8]})"
-    request_id = _atomic_request(catalog, entry, variant, race, face, clip_path, target)
+    request_id = _atomic_request(
+        catalog, entry, variant, race, face, asset_kind, asset_path, target
+    )
     return f"Preparing {_entry_name(entry)}… request {request_id[:8]}"
 
 
@@ -1530,7 +2431,7 @@ class XIVBLEND_OT_change_animation_page(Operator):
         catalog, error = _catalog_or_error()
         if error:
             return {"CANCELLED"}
-        entries = _filtered_entries(context.scene, catalog)
+        entries = _filtered_entries(context, catalog)
         last_page = max(0, math.ceil(len(entries) / PAGE_SIZE) - 1)
         context.scene.xivblend_animation_page = min(
             last_page, max(0, context.scene.xivblend_animation_page + self.delta)
@@ -1545,21 +2446,28 @@ class XIVBLEND_OT_play_emote(Operator):
     # browsing many emotes would retain hidden copies and defeat the light cache.
     bl_options = {"REGISTER"}
 
+    entry_id: StringProperty(options={"SKIP_SAVE"})
+    # Kept for buttons stored by older add-on builds.
     emote_id: StringProperty(options={"SKIP_SAVE"})
     variant_id: StringProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def description(cls, _context, properties):
         catalog, _ = _catalog_or_error()
-        entry = _find_entry(catalog, properties.emote_id) if catalog else None
+        requested_id = properties.entry_id or properties.emote_id
+        entry = _find_entry(catalog, requested_id) if catalog else None
         if entry is None:
             return "Play this emote"
         command = _entry_command(entry)
-        return f"Play {_entry_name(entry)}{f' ({command})' if command else ''} on a loop"
+        source = _entry_source_description(entry)
+        return (
+            f"Play {_entry_name(entry)}{f' ({command})' if command else ''} on a loop. "
+            f"Source: {source}"
+        )
 
     def execute(self, context):
         try:
-            message = _play(context, self.emote_id, self.variant_id)
+            message = _play(context, self.entry_id or self.emote_id, self.variant_id)
         except Exception as error:
             message = str(error)
             _set_status(message)
@@ -1745,7 +2653,10 @@ class XIVBLEND_PT_animation_browser(Panel):
         category_label = "All categories" if not category or category == "__ALL__" else category
         layout.menu(XIVBLEND_MT_animation_categories.bl_idname, text=category_label, icon="FILTER")
 
-        entries = _filtered_entries(scene, catalog)
+        entries = _filtered_entries(context, catalog)
+        custom_count = sum(1 for entry in entries if _entry_source_badge(entry))
+        if custom_count:
+            layout.label(text=f"{custom_count} custom animation(s) loaded", icon="PACKAGE")
         page_count = max(1, math.ceil(len(entries) / PAGE_SIZE))
         page = min(max(0, scene.xivblend_animation_page), page_count - 1)
         visible = entries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
@@ -1755,13 +2666,15 @@ class XIVBLEND_PT_animation_browser(Panel):
             grid = layout.grid_flow(row_major=True, columns=3, even_columns=True, even_rows=True, align=True)
             for entry in visible:
                 icon_value = _icon_value(catalog, entry)
-                kwargs = {"text": _entry_name(entry)[:22]}
+                badge = _entry_source_badge(entry)
+                label = f"[{badge}] {_entry_name(entry)}" if badge else _entry_name(entry)
+                kwargs = {"text": label[:22]}
                 if icon_value:
                     kwargs["icon_value"] = icon_value
                 else:
                     kwargs["icon"] = "PLAY"
                 operator = grid.operator(XIVBLEND_OT_play_emote.bl_idname, **kwargs)
-                operator.emote_id = _id_text(_entry_id(entry))
+                operator.entry_id = _id_text(_entry_id(entry))
                 operator.variant_id = ""
 
         pages = layout.row(align=True)
@@ -1775,8 +2688,11 @@ class XIVBLEND_PT_animation_browser(Panel):
         layout.operator(XIVBLEND_OT_restore_captured_pose.bl_idname, icon="PAUSE")
         status = getattr(context.window_manager, "xivblend_animation_status", "") or _status
         status_box = layout.box()
-        for line in _wrap_lines(status):
-            status_box.label(text=line)
+        for index, line in enumerate(_wrap_lines(status)):
+            status_box.label(
+                text=line,
+                icon="ERROR" if index == 0 and "warning:" in status.casefold() else "NONE",
+            )
 
 
 class XIVBLEND_PT_render_studio(Panel):
@@ -1873,6 +2789,7 @@ def _save_pre_handler(_filepath):
         # captured-pose Action active, frame 100 selected, and its original range.
         _restore_target(target, restore_scene=True)
     _purge_transient_actions(restore=True)
+    _remove_runtime_visuals()
 
 
 def _resume_after_save():
@@ -1880,12 +2797,17 @@ def _resume_after_save():
     sessions, _save_sessions = _save_sessions, []
     for session in sessions:
         target = bpy.data.objects.get(session["target"])
-        clip_path = Path(session["clip_path"])
-        if target is None or not clip_path.is_file():
+        asset_kind = session.get("asset_kind", "clip")
+        asset_path = Path(
+            session.get("bundle_path") if asset_kind == "bundle" else session["clip_path"]
+        )
+        if target is None or not asset_path.is_file():
             continue
         try:
-            _import_clip(
-                bpy.context, target, clip_path, session["entry"], session["variant"],
+            catalog = _load_catalog()
+            _import_animation_asset(
+                bpy.context, target, asset_kind, asset_path, catalog,
+                session["entry"], session["variant"],
                 auto_play=bool(session.get("playing", False)),
             )
             bpy.context.scene.frame_set(min(
@@ -1940,9 +2862,11 @@ def _load_post_handler(_filepath):
     global _resume_fast_preview_after_render
     _stop_playback()
     _purge_transient_actions(restore=True)
+    _remove_runtime_visuals()
     _pending_requests.clear()
     _captured_actions.clear()
     _scene_settings.clear()
+    _action_settings.clear()
     _runtime_sessions.clear()
     _save_sessions = []
     _fast_preview_session = None
@@ -2026,7 +2950,9 @@ def unregister():
         if target is not None:
             _restore_target(target, restore_scene=True)
     _purge_transient_actions(restore=True)
+    _remove_runtime_visuals()
     _pending_requests.clear()
+    _action_settings.clear()
     try:
         if bpy.app.timers.is_registered(_poll_requests):
             bpy.app.timers.unregister(_poll_requests)

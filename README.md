@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.11 adds a measured 30 fps Smooth Animation mode, removes accidental dither from source-declared opaque materials, and introduces a more dimensional portrait studio with controlled highlights and one shadow-casting key. Exact FFXIV materials are automatically restored for F12/Render Portrait output and saves. The optional browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. Live extraction, GLB generation, Action assignment, animated evaluation, and captured-pose restoration have been verified on the current c0801 export; broader race, face-rig, and emote coverage remains prototype work.
+> **Prototype status:** version 0.0.12 turns each clicked body emote into an on-demand bundle: the primary PAP, exact TMB-scheduled facial clips, and supported visible emote events share the game's 30 fps clock. Eat Apple receives a timed lightweight apple, cheer-wave emotes receive colored glowsticks, and unsupported complex AVFX are reported instead of silently faked. A selected Penumbra animation mod can also be imported as clearly labeled **Custom** cards using only the active PAP overrides winning for your own current character. The shared cache remains outside every `.blend`, and preview Actions/effects are removed before saving.
 
 ## What it exports
 
@@ -14,7 +14,7 @@ The one-button prototype reads the final live draw object after Glamourer and Pe
 - Glamourer state and Penumbra resource-path diagnostics when their IPC APIs are available.
 - Skeleton, skin weights, morphs, material colorsets, custom character colors, and textures.
 - A Blender 5.x scene with a clean stick rig, organized collections, a 1440×1800 portrait camera, grounded seamless backdrop, softbox-style three-point lighting, mapped FFXIV materials, packed images, redacted provenance, an embedded build report, and a script-free A-pose/captured-pose Timeline slider.
-- When explicitly set up, an asset-free Blender sidebar that shows locally extracted game emote icons and requests only the selected vanilla skeletal animation. Combat, weapons, VFX, props, and modded animations are excluded.
+- When explicitly set up, an asset-free Blender sidebar that shows locally extracted game emote icons and requests only the selected synchronized animation bundle. It supports vanilla body/face timing, lightweight apple/glowstick previews, and explicitly imported active Penumbra PAP overrides. Combat, weapon actions, mounts, and automatic bulk extraction remain excluded.
 
 XivBlend rejects an export as incomplete when a visible model or material fails, or when Blender cannot verify a mesh bound to the imported armature.
 
@@ -74,7 +74,9 @@ The `.blend` contains redacted provenance, but it is not anonymous: its filename
 5. Keep FFXIV running with XivBlend loaded for the first click on an uncached clip. Later clicks use the shared local cache.
 6. Use **Stop / Restore Captured Pose** to unload the preview and return to the exported pose.
 
-The library is intentionally limited to the primary icon-click animation for 279 built-in player emotes and expressions in the current validated game data. It does not read Penumbra animation mods or include combat actions, weapons, VFX, props, mounts, alternate timeline slots, or the complete TMB animation layering. It reads canonical paths from the live SqPack; current Dalamud cannot independently prove that a live index was never modified by TexTools, so restore TexTools index changes first. Preview Actions are removed before saving, so game animation data is not embedded in the `.blend`.
+For a custom dance or other emote replacer, press **Refresh Penumbra Mods**, choose the mod, then press **Add Active Animation Overrides**. XivBlend asks Penumbra which canonical emote PAPs from that mod are currently winning for the local player, records their selected option names and content hashes, and adds separate cards under **Custom**. Changing the mod file or its options requires importing it again. Removing a saved source changes only XivBlend's catalog, never the Penumbra mod.
+
+The library is intentionally limited to the primary icon-click animation for 279 built-in player emotes and expressions in the current validated game data. Body-emote TMB schedules now add exact facial clips; visible event metadata is retained, with a procedural apple and glowsticks implemented first. Full AVFX particle simulation, exact prop meshes, combat actions, weapons, mounts, alternate timeline slots, sound, and camera events remain excluded. Vanilla assets come from canonical live SqPack paths; current Dalamud cannot independently prove that a live index was never modified by TexTools, so restore TexTools index changes first. Preview Actions and generated effect objects are removed before saving, so game animation data is not embedded in the `.blend`.
 
 See [Animation browser workflow, scope, and limitations](docs/ANIMATION_LIBRARY.md) for cache behavior, update steps, technical limits, and local-extraction boundaries.
 
@@ -82,12 +84,12 @@ See [Animation browser workflow, scope, and limitations](docs/ANIMATION_LIBRARY.
 
 - The file opens on Timeline frame 100, labeled `CAPTURED POSE`. Drag the ordinary Blender Timeline to frame 0, labeled `XIV A-POSE`, for the rig's standard rest A-pose; frames between them blend linearly. This control is stored as normal keyframes and requires no add-on, embedded script, or trusted-script permission.
 - New exports open with the portrait camera fitted to the actual captured pose rather than artificial frames between the A-pose and capture. The character stands on the sweep instead of floating above it. A warm rectangular key models the form, low cool fill preserves shadows, a cool strip rim separates hair and clothing, and only the key casts shadows. AgX highlight control, a 96-sample Eevee preset, and 16-bit PNG output are ready for a clean still render.
-- With animation-browser version 0.3.0 installed, open the 3D View's `N` sidebar and expand **XivBlend** → **Render Studio**. Use **Smooth Animation** for a deliberately simplified clay viewport driven by one shared shader, then **Full Detail** for the exact exported appearance. F12/Render Portrait output and saving automatically switch to Full Detail and safely resume Smooth Animation afterward. On the validated 61-mesh c0801 export, Smooth Animation sustained 30 fps at a 1845×1158 Rendered viewport; results still depend on the scene and other GPU workloads.
+- With animation-browser version 0.4.0 installed, open the 3D View's `N` sidebar and expand **XivBlend** → **Render Studio**. Use **Smooth Animation** for a deliberately simplified clay viewport driven by one shared shader, then **Full Detail** for the exact exported appearance. F12/Render Portrait output and saving automatically switch to Full Detail and safely resume Smooth Animation afterward. On the validated 61-mesh c0801 export, Smooth Animation sustained 30 fps at a 1845×1158 Rendered viewport; results still depend on the scene and other GPU workloads.
 - **Fit Camera to Current Pose** gives the strongest composition for one frame; **Fit Camera to Whole Animation** measures up to 96 evenly spaced poses across the active clip to keep its motion inside the shot; **Render Portrait** opens Blender's ordinary render view. Camera fitting does not change the lens, animation, or current frame.
 - The apparent blocky rig in earlier exports was caused by glTF-imported Icosphere custom bone shapes overriding Blender's `STICK` display. New files disable those widgets and show the clean stick armature by default.
 - Viewport grid, coordinate axes, relationship lines, camera, and light helpers are hidden by default. The camera and three studio lights remain active for F12 renders.
 - Native glTF rest matrices, bind transforms, and bone axes are preserved; the pose slider does not remap the rig. For an FBX round trip, use Primary Bone Axis `X` and Secondary Bone Axis `Y` at the FBX export/import boundary only.
-- Existing `.blend` files are not retroactively relit or repaired for unnecessary opaque dither. Export again with 0.0.11 or newer for the new studio and material cleanup. The 0.3.0 viewport/camera/render controls also work on compatible older XivBlend files after reinstalling the Blender panel.
+- Existing `.blend` files are not retroactively relit or repaired for unnecessary opaque dither. Export again with 0.0.11 or newer for the new studio and material cleanup. The 0.4.0 viewport, animation-bundle, camera, and render controls work on compatible metadata-bearing XivBlend files after reinstalling the Blender panel.
 
 ## Verified so far
 
@@ -98,6 +100,9 @@ See [Animation browser workflow, scope, and limitations](docs/ANIMATION_LIBRARY.
 - Source-declared opaque materials have no live Principled alpha link or transparent shadow path; true transparent, clipped, dithered, and unknown mod materials remain untouched.
 - The Smooth Animation mode restores original material datablock identities, scene quality settings, and viewport state exactly, and its runtime preview material is never saved into the character file.
 - The strict current-game catalog filter resolves 279 primary player-emote/expression entries (150 General, 100 Special, and 29 Expressions) while excluding weapon timelines, non-player timelines, and commandless internal/event variants.
+- A read-only audit of all 250 body entries in the current catalog parsed without failures: 210 declare face libraries, 736 face events resolved to 437 exact facial clips on the validated face rig, and 149 VFX plus 55 prop events remained synchronized and bounded.
+- Synchronized animation-bundle loading, timed facial NLA layers, transient apple/glowstick objects, save cleanup, and Action-slot binding pass headless tests in Blender 5.0 and Blender 5.2. The catalog and request queue use schema 2; bundle manifests use schema 1.
+- Custom animation imports use Penumbra's effective local-player collection, accept only winning PAP files contained inside the chosen mod's final filesystem path, and recheck the size, content hash, and path before decoding.
 - The animation catalog, icons, request queue, and decoded clips are versioned outside character files; the plugin and Blender add-on contain no bundled FFXIV assets.
 - The Windows x64 release package carries the plugin dependencies and visible AGPL license/notice files.
 
@@ -105,8 +110,9 @@ The remaining important validation is real-world live FFXIV exports and first-cl
 
 ## Prototype limitations
 
-- The animation browser includes only vanilla player emotes and facial expressions, primary slot zero. It excludes combat, weapons, VFX, sound, props, mounts, NPC/modded animations, and alternate timeline slots.
-- Multi-clip PAP auxiliary layers and TMB orchestration are not merged yet, so some ear/tail/part motion can be absent; the deterministic main-track fallback still needs full-catalog auditing.
+- The animation browser includes player emotes and facial expressions at primary slot zero, plus explicitly selected active Penumbra body-PAP overrides. It excludes combat, weapon actions, sound, mounts, NPC animations, and alternate timeline slots.
+- TMB-scheduled facial clips are reconstructed, but other auxiliary skeletal layers such as some ear/tail/part tracks are not yet merged.
+- Apple and glowstick previews are lightweight procedural approximations. Exact game prop meshes, arbitrary AVFX particles, custom face-PAP replacements, and mod-supplied VFX assets are not imported yet; unsupported events are shown as warnings.
 - Common c0101 fallback clips use simple named-bone retargeting in Blender, and extracted reference-frame root motion is not reconstructed yet.
 - No cloth/hair physics or material-animation conversion.
 - Mounts, ornaments, companions, and hidden weapons are excluded.
@@ -135,6 +141,6 @@ The main prototype integration is in:
 
 ## Source and license
 
-XivBlend is an AGPL-3.0-compatible fork of [PassiveModding/Meddle](https://github.com/PassiveModding/Meddle) at commit `312ad2610b74083376838964f5aebe6b5886449b` (v0.1.55.0). Its bundled shader conversion code is based on [PassiveModding/MeddleTools](https://github.com/PassiveModding/MeddleTools) at commit `fc241c595996321cbb4c33a87d9e299ab9d3a0cd` (v0.1.10). The local Havok PAP/SKLB loading and sampling implementation is adapted from the MIT-licensed [Dalamud VFXEditor](https://github.com/0ceal0t/Dalamud-VFXEditor) at commit `cd878d0e029d515acef723494ea4ffe5dbe19ade`.
+XivBlend is an AGPL-3.0-compatible fork of [PassiveModding/Meddle](https://github.com/PassiveModding/Meddle) at commit `312ad2610b74083376838964f5aebe6b5886449b` (v0.1.55.0). Its bundled shader conversion code is based on [PassiveModding/MeddleTools](https://github.com/PassiveModding/MeddleTools) at commit `fc241c595996321cbb4c33a87d9e299ab9d3a0cd` (v0.1.10). The local Havok PAP/SKLB loading, sampling, and bounded TMB timeline reader are adapted from the MIT-licensed [Dalamud VFXEditor](https://github.com/0ceal0t/Dalamud-VFXEditor) at commit `cd878d0e029d515acef723494ea4ffe5dbe19ade`.
 
 See [LICENSE.txt](LICENSE.txt) and [NOTICE-XIVBLEND.md](NOTICE-XIVBLEND.md) for the complete attribution and corresponding-source information.
