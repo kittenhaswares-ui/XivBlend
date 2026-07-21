@@ -53,7 +53,7 @@ public sealed class AnimationVfxAssetExporter : IService
     private const int MaximumGamePathLength = 512;
     private const int ShortHashCharacters = 20;
     private const string RawAssetFileName = "source.avfx";
-    private const string StaticPreviewFileName = "static-preview-v1.glb";
+    private const string StaticPreviewFileName = "static-preview-v2.glb";
     private const int MaximumResultWarnings = 1_024;
 
     private static readonly ConcurrentDictionary<string, object> AssetLocks = new(StringComparer.Ordinal);

@@ -129,7 +129,10 @@ def bone_custom_shape_assignments(
 def collection_objects(
     collection: bpy.types.Collection | None,
 ) -> set[bpy.types.Object]:
-    return set(collection.objects) if collection is not None else set()
+    # Character meshes are organized into readable one-level child collections
+    # beneath Meshes. Use recursive membership while retaining compatibility
+    # with older exports whose meshes were linked directly to the parent.
+    return set(collection.all_objects) if collection is not None else set()
 
 
 def audit_mesh(

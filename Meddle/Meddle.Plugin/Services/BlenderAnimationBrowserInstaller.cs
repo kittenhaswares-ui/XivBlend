@@ -14,7 +14,7 @@ namespace Meddle.Plugin.Services;
 /// </summary>
 public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
 {
-    public const string BrowserVersion = "0.5.0";
+    public const string BrowserVersion = "0.6.0";
 
     private const string ResourcePrefix = "XivBlendBuilder/";
     private const string InstallerResource = ResourcePrefix + "install_animation_browser.py";

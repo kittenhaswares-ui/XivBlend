@@ -35,6 +35,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
     private readonly IDalamudPluginInterface pluginInterface;
     private readonly ResolverService resolverService;
     private readonly ComposerFactory composerFactory;
+    private readonly CharacterPartProvenanceService characterPartProvenanceService;
     private readonly Configuration configuration;
     private readonly ICallGateSubscriber<int, uint, (int ErrorCode, string? State)> glamourerState;
     private readonly ICallGateSubscriber<ushort[], Dictionary<string, HashSet<string>>?[]> penumbraResourcePaths;
@@ -50,6 +51,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         IDalamudPluginInterface pluginInterface,
         ResolverService resolverService,
         ComposerFactory composerFactory,
+        CharacterPartProvenanceService characterPartProvenanceService,
         Configuration configuration)
     {
         this.log = log;
@@ -58,6 +60,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         this.pluginInterface = pluginInterface;
         this.resolverService = resolverService;
         this.composerFactory = composerFactory;
+        this.characterPartProvenanceService = characterPartProvenanceService;
         this.configuration = configuration;
         exportCancellationToken = disposeToken.Token;
 
@@ -121,15 +124,20 @@ public sealed class QuickBlendExportService : IService, IDisposable
 
             var raceCode = checked((ushort)characterInfo.GenderRace);
             var faceSkeleton = FindFaceSkeletonToken(characterInfo, raceCode);
+            var partProvenance = characterPartProvenanceService.Capture(characterInfo);
             snapshot = snapshot with
             {
                 RaceCode = raceCode,
                 FaceSkeleton = faceSkeleton,
-                Warnings = faceSkeleton is null
+                PartSources = partProvenance.PartSources,
+                Warnings = (faceSkeleton is null
                     ? snapshot.Warnings.Append(
                         "The captured face skeleton resource did not expose a standard fNNNN token; " +
-                        "facial animation browsing will be unavailable for this export.").ToArray()
-                    : snapshot.Warnings,
+                        "facial animation browsing will be unavailable for this export.")
+                    : snapshot.Warnings)
+                    .Concat(partProvenance.Warnings)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray(),
             };
 
             var currentLocalPlayer = objectTable.LocalPlayer;
@@ -303,7 +311,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         }
 
         return new SnapshotManifest(
-            SchemaVersion: 2,
+            SchemaVersion: 3,
             CapturedAtUtc: DateTimeOffset.UtcNow,
             CharacterName: characterName,
             ObjectIndex: objectIndex,
@@ -313,6 +321,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
             GlamourerErrorCode: glamourerErrorCode,
             GlamourerStateBase64: glamourerStateBase64,
             PenumbraResourcePaths: resourcePaths,
+            PartSources: [],
             Warnings: warnings);
     }
 
@@ -570,7 +579,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
 
         var builderRoot = Path.GetFullPath(Path.Combine(
             pluginInterface.ConfigDirectory.FullName,
-            "XivBlendBuilder-0.8.0"));
+            "XivBlendBuilder-0.9.0"));
         Directory.CreateDirectory(builderRoot);
         var requiredPrefix = builderRoot + Path.DirectorySeparatorChar;
 
@@ -630,5 +639,6 @@ public sealed class QuickBlendExportService : IService, IDisposable
         int? GlamourerErrorCode,
         string? GlamourerStateBase64,
         Dictionary<string, HashSet<string>>? PenumbraResourcePaths,
+        IReadOnlyList<CharacterPartSource> PartSources,
         IReadOnlyList<string> Warnings);
 }

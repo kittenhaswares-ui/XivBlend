@@ -17,15 +17,16 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Iterable
+import unicodedata
 import warnings
 
 import bpy
 from bpy_extras.object_utils import world_to_camera_view
-from mathutils import Matrix, Vector
+from mathutils import Matrix, Quaternion, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.8.0"
+BUILDER_VERSION = "0.9.0"
 ANIMATION_CATALOG_SCHEMA = 2
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -45,6 +46,21 @@ SETUP_COLLECTION = "Scene Setup"
 CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
 MATERIAL_SURFACE_CLASSIFICATION_PROPERTY = "xivblend_surface_classification"
 MATERIAL_OPAQUE_ALPHA_LINKS_PROPERTY = "xivblend_opaque_alpha_links_removed"
+PART_COLLECTION_PROPERTY = "xivblend_part_collection"
+PART_CATEGORY_PROPERTY = "xivblend_part_category"
+PART_SOURCE_PROPERTY = "xivblend_source_name"
+PART_CONTRIBUTORS_PROPERTY = "xivblend_source_contributors"
+GLTF_BONE_AXIS_CORRECTION_PROPERTY = "xivblend_gltf_axis_correction_v1"
+
+MAX_PART_SOURCE_RECORDS = 4_096
+MAX_PART_CONTRIBUTORS = 64
+MAX_PART_SOURCE_CHARACTERS = 1_024
+MAX_GLTF_JSON_BYTES = 64 * 1024 * 1024
+MAX_GLTF_NODES = 65_536
+# Blender ID names are byte-bounded. Leave the complete 63-byte budget available
+# while truncating on Unicode code-point boundaries ourselves so Blender never
+# invents an opaque .001 suffix for a long or colliding mod name.
+MAX_COLLECTION_NAME_BYTES = 63
 
 POSE_REST_FRAME = 0
 POSE_CAPTURED_FRAME = 100
@@ -505,6 +521,255 @@ def import_character(
     return imported, armatures, character_meshes
 
 
+def read_gltf_document(source: Path) -> dict[str, Any]:
+    """Read only the bounded JSON document needed to preserve joint axes."""
+    if source.suffix.lower() == ".gltf":
+        size = source.stat().st_size
+        if size <= 0 or size > MAX_GLTF_JSON_BYTES:
+            raise BuildError("Source glTF JSON is empty or exceeds the safety limit")
+        payload = source.read_bytes()
+    else:
+        with source.open("rb") as stream:
+            header = stream.read(12)
+            if (
+                len(header) != 12
+                or header[:4] != b"glTF"
+                or int.from_bytes(header[4:8], "little") != 2
+            ):
+                raise BuildError("Source GLB has an invalid header")
+            declared_size = int.from_bytes(header[8:12], "little")
+            if declared_size != source.stat().st_size:
+                raise BuildError("Source GLB declares an invalid length")
+            chunk_header = stream.read(8)
+            if len(chunk_header) != 8 or chunk_header[4:8] != b"JSON":
+                raise BuildError("Source GLB does not begin with a JSON chunk")
+            chunk_size = int.from_bytes(chunk_header[:4], "little")
+            if chunk_size <= 0 or chunk_size > MAX_GLTF_JSON_BYTES:
+                raise BuildError("Source GLB JSON exceeds the safety limit")
+            payload = stream.read(chunk_size)
+            if len(payload) != chunk_size:
+                raise BuildError("Source GLB JSON chunk is truncated")
+
+    try:
+        document = json.loads(payload.decode("utf-8-sig").rstrip("\x00 \t\r\n"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BuildError("Source glTF contains invalid JSON") from exc
+    if not isinstance(document, dict):
+        raise BuildError("Source glTF JSON root is not an object")
+    nodes = document.get("nodes")
+    if not isinstance(nodes, list) or not 0 < len(nodes) <= MAX_GLTF_NODES:
+        raise BuildError("Source glTF contains an invalid joint-node table")
+    return document
+
+
+def gltf_node_local_matrix(node: dict[str, Any]) -> Matrix:
+    values = node.get("matrix")
+    if values is not None:
+        if not isinstance(values, list) or len(values) != 16:
+            raise BuildError("Source glTF node has an invalid matrix")
+        matrix_values = [float(value) for value in values]
+        if not all(math.isfinite(value) for value in matrix_values):
+            raise BuildError("Source glTF node matrix is not finite")
+        return Matrix(
+            (
+                matrix_values[0::4],
+                matrix_values[1::4],
+                matrix_values[2::4],
+                matrix_values[3::4],
+            )
+        )
+
+    translation = node.get("translation", [0.0, 0.0, 0.0])
+    rotation = node.get("rotation", [0.0, 0.0, 0.0, 1.0])
+    scale = node.get("scale", [1.0, 1.0, 1.0])
+    if (
+        not isinstance(translation, list)
+        or len(translation) != 3
+        or not isinstance(rotation, list)
+        or len(rotation) != 4
+        or not isinstance(scale, list)
+        or len(scale) != 3
+    ):
+        raise BuildError("Source glTF node has invalid transform components")
+    components = [float(value) for value in (*translation, *rotation, *scale)]
+    if not all(math.isfinite(value) for value in components):
+        raise BuildError("Source glTF node transform is not finite")
+    quaternion = Quaternion((components[6], components[3], components[4], components[5]))
+    if sum(float(component) * float(component) for component in quaternion) < 1.0e-16:
+        raise BuildError("Source glTF node has a zero rotation quaternion")
+    quaternion.normalize()
+    return (
+        Matrix.Translation(Vector(components[:3]))
+        @ quaternion.to_matrix().to_4x4()
+        @ Matrix.Diagonal((*components[7:10], 1.0))
+    )
+
+
+def preserve_gltf_bone_axes(
+    source: Path,
+    armatures: Iterable[bpy.types.Object],
+) -> dict[str, Any]:
+    """Store Blender-bone to original-glTF joint-axis corrections.
+
+    Blender's glTF importer deliberately turns joint axes to make readable
+    edit bones. Skinning remains exact, but a rigid child attached directly to
+    that display bone would inherit the remapped axes. Runtime emote props need
+    the original joint basis used by XIV, so retain B^-1 * O on each data bone.
+    """
+    document = read_gltf_document(source)
+    nodes = document["nodes"]
+    if any(not isinstance(node, dict) for node in nodes):
+        raise BuildError("Source glTF contains a non-object node")
+
+    joint_indices: set[int] = set()
+    skins = document.get("skins", [])
+    if not isinstance(skins, list):
+        raise BuildError("Source glTF contains an invalid skin table")
+    for skin in skins:
+        if not isinstance(skin, dict) or not isinstance(skin.get("joints"), list):
+            raise BuildError("Source glTF contains an invalid skin")
+        for value in skin["joints"]:
+            if not isinstance(value, int) or value < 0 or value >= len(nodes):
+                raise BuildError("Source glTF skin references an invalid joint")
+            joint_indices.add(value)
+    if not joint_indices:
+        raise BuildError("Source glTF contains no skin joints")
+
+    parents: dict[int, int] = {}
+    for parent_index, node in enumerate(nodes):
+        children = node.get("children", [])
+        if not isinstance(children, list):
+            raise BuildError("Source glTF node has an invalid child list")
+        for child_index in children:
+            if not isinstance(child_index, int) or child_index < 0 or child_index >= len(nodes):
+                raise BuildError("Source glTF node references an invalid child")
+            if child_index in parents:
+                raise BuildError("Source glTF node has multiple parents")
+            parents[child_index] = parent_index
+
+    local_matrices = [gltf_node_local_matrix(node) for node in nodes]
+    world_matrices: dict[int, Matrix] = {}
+    visiting: set[int] = set()
+
+    def world_matrix(index: int) -> Matrix:
+        if index in world_matrices:
+            return world_matrices[index]
+        if index in visiting:
+            raise BuildError("Source glTF node hierarchy contains a cycle")
+        visiting.add(index)
+        parent = parents.get(index)
+        result = local_matrices[index].copy()
+        if parent is not None:
+            result = world_matrix(parent) @ result
+        visiting.remove(index)
+        world_matrices[index] = result
+        return result
+
+    by_name: dict[str, list[int]] = {}
+    for index in sorted(joint_indices):
+        name = nodes[index].get("name")
+        if isinstance(name, str) and name:
+            by_name.setdefault(name, []).append(index)
+
+    yup_to_zup = Matrix(
+        (
+            (1.0, 0.0, 0.0, 0.0),
+            (0.0, 0.0, -1.0, 0.0),
+            (0.0, 1.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    inverse_basis = yup_to_zup.inverted()
+    stored = 0
+    non_identity = 0
+    ambiguous_names = 0
+    maximum_alignment_error = 0.0
+    required_sockets = {"n_buki_l", "n_buki_r", "n_throw", "j_te_l", "j_te_r"}
+    required_present: set[str] = set()
+    required_stored: set[str] = set()
+
+    for armature in armatures:
+        for bone in armature.data.bones:
+            if bone.name in required_sockets:
+                required_present.add(bone.name)
+            candidates = by_name.get(bone.name, [])
+            if not candidates:
+                continue
+            blender_rest = bone.matrix_local.copy()
+            world_to_armature = armature.matrix_world.inverted_safe()
+            if len(candidates) > 1:
+                ambiguous_names += 1
+            index = min(
+                candidates,
+                key=lambda candidate: (
+                    (
+                        (
+                            world_to_armature
+                            @ yup_to_zup
+                            @ world_matrix(candidate)
+                            @ inverse_basis
+                        ).translation
+                        - blender_rest.translation
+                    ).length_squared,
+                    candidate,
+                ),
+            )
+            original_rest = (
+                world_to_armature
+                @ yup_to_zup
+                @ world_matrix(index)
+                @ inverse_basis
+            )
+            correction = blender_rest.inverted_safe() @ original_rest
+            if not all(
+                math.isfinite(correction[row][column])
+                for row in range(4)
+                for column in range(4)
+            ):
+                raise BuildError("A preserved glTF joint-axis correction is not finite")
+            corrected = blender_rest @ correction
+            alignment_error = max(
+                abs(corrected[row][column] - original_rest[row][column])
+                for row in range(4)
+                for column in range(4)
+            )
+            maximum_alignment_error = max(maximum_alignment_error, alignment_error)
+            if alignment_error > 1.0e-6:
+                raise BuildError("A preserved glTF joint-axis correction did not validate")
+            values = tuple(
+                float(correction[row][column])
+                for row in range(4)
+                for column in range(4)
+            )
+            bone[GLTF_BONE_AXIS_CORRECTION_PROPERTY] = values
+            stored += 1
+            if max(
+                abs(correction[row][column] - (1.0 if row == column else 0.0))
+                for row in range(4)
+                for column in range(4)
+            ) > 1.0e-5:
+                non_identity += 1
+            if bone.name in required_sockets:
+                required_stored.add(bone.name)
+
+    missing_required = sorted(required_present - required_stored)
+    if missing_required:
+        raise BuildError(
+            "Original glTF axes were not preserved for attachment bones: "
+            + ", ".join(missing_required)
+        )
+    report = {
+        "SchemaVersion": 1,
+        "StoredBones": stored,
+        "NonIdentityCorrections": non_identity,
+        "AmbiguousJointNames": ambiguous_names,
+        "RequiredAttachmentBones": sorted(required_stored),
+        "MaximumAlignmentError": maximum_alignment_error,
+    }
+    log("gltf_bone_axes_preserved", **report)
+    return report
+
+
 def resolve_meddle_tools(path_value: str | None) -> tuple[Path, Path] | None:
     if not path_value:
         return None
@@ -735,8 +1000,267 @@ def bone_custom_shapes(objects: Iterable[bpy.types.Object]) -> set[bpy.types.Obj
     }
 
 
+def mapping_value(mapping: Any, *names: str) -> Any:
+    if not isinstance(mapping, dict):
+        return None
+    folded = {str(key).casefold(): value for key, value in mapping.items()}
+    for name in names:
+        if name.casefold() in folded:
+            return folded[name.casefold()]
+    return None
+
+
+def normalized_game_path(value: Any) -> str:
+    return str(value or "").strip().replace("\\", "/").lstrip("/").casefold()
+
+
+def part_source_names(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    result: list[str] = []
+    for item in value[:MAX_PART_CONTRIBUTORS]:
+        if isinstance(item, str):
+            candidate = item
+        elif isinstance(item, dict):
+            candidate = mapping_value(
+                item,
+                "SourceName",
+                "PrimarySourceName",
+                "ModName",
+                "DisplayName",
+                "Name",
+            )
+        else:
+            continue
+        if isinstance(candidate, str) and candidate.strip():
+            result.append(candidate[:MAX_PART_SOURCE_CHARACTERS])
+    return result
+
+
+def read_part_source_index(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Read bounded, path-free Penumbra attribution from new snapshot manifests.
+
+    The aliases deliberately accept early prototype field spellings. Old manifests
+    simply return an empty index and are classified as Vanilla/Modded from the
+    imported mesh metadata instead.
+    """
+    raw = mapping_value(document, "PartSources", "partSources", "part_sources")
+    rows: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        rows = [item for item in raw[:MAX_PART_SOURCE_RECORDS] if isinstance(item, dict)]
+    elif isinstance(raw, dict):
+        for game_path, value in list(raw.items())[:MAX_PART_SOURCE_RECORDS]:
+            if isinstance(value, dict):
+                row = dict(value)
+                row.setdefault("ModelGamePath", game_path)
+            elif isinstance(value, str):
+                row = {"ModelGamePath": game_path, "SourceName": value}
+            else:
+                continue
+            rows.append(row)
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        game_path = mapping_value(row, "ModelGamePath", "modelGamePath", "model_game_path")
+        key = normalized_game_path(game_path)
+        if not key:
+            continue
+
+        source_name = mapping_value(
+            row,
+            "SourceName",
+            "PrimarySourceName",
+            "PrimaryModName",
+            "ModName",
+            "DisplayName",
+        )
+        source_key = mapping_value(
+            row,
+            "SourceKey",
+            "SourceIdentifier",
+            "PrimaryModIdentifier",
+            "ModIdentifier",
+        )
+        contributors = part_source_names(
+            mapping_value(
+                row,
+                "Contributors",
+                "ContributorNames",
+                "ContributingModNames",
+                "ContributorModNames",
+            )
+        )
+        ambiguous = mapping_value(
+            row,
+            "PrimarySourceAmbiguous",
+            "primarySourceAmbiguous",
+            "primary_source_ambiguous",
+        ) is True
+        if ambiguous and contributors:
+            source_name = "Multiple Mods"
+        elif not isinstance(source_name, str) or not source_name.strip():
+            source_name = "Vanilla / Game"
+        if len(source_name) > MAX_PART_SOURCE_CHARACTERS:
+            source_name = source_name[:MAX_PART_SOURCE_CHARACTERS]
+        source_key_text = (
+            (
+                "ambiguous:"
+                + hashlib.sha256(
+                    "\0".join(
+                        sorted(item.casefold() for item in contributors)
+                    ).encode("utf-8", errors="replace")
+                ).hexdigest()
+            )
+            if ambiguous and contributors
+            else (
+                str(source_key)[:MAX_PART_SOURCE_CHARACTERS]
+                if source_key is not None and str(source_key).strip()
+                else source_name
+            )
+        )
+
+        existing = result.get(key)
+        if existing is None:
+            result[key] = {
+                "source_name": source_name,
+                "source_key": source_key_text,
+                "contributors": contributors,
+            }
+            continue
+        for contributor in contributors:
+            if contributor.casefold() not in {
+                str(item).casefold() for item in existing["contributors"]
+            }:
+                existing["contributors"].append(contributor)
+                if len(existing["contributors"]) >= MAX_PART_CONTRIBUTORS:
+                    break
+    return result
+
+
+def utf8_prefix(value: str, maximum_bytes: int) -> str:
+    result: list[str] = []
+    length = 0
+    for character in value:
+        encoded = character.encode("utf-8")
+        if length + len(encoded) > maximum_bytes:
+            break
+        result.append(character)
+        length += len(encoded)
+    return "".join(result)
+
+
+def safe_part_text(value: Any, fallback: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned: list[str] = []
+    for character in text:
+        if character in "/\\:" or unicodedata.category(character).startswith("C"):
+            cleaned.append(" ")
+        else:
+            cleaned.append(character)
+    result = re.sub(r"\s+", " ", "".join(cleaned)).strip(" .-_")
+    return result or fallback
+
+
+def unique_part_collection_name(
+    label: str,
+    stable_key: str,
+    used_names: set[str],
+) -> str:
+    cleaned = safe_part_text(label, "Character Part - Unknown")
+    digest = hashlib.sha256(stable_key.encode("utf-8", errors="replace")).hexdigest()
+    encoded = cleaned.encode("utf-8")
+    needs_suffix = len(encoded) > MAX_COLLECTION_NAME_BYTES
+
+    for suffix_length in (6, 8, 12, 16, 24, 32, 64):
+        suffix = f" [{digest[:suffix_length]}]" if needs_suffix else ""
+        candidate = utf8_prefix(
+            cleaned,
+            MAX_COLLECTION_NAME_BYTES - len(suffix.encode("utf-8")),
+        ).rstrip(" .-_") + suffix
+        folded = candidate.casefold()
+        if folded not in used_names:
+            used_names.add(folded)
+            return candidate
+        needs_suffix = True
+
+    raise BuildError("Could not create a unique, bounded character-part collection name")
+
+
+def model_part_category(game_path: Any) -> str:
+    path = normalized_game_path(game_path)
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    suffix = stem.rsplit("_", 1)[-1]
+
+    if "/equipment/" in path:
+        return {
+            "met": "Head",
+            "top": "Upper Body",
+            "glv": "Hands",
+            "dwn": "Legs",
+            "sho": "Feet",
+        }.get(suffix, "Clothes")
+    if "/accessory/" in path:
+        return {
+            "ear": "Earrings",
+            "nek": "Neck",
+            "wrs": "Wrists",
+            "rir": "Right Ring",
+            "ril": "Left Ring",
+            "gls": "Glasses",
+        }.get(suffix, "Accessory")
+    if "/obj/hair/" in path:
+        return "Hair"
+    if "/obj/face/" in path:
+        return "Face"
+    if "/obj/tail/" in path:
+        return "Tail"
+    if "/obj/zear/" in path or "/obj/ear/" in path:
+        return "Ears"
+    if "/obj/body/" in path:
+        return "Body"
+    if "/weapon/" in path:
+        return "Weapon"
+    return "Character Part"
+
+
+def mesh_part_source(
+    obj: bpy.types.Object,
+    source_index: dict[str, dict[str, Any]],
+) -> tuple[str, str, list[str]]:
+    game_path = obj.data.get("modelGamePath", "")
+    attribution = source_index.get(normalized_game_path(game_path))
+    if attribution is not None:
+        source = safe_part_text(attribution["source_name"], "Modded")
+        contributors = [
+            safe_part_text(item, "Unnamed Mod")
+            for item in attribution["contributors"][:MAX_PART_CONTRIBUTORS]
+        ]
+        if (
+            source not in {"Multiple Mods", "Vanilla / Game"}
+            and source.casefold() not in {item.casefold() for item in contributors}
+        ):
+            contributors.insert(0, source)
+        if not contributors:
+            contributors = [source]
+        return source, str(attribution["source_key"]), contributors
+
+    full_path = str(obj.data.get("modelFullPath", "") or "").strip()
+    source = (
+        "Modded"
+        if full_path
+        and normalized_game_path(full_path) != normalized_game_path(game_path)
+        else "Vanilla"
+    )
+    return source, f"fallback:{source.casefold()}", [source]
+
+
 def organize_objects(
-    scene: bpy.types.Scene, imported: list[bpy.types.Object]
+    scene: bpy.types.Scene,
+    imported: list[bpy.types.Object],
+    document: dict[str, Any],
 ) -> dict[str, bpy.types.Collection]:
     root = new_collection(CHARACTER_COLLECTION, scene.collection)
     rig = new_collection(RIG_COLLECTION, root)
@@ -755,6 +1279,23 @@ def organize_objects(
     custom_bone_shapes = bone_custom_shapes(imported) | {
         obj for obj in imported if bool(obj.get(CUSTOM_BONE_SHAPE_PROPERTY))
     }
+    source_index = read_part_source_index(document)
+    mesh_identity = {
+        obj: (
+            obj.name,
+            obj.data.name,
+            obj.parent,
+            tuple(
+                (modifier.name, modifier.object)
+                for modifier in obj.modifiers
+                if modifier.type == "ARMATURE"
+            ),
+        )
+        for obj in imported
+        if obj.type == "MESH" and obj not in custom_bone_shapes
+    }
+    group_assignments: dict[bpy.types.Object, tuple[str, str]] = {}
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
 
     for obj in imported:
         if obj.type == "ARMATURE":
@@ -778,12 +1319,108 @@ def organize_objects(
             if old_collection != target:
                 old_collection.objects.unlink(obj)
 
-        obj["clean_extract_component"] = target.name
+        # Keep the stable parent component tag even though character meshes will
+        # move into readable child collections below. Older browser versions use
+        # this exact value to identify the character.
+        obj["clean_extract_component"] = (
+            MESH_COLLECTION if target == meshes else target.name
+        )
+
+        if target == meshes:
+            game_path = obj.data.get("modelGamePath", "")
+            category = model_part_category(game_path)
+            source, source_key, contributors = mesh_part_source(obj, source_index)
+            group_key = (category, source_key.casefold())
+            group = groups.setdefault(
+                group_key,
+                {
+                    "category": category,
+                    "source": source,
+                    "source_key": source_key,
+                    "contributors": [],
+                    "objects": [],
+                },
+            )
+            group["objects"].append(obj)
+            known_contributors = {
+                str(item).casefold() for item in group["contributors"]
+            }
+            for contributor in contributors:
+                if contributor.casefold() not in known_contributors:
+                    group["contributors"].append(contributor)
+                    known_contributors.add(contributor.casefold())
+            group_assignments[obj] = group_key
 
     retained = set(targets.values())
     for collection in list(bpy.data.collections):
         if collection not in retained:
             bpy.data.collections.remove(collection, do_unlink=True)
+
+    # Importer collections are gone before the readable leaves are created, so a
+    # hostile or coincident source name cannot force Blender's implicit .001
+    # suffix. Each mesh is linked to exactly one one-level leaf under Meshes.
+    used_names = {collection.name.casefold() for collection in bpy.data.collections}
+    part_collections: dict[tuple[str, str], bpy.types.Collection] = {}
+    for group_key, group in sorted(
+        groups.items(),
+        key=lambda item: (
+            str(item[1]["category"]).casefold(),
+            str(item[1]["source"]).casefold(),
+            str(item[1]["source_key"]).casefold(),
+        ),
+    ):
+        category = safe_part_text(group["category"], "Character Part")
+        source = safe_part_text(group["source"], "Unknown")
+        stable_key = f"{category}\0{group['source_key']}"
+        collection_name = unique_part_collection_name(
+            f"{category} - {source}",
+            stable_key,
+            used_names,
+        )
+        collection = new_collection(collection_name, meshes)
+        collection[PART_COLLECTION_PROPERTY] = True
+        collection[PART_CATEGORY_PROPERTY] = category
+        collection[PART_SOURCE_PROPERTY] = source
+        collection[PART_CONTRIBUTORS_PROPERTY] = json.dumps(
+            group["contributors"][:MAX_PART_CONTRIBUTORS],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        part_collections[group_key] = collection
+
+        for obj in group["objects"]:
+            collection.objects.link(obj)
+            meshes.objects.unlink(obj)
+
+    if set(group_assignments) != set(mesh_identity):
+        raise BuildError("Not every character mesh received a readable part collection")
+    for obj, before in mesh_identity.items():
+        after = (
+            obj.name,
+            obj.data.name,
+            obj.parent,
+            tuple(
+                (modifier.name, modifier.object)
+                for modifier in obj.modifiers
+                if modifier.type == "ARMATURE"
+            ),
+        )
+        if after != before:
+            raise BuildError(
+                "Character collection organization changed a mesh name or rig binding"
+            )
+
+    meshes["xivblend_part_collection_count"] = len(part_collections)
+    log(
+        "character_part_collections_created",
+        collections=len(part_collections),
+        meshes=len(mesh_identity),
+        attributed=sum(
+            1
+            for obj in mesh_identity
+            if normalized_game_path(obj.data.get("modelGamePath", "")) in source_index
+        ),
+    )
 
     return targets
 
@@ -2112,9 +2749,52 @@ def validate_output(
     viewport_configuration: dict[str, Any],
     primary_armature: bpy.types.Object,
 ) -> dict[str, Any]:
-    meshes = [obj for obj in collections["meshes"].objects if obj.type == "MESH"]
+    mesh_root = collections["meshes"]
+    meshes = [obj for obj in mesh_root.all_objects if obj.type == "MESH"]
     armatures = [obj for obj in collections["rig"].objects if obj.type == "ARMATURE"]
     armature_set = set(armatures)
+
+    part_collections = list(mesh_root.children)
+    part_collection_set = set(part_collections)
+    direct_meshes = [obj.name for obj in mesh_root.objects if obj.type == "MESH"]
+    invalid_part_membership: dict[str, list[str]] = {}
+    for obj in meshes:
+        memberships = [
+            collection.name
+            for collection in obj.users_collection
+            if collection in part_collection_set
+        ]
+        if len(memberships) != 1:
+            invalid_part_membership[obj.name] = sorted(memberships)
+
+    if direct_meshes:
+        raise BuildError(
+            "Character meshes remain directly in the Meshes collection: "
+            + ", ".join(sorted(direct_meshes))
+        )
+    if not part_collections:
+        raise BuildError("The Meshes collection contains no readable part collections")
+    if invalid_part_membership:
+        raise BuildError(
+            "Character meshes must belong to exactly one readable part collection: "
+            + ", ".join(
+                f"{name} ({len(memberships)})"
+                for name, memberships in sorted(invalid_part_membership.items())
+            )
+        )
+    invalid_part_collections = [
+        collection.name
+        for collection in part_collections
+        if not bool(collection.get(PART_COLLECTION_PROPERTY, False))
+        or not str(collection.get(PART_CATEGORY_PROPERTY, "")).strip()
+        or not str(collection.get(PART_SOURCE_PROPERTY, "")).strip()
+        or len(collection.children) != 0
+    ]
+    if invalid_part_collections:
+        raise BuildError(
+            "Character part collections lost their grouping metadata: "
+            + ", ".join(sorted(invalid_part_collections))
+        )
 
     unbound = [
         obj.name
@@ -2244,6 +2924,7 @@ def validate_output(
         "Armatures": len(armatures),
         "Bones": sum(len(obj.data.bones) for obj in armatures),
         "CharacterMeshes": len(meshes),
+        "PartCollections": len(part_collections),
         "Vertices": sum(len(obj.data.vertices) for obj in meshes),
         "Materials": len(bpy.data.materials),
         "SourceMaterials": material_mapping["source_materials"],
@@ -2348,11 +3029,14 @@ def main() -> None:
     )
     scene = clear_scene()
     imported, armatures, character_meshes = import_character(source)
+    bone_axis_report = preserve_gltf_bone_axes(source, armatures)
+    scene["xivblend_gltf_bone_axis_schema"] = bone_axis_report["SchemaVersion"]
+    scene["xivblend_gltf_bone_axis_corrections"] = bone_axis_report["StoredBones"]
     removed_vertex_groups = remove_empty_vertex_groups(character_meshes)
     captured_pose, pose_configuration = configure_armatures(scene, armatures)
     material_mapping = apply_meddle_materials(source, imported, meddle_location)
     material_optimization = optimize_character_materials(imported)
-    collections = organize_objects(scene, imported)
+    collections = organize_objects(scene, imported, document)
     configure_scene_setup(scene, imported, collections["setup"])
     viewport_configuration = configure_viewport_defaults()
     embed_manifest(scene, manifest_path, document, canonical, digest, source)
@@ -2387,6 +3071,7 @@ def main() -> None:
         viewport_configuration,
         primary_armature,
     )
+    report["BoneAxisCorrections"] = bone_axis_report
     embed_build_report(scene, report)
     # Run the privacy assertion after the build report is embedded so every ID
     # that will actually be saved has been included in the recursive scan.

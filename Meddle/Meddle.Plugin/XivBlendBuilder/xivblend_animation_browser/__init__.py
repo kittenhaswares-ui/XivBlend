@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -53,6 +53,10 @@ CAPTURED_MARKER = "CAPTURED POSE"
 STUDIO_COMPONENT_PROPERTY = "xivblend_component"
 STUDIO_CAMERA_COMPONENT = "studio_camera"
 CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
+GLTF_BONE_AXIS_CORRECTION_PROPERTY = "xivblend_gltf_axis_correction_v1"
+LEGACY_GLTF_SOCKET_BONES = frozenset(
+    {"n_buki_l", "n_buki_r", "n_throw", "j_te_l", "j_te_r"}
+)
 SCENE_SETUP_COLLECTION = "Scene Setup"
 CHARACTER_COLLECTION = "FFXIV Character"
 CHARACTER_MESH_COMPONENT = "Meshes"
@@ -577,7 +581,7 @@ def _read_bundle_manifest(catalog, bundle_path):
     if not isinstance(document, dict):
         raise ClipError(f"{bundle_path.name} must contain a JSON object")
     schema = _int_value(_field(document, "SchemaVersion"), 0)
-    if schema != 2:
+    if schema != 3:
         raise ClipError(
             f"Animation bundle {bundle_path.name} uses obsolete schema {schema}; "
             "rebuild it with the current XivBlend plugin"
@@ -1704,7 +1708,46 @@ def _attachment_bone(target, event):
     return next((name for name in fallbacks if target.pose.bones.get(name) is not None), None)
 
 
-def _attachment_matrix(event):
+def _bone_axis_correction(target, bone_name):
+    bone = target.data.bones.get(bone_name) if target is not None else None
+    raw = bone.get(GLTF_BONE_AXIS_CORRECTION_PROPERTY) if bone is not None else None
+    if raw is not None:
+        try:
+            values = [float(value) for value in raw]
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ClipError(f"attachment bone '{bone_name}' has invalid axis metadata") from error
+        if len(values) != 16 or not all(math.isfinite(value) for value in values):
+            raise ClipError(f"attachment bone '{bone_name}' has invalid axis metadata")
+        correction = Matrix(
+            (
+                values[0:4],
+                values[4:8],
+                values[8:12],
+                values[12:16],
+            )
+        )
+        if abs(correction.determinant()) < 1.0e-8:
+            raise ClipError(f"attachment bone '{bone_name}' has singular axis metadata")
+        return correction
+
+    # Browser 0.5 and older XivBlend files predate preserved glTF joint axes.
+    # Blender's default importer rotates these known XIV socket/display bones
+    # +90 degrees around local X, so undo that only on a tagged XivBlend rig.
+    tagged_xivblend_rig = _id_property(
+        target,
+        "xivblend_race_code",
+        "XivBlendRaceCode",
+    ) is not None or _id_property(
+        getattr(target, "data", None),
+        "xivblend_race_code",
+        "XivBlendRaceCode",
+    ) is not None
+    if tagged_xivblend_rig and bone_name in LEGACY_GLTF_SOCKET_BONES:
+        return Euler((-math.pi / 2.0, 0.0, 0.0), "XYZ").to_matrix().to_4x4()
+    return Matrix.Identity(4)
+
+
+def _attachment_matrix(event, target=None, bone_name=""):
     scale = _float_value(_field(event, "AttachmentScale", "Scale"), 1.0)
     if not math.isfinite(scale) or scale <= 0.0 or scale > 100.0:
         scale = 1.0
@@ -1727,7 +1770,8 @@ def _attachment_matrix(event):
         (0.0, 0.0, 0.0, 1.0),
     ))
     game_matrix = Matrix.Translation(offset) @ rotation @ Matrix.Scale(scale, 4)
-    return basis @ game_matrix @ basis.inverted()
+    attachment = basis @ game_matrix @ basis.inverted()
+    return _bone_axis_correction(target, bone_name) @ attachment
 
 
 def _restore_selection(context, original_active, original_selected):
@@ -1803,7 +1847,7 @@ def _import_runtime_prop(context, collection, target, catalog, event, index):
         collection.objects.link(anchor)
         anchor.parent = bone_anchor
         anchor.matrix_parent_inverse = Matrix.Identity(4)
-        anchor.matrix_basis = _attachment_matrix(event)
+        anchor.matrix_basis = _attachment_matrix(event, target, bone_name)
 
         for obj in imported_objects:
             obj[TRANSIENT_PROPERTY] = True

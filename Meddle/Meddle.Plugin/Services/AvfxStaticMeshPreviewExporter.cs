@@ -42,7 +42,10 @@ public static class AvfxStaticMeshPreviewExporter
         {
             var mesh = new MeshBuilder<VertexPositionNormalTangent, VertexColor1Texture4>(
                 $"AVFX Static Preview {model.ModelIndex}");
-            var material = new MaterialBuilder($"AVFX Preview Placeholder {model.ModelIndex}");
+            var material = new MaterialBuilder($"AVFX Static Preview Unlit {model.ModelIndex}")
+                .WithUnlitShader()
+                .WithBaseColor(Vector4.One)
+                .WithDoubleSide(true);
             var primitive = mesh.UsePrimitive(material);
             var vertices = model.Vertices.Select(ToVertex).ToArray();
             foreach (var triangle in model.Triangles)

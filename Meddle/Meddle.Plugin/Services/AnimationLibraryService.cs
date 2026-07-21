@@ -28,7 +28,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 {
     public const int CatalogSchemaVersion = 2;
     public const int QueueSchemaVersion = 2;
-    public const int BundleSchemaVersion = 2;
+    public const int BundleSchemaVersion = 3;
 
     private const long MaximumBundleJsonBytes = 4_194_304;
     private const int MaximumBundleLayers = 1_024;
@@ -1472,7 +1472,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                     StringComparison.Ordinal)
                 || previewPresent
                 && !item.StaticPreviewRelativePath!.Replace('\\', '/').EndsWith(
-                    $"/assets/vfx/{shortHash}/static-preview-v1.glb",
+                    $"/assets/vfx/{shortHash}/static-preview-v2.glb",
                     StringComparison.Ordinal))
             {
                 return false;
