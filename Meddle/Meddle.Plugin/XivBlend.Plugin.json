@@ -2,7 +2,7 @@
     "Author": "kittenhaswares-ui; based on PassiveModding/Meddle",
     "Name": "XivBlend Prototype",
     "Punchline": "Export your character and preview synchronized emotes in Blender.",
-    "Description": "Self-only Blender export with synchronized body/face emotes and explicit local Penumbra animation imports, built on Meddle's AGPL extractor.",
+    "Description": "Self-only Blender export with synchronized body/face emotes, exact game props, indexed AVFX sources, and explicit local Penumbra animation imports, built on Meddle's AGPL extractor.",
     "InternalName": "XivBlend.Plugin",
     "ApplicableVersion": "any",
     "Tags": [

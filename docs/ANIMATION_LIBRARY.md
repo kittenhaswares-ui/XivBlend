@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.12 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, and supported visible prop/VFX events all use FFXIV's 30 fps timeline. The browser can also add active body-PAP overrides from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and the generated data stays in a shared local cache rather than inside character `.blend` files.
+XivBlend 0.0.13 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
 
 ## Scope
 
@@ -21,15 +21,16 @@ Included:
 - Race-specific body PAPs when present, with the common `c0101` PAP as the normal named-bone fallback.
 - The face skeleton actually captured on the exported character, such as `f0002`.
 - Exact TMB facial timing. `TMPP` identifies the preferred face library; each embedded `C010` selects and schedules its exact `cfxf_*` clip. Clip-derived and resident packs provide bounded fallbacks for vanilla timelines that omit or mix libraries.
-- Visible TMB event metadata. Eat Apple's model event becomes a timed lightweight apple; recognized cyalume events become colored procedural glowsticks attached to the hand bones.
-- Explicitly imported, active Penumbra body-PAP overrides for the local player's effective collection. Each card is labeled with the mod and base emote name.
+- Exact TMB model events. The referenced local SqPack model, material, textures, colorset, hand flag, attachment transform, scale, and frame lifetime are exported on demand; Eat Apple now uses the actual game prop rather than a procedural stand-in.
+- Native AVFX event data. Exact `.avfx` sources are hash-verified in the local cache with TMB timing, color, scale, and placement metadata. Embedded static draw geometry can be converted for inspection, while Apricot-dependent effects are explicitly identified.
+- Explicitly imported Penumbra player-body PAPs winning for the local player's effective collection. Canonical replacements are labeled with the base emote; standalone player pose/loop paths receive their own **Custom** cards.
 - The game's high-resolution emote icons, extracted locally for the Blender browser.
 
 Excluded:
 
 - Combat/job actions, weapon timelines, sheathe/draw actions, mounts, movement sets, ornaments, companions, and NPC-only animations.
 - Alternate emote slots such as intro, ground, chair, and upper-body variants.
-- Sound, camera events, exact spawned-object motion, arbitrary AVFX particle simulation, and exact prop/AVFX meshes.
+- Sound, camera events, separate spawned-object animation/physics, and Apricot AVFX particle simulation. Static embedded AVFX geometry is inspection-only and is not automatically shown as if it were the complete effect.
 - Custom face-PAP replacements and mod-supplied VFX assets. A custom body PAP can schedule ordinary vanilla facial clips, but custom facial libraries are not trusted/imported in this milestone.
 - Automatic extraction or embedding of the entire catalog.
 
@@ -42,13 +43,13 @@ The filter is data-driven, so a future game update can change the count without 
 3. The generated character `.blend` stores only safe lookup metadata: race code, captured face-skeleton token, and catalog schema.
 4. Clicking an uncached card writes a local queue request. XivBlend selects the exact primary PAP track from the action TMB, samples it through FFXIV's loaded Havok runtime, then parses that selected track's embedded timeline.
 5. Every distinct scheduled facial clip is sampled once. The bundle manifest places reusable face GLBs as timed Blender NLA strips, including source-frame slices and held one-frame expressions.
-6. Blender applies the body Action, combines the facial strips, creates supported transient visual approximations, and loops the bundle.
+6. Blender applies the body Action, combines the facial strips, imports supported exact prop assets as transient objects, exposes native AVFX status/metadata, and loops the bundle.
 7. Clicking the same card for the same game build, rig, face, converter, and custom-content hash is a cache hit.
 8. Before a save or reload, Blender restores the captured pose and removes runtime Actions, NLA strips, objects, collections, and materials. The live preview can resume after a successful save.
 
 ## Set up and use
 
-1. Install XivBlend 0.0.12 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.13 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both status messages to finish.
 4. Export a character with race and face-skeleton metadata, then restart Blender if it was already open.
@@ -65,7 +66,9 @@ The browser targets the active armature, or the exported primary armature when n
 3. Choose the mod and click **Add Active Animation Overrides**.
 4. Refresh/reinstall the browser if it is already open, then use the new **Custom** category in Blender.
 
-XivBlend asks Penumbra for the local player's effective collection and resolves only known canonical body-emote PAP paths. A candidate is accepted only when its final filesystem path remains inside the chosen mod directory. XivBlend stores the mod identifier, selected option labels, target/source rig, relative path, byte length, and SHA-256 hash. Before every decode it asks Penumbra for the mod root again, resolves junctions/links, and verifies the same length and hash. Blender never supplies an arbitrary mod path.
+XivBlend obtains the chosen mod's physical directory from Penumbra, reads only bounded `default_mod.json` and `group_*.json` manifests, and discovers canonical player-body PAP paths for the exported race plus the common fallback rig. Penumbra's effective local-player collection decides whether each candidate is active and winning. A candidate is accepted only when its final filesystem path remains inside the chosen mod directory. XivBlend stores the mod identifier, selected option labels, target/source rig, relative path, byte length, and SHA-256 hash. Before every decode it asks Penumbra for the mod root again, resolves junctions/links, and verifies the same length and hash. Blender never supplies an arbitrary mod path.
+
+This also covers standalone player pose/loop files that have no vanilla catalog key. Their labels are derived from the safe relative PAP name and selected option metadata; they do not pretend to be a built-in emote.
 
 If the file or selected option changes, import the mod again. **Remove Saved Source from XivBlend** removes all of that mod's saved cards without changing Penumbra or deleting mod files. Imports for another player race are merged with existing race bindings instead of erasing them.
 
@@ -73,7 +76,7 @@ The importer has conservative PAP size, cumulative-import, animation-count, dura
 
 ## Render Studio controls
 
-Animation-browser 0.4.0 also provides **XivBlend** → **Render Studio**:
+Animation-browser 0.5.0 also provides **XivBlend** → **Render Studio**:
 
 - **Smooth Animation** temporarily presents the active View Layer through one restrained shared material for responsive posing and motion review.
 - **Full Detail** restores the original materials and viewport settings exactly.
@@ -104,7 +107,9 @@ Catalog builds are separated by game version, client language, and converter ver
 
 The body Action is still the primary PAP track. TMB-scheduled face clips are reconstructed, but other auxiliary skeletal layers—such as some ear, tail, part, or additive tracks—are not yet merged. Root motion, game transitions, environment interaction, and emote conditions are not reproduced.
 
-The apple and glowsticks are intentionally lightweight Blender-native approximations. Timing—and glowstick color—comes from the emote bundle; the browser attaches them to known right/left hand-bone candidates on the exported rig. Their geometry and arbitrary AVFX behavior are not exact game rendering. Unsupported visual events appear as warnings rather than producing junk objects.
+TMB-spawned model props use the exact locally installed game mesh and mapped material data. The TMB hand flag, frame lifetime, color, scale, and placement are preserved, and verified food attachments use the game's ATCH transform. Some unusual props may still need event-specific spawned-object animation, physics, or attachment support.
+
+Native AVFX files are not treated as simple meshes. XivBlend preserves and validates the exact source plus event metadata, classifies whether the file has static embedded draw geometry, and reports the Apricot features it uses. Blender does not yet implement FFXIV's Apricot scheduler, emitters, particles, billboards, trails, distortion, collision, animated curves, or game shader pipeline. Static preview GLBs therefore remain inspection data and are not automatically loaded as fake effect playback.
 
 The browser loops previews for inspection even when the original emote is a one-shot. Common `c0101` body fallback uses named-bone retargeting, not FFXIV's complete retargeting system, so proportion-sensitive translation still needs validation across all player rigs.
 
@@ -112,7 +117,7 @@ The browser loops previews for inspection even when the original emote is a one-
 
 The current catalog audit parsed all 250 body-emote primary PAP timelines with zero parser failures. It observed 210 declared face libraries, 736 scheduled face events resolving to 437 exact facial clips on the validated `c0101/f0002` rig, 149 VFX events, and 55 prop events. Eat Apple and cheer-wave timing were checked directly against their live TMB/PAP data.
 
-Schema-2 catalog/request handling, schema-1 bundle loading, timed NLA evaluation, Blender 5 Action-slot handling, apple/glowstick creation, complete cleanup, and registration pass headless tests in Blender 5.0 and 5.2. Broader live testing across every race, face rig, custom animation style, and future game update remains necessary.
+Schema-2 catalog/request/bundle handling, timed NLA evaluation, Blender 5 Action-slot handling, exact apple import and material binding, complete transient cleanup, and registration pass headless tests in Blender 5.0 and Blender 5.2. All 66 unique non-sync player-emote AVFX sources in the focused current-game audit parse: 33 contain validated embedded static draw geometry and 33 are Apricot-only. Bounded Penumbra discovery tests cover active canonical replacements, standalone pose/loop files, inactive options, and path-containment rejection. Broader live testing across every race, face rig, custom animation style, and future game update remains necessary.
 
 ## Vanilla verification and local-only boundary
 

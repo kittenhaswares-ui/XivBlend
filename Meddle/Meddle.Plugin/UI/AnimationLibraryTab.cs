@@ -112,7 +112,8 @@ public sealed class AnimationLibraryTab : ITab
         ImGui.Separator();
         ImGui.TextDisabled("In Blender: press N in the 3D View, open XivBlend, then click Player Emotes.");
         ImGui.TextDisabled("Keep XivBlend open in FFXIV the first time a clip is clicked; later plays use the local cache.");
-        ImGui.TextDisabled("Included: player emote body/face timing and visible event metadata. Combat and weapon actions stay excluded.");
+        ImGui.TextDisabled("Included: player emote body/face timing, exact local props, and indexed native AVFX metadata.");
+        ImGui.TextDisabled("Combat and weapon actions stay excluded; Blender does not yet simulate Apricot particle playback.");
         ImGui.TextDisabled("Vanilla extraction bypasses Penumbra. Custom imports ask Penumbra only for your active winning PAP paths.");
         ImGui.TextDisabled("Only the selected preview bundle is loaded; its runtime Actions and effects are removed before saving.");
     }
@@ -122,8 +123,9 @@ public sealed class AnimationLibraryTab : ITab
         ImGui.Separator();
         ImGui.Text("Custom Animation Mods");
         ImGui.TextWrapped(
-            "Choose an installed Penumbra animation mod. XivBlend adds only its active, winning emote PAPs " +
-            "for your own current character; it does not change the mod or its options.");
+            "Choose an installed Penumbra animation mod. XivBlend reads its standard Penumbra option files, " +
+            "then asks Penumbra which player-animation PAPs are active and winning for your own current character. " +
+            "Standalone pose and loop replacements appear under Custom too; XivBlend does not change the mod or its options.");
 
         if (ImGui.Button("Refresh Penumbra Mods"))
         {

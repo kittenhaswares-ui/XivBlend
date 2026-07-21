@@ -20,8 +20,8 @@ public sealed record CustomAnimationSource(
 public sealed record CustomAnimationBinding(
     string EntryId,
     string VariantId,
-    string BaseEntryId,
-    uint BaseEmoteId,
+    string? BaseEntryId,
+    uint? BaseEmoteId,
     ushort TargetRaceCode,
     ushort SourceRaceCode,
     string CanonicalGamePath,

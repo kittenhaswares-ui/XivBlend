@@ -22,6 +22,7 @@ public class ComposerCache
     private readonly ConcurrentDictionary<string, string> mtrlPathCache = new();
     private readonly ConcurrentDictionary<string, PbdFile> pbdCache = new();
     private readonly ConcurrentDictionary<string, RefCounter<MdlFile>> mdlCache = new();
+    private readonly ConcurrentDictionary<string, byte> trackedCacheFiles = new(StringComparer.OrdinalIgnoreCase);
     
     private sealed class RefCounter<T>(T obj)
     {
@@ -32,13 +33,91 @@ public class ComposerCache
     private readonly SqPack pack;
     private readonly string cacheDir;
     private readonly Configuration.ExportConfiguration exportConfig;
+    private readonly bool refreshExistingFiles;
 
-    public ComposerCache(SqPack pack, string cacheDir, Configuration.ExportConfiguration exportConfig)
+    public ComposerCache(
+        SqPack pack,
+        string cacheDir,
+        Configuration.ExportConfiguration exportConfig,
+        bool refreshExistingFiles = false)
     {
         this.pack = pack;
-        this.cacheDir = cacheDir;
+        this.cacheDir = Path.GetFullPath(cacheDir);
         this.exportConfig = exportConfig;
+        this.refreshExistingFiles = refreshExistingFiles;
         defaultPbdFile = GetPbdFile("chara/xls/boneDeformer/human.pbd");
+    }
+
+    /// <summary>
+    /// Returns the concrete cache files used by this composer instance. This
+    /// lets the on-demand prop exporter publish a bounded integrity manifest
+    /// without scanning or claiming unrelated files in the shared cache.
+    /// </summary>
+    public IReadOnlyList<string> GetTrackedCacheFiles()
+    {
+        return trackedCacheFiles.Keys
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private string TrackCacheFile(string path)
+    {
+        var resolved = Path.GetFullPath(path);
+        trackedCacheFiles.TryAdd(resolved, 0);
+        return resolved;
+    }
+
+    private void TrackPngFiles(params string[] directories)
+    {
+        foreach (var directory in directories.Where(Directory.Exists))
+        {
+            foreach (var file in Directory.EnumerateFiles(
+                         directory,
+                         "*.png",
+                         SearchOption.TopDirectoryOnly))
+            {
+                TrackCacheFile(file);
+            }
+        }
+    }
+
+    private static void WriteAllBytesAtomic(string path, ReadOnlySpan<byte> data)
+    {
+        var parent = Path.GetDirectoryName(path)
+            ?? throw new InvalidOperationException("The cache output has no parent directory.");
+        Directory.CreateDirectory(parent);
+        var temporary = Path.Combine(parent, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(
+                       temporary,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       64 * 1024,
+                       FileOptions.SequentialScan))
+            {
+                stream.Write(data);
+                stream.Flush(true);
+            }
+
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(temporary);
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup of a private cache staging file.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Best-effort cleanup of a private cache staging file.
+            }
+        }
     }
     
     public PbdFile GetDefaultPbdFile()
@@ -76,6 +155,53 @@ public class ComposerCache
         ArrayTextureUtil.SaveTileTextures(pack, cacheDir);
         ArrayTextureUtil.SaveBgSphereTextures(pack, cacheDir);
         ArrayTextureUtil.SaveBgDetailTextures(pack, cacheDir);
+        TrackPngFiles(Directory.GetDirectories(
+            Path.Combine(cacheDir, "array_textures"),
+            "*",
+            SearchOption.AllDirectories));
+    }
+
+    private bool characterArrayTexturesSaved;
+    public void SaveCharacterArrayTextures()
+    {
+        if (characterArrayTexturesSaved) return;
+        characterArrayTexturesSaved = true;
+
+        var root = Path.Combine(cacheDir, "array_textures", "chara", "common", "texture");
+        var normDirectory = Path.Combine(root, "tile_norm_array");
+        var orbDirectory = Path.Combine(root, "tile_orb_array");
+        if (!refreshExistingFiles
+            && HasVerticalArrayTexture(normDirectory, "tile_norm_array")
+            && HasVerticalArrayTexture(orbDirectory, "tile_orb_array"))
+        {
+            TrackPngFiles(normDirectory, orbDirectory);
+            return;
+        }
+
+        Directory.CreateDirectory(cacheDir);
+        ArrayTextureUtil.SaveTileTextures(pack, cacheDir);
+        TrackPngFiles(normDirectory, orbDirectory);
+    }
+
+    private static bool HasVerticalArrayTexture(string directory, string fileName)
+    {
+        try
+        {
+            return Directory.Exists(directory)
+                   && Directory.EnumerateFiles(
+                           directory,
+                           $"{fileName}.*.vertical.png",
+                           SearchOption.TopDirectoryOnly)
+                       .Any();
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
     
     public MdlFile GetMdlFile(string path)
@@ -191,14 +317,17 @@ public class ComposerCache
     {
        var cachePath = GetCacheFilePath(fullPath);
         
-        if (File.Exists(cachePath)) return cachePath;
+        if (File.Exists(cachePath) && !refreshExistingFiles)
+        {
+            return TrackCacheFile(cachePath);
+        }
         
         var fileData = pack.GetFileOrReadFromDisk(fullPath);
         if (fileData == null) throw new Exception($"Failed to load file: {fullPath}");
         
         Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-        File.WriteAllBytes(cachePath, fileData);
-        return cachePath;
+        WriteAllBytesAtomic(cachePath, fileData);
+        return TrackCacheFile(cachePath);
     }
     
     public string CacheTexture(string fullPath)
@@ -207,7 +336,10 @@ public class ComposerCache
         var pngCachePath = cachePath + ".png";
         
         // inner skip if the png cache exists.
-        if (File.Exists(pngCachePath)) return pngCachePath;
+        if (File.Exists(pngCachePath) && !refreshExistingFiles)
+        {
+            return TrackCacheFile(pngCachePath);
+        }
         
         var fileData = pack.GetFileOrReadFromDisk(fullPath);
         if (fileData == null) throw new Exception($"Failed to load file: {fullPath}");
@@ -216,7 +348,7 @@ public class ComposerCache
 
         if (exportConfig.CacheFileTypes.HasFlag(CacheFileType.Tex))
         {
-            File.WriteAllBytes(cachePath, fileData);
+            WriteAllBytesAtomic(cachePath, fileData);
         }
         
         var tex = new TexFile(fileData);
@@ -234,7 +366,9 @@ public class ComposerCache
                 var img = ImageUtils.GetTexData(tex, face, 0, 0);
                 var data = img.ImageAsPng();
                 var facePath = $"{basePath}_{faceNames[face]}.png";
-                File.WriteAllBytes(Path.Combine(Path.GetDirectoryName(cachePath)!, facePath), data.ToArray());
+                var outputPath = Path.Combine(Path.GetDirectoryName(cachePath)!, facePath);
+                WriteAllBytesAtomic(outputPath, data);
+                TrackCacheFile(outputPath);
             }
         
             return basePath; // Return base path since multiple files were created
@@ -244,8 +378,8 @@ public class ComposerCache
         using var memoryStream = new MemoryStream();
         texture.Bitmap.Encode(memoryStream, SKEncodedImageFormat.Png, 100);
         var textureBytes = memoryStream.ToArray();
-        File.WriteAllBytes(pngCachePath, textureBytes);
-        return pngCachePath;
+        WriteAllBytesAtomic(pngCachePath, textureBytes);
+        return TrackCacheFile(pngCachePath);
     }
     
     public MaterialBuilder ComposeMaterial(string mtrlPath, 
@@ -314,45 +448,52 @@ public class ComposerCache
             }
             
             material.SetPropertiesFromMaterialInfo(materialInfo);
-            if (materialInfo.ColorTable != null)
+        }
+
+        // A live material can supply a GPU-resolved (and therefore dyed)
+        // table. Static assets such as emote props have no live material, so
+        // preserve the table authored directly in their MTRL instead of
+        // silently rendering them with the node group's defaults.
+        var colorTable = materialInfo?.ColorTable ?? mtrlFile.GetColorTable();
+        if (colorTable != null)
+        {
+            material.SetPropertiesFromColorTable(colorTable);
+            if (colorTable is ColorTableSet colorTableSet)
             {
-                material.SetPropertiesFromColorTable(materialInfo.ColorTable);
-                if (materialInfo.ColorTable is ColorTableSet colorTableSet)
-                {
-                    var tex = colorTableSet.ColorTable.ToTexture();
-                    var colorTablePath = SaveInMemoryTex(tex, "color_tables");
-                    material.SetProperty("ColorTable_PngCachePath", Path.GetRelativePath(cacheDir, colorTablePath));
-                }
-                else if (materialInfo.ColorTable is LegacyColorTableSet legacyColorTableSet)
-                {
-                    var tex = legacyColorTableSet.ColorTable.ToTexture();
-                    var colorTablePath = SaveInMemoryTex(tex, "color_tables");
-                    material.SetProperty("LegacyColorTable_PngCachePath", Path.GetRelativePath(cacheDir, colorTablePath));
-                }
+                var tex = colorTableSet.ColorTable.ToTexture();
+                var colorTablePath = SaveInMemoryTex(tex, "color_tables");
+                material.SetProperty("ColorTable_PngCachePath", Path.GetRelativePath(cacheDir, colorTablePath));
             }
-            
-            string SaveInMemoryTex(SkTexture tex, string type)
+            else if (colorTable is LegacyColorTableSet legacyColorTableSet)
             {
-                var texCacheDir = Path.Combine(cacheDir, type);
-                Directory.CreateDirectory(texCacheDir);
-                var buf = tex.Bitmap.Bytes;
-                var hash = System.Security.Cryptography.SHA256.HashData(buf);
-                var hashStr = Convert.ToHexStringLower(hash);
-                // truncate the hash to 8 characters for the filename.
-                if (hashStr.Length > 8)
-                {
-                    hashStr = hashStr[..8];
-                }
-                var mtrlPathWithoutExtension = Path.GetFileNameWithoutExtension(mtrlPath);
-                var colorTablePath = Path.Combine(texCacheDir, $"{mtrlPathWithoutExtension}_{materialInfo.Shpk}_{hashStr}.png");
-                if (!File.Exists(colorTablePath))
-                {
-                    using var fileStream = new FileStream(colorTablePath, FileMode.Create, FileAccess.Write);
-                    using var skiaStream = new SKManagedWStream(fileStream);
-                    tex.Bitmap.Encode(skiaStream, SKEncodedImageFormat.Png, 100);
-                }
-                return colorTablePath;
+                var tex = legacyColorTableSet.ColorTable.ToTexture();
+                var colorTablePath = SaveInMemoryTex(tex, "color_tables");
+                material.SetProperty("LegacyColorTable_PngCachePath", Path.GetRelativePath(cacheDir, colorTablePath));
             }
+        }
+
+        string SaveInMemoryTex(SkTexture tex, string type)
+        {
+            var texCacheDir = Path.Combine(cacheDir, type);
+            Directory.CreateDirectory(texCacheDir);
+            var buf = tex.Bitmap.Bytes;
+            var hash = System.Security.Cryptography.SHA256.HashData(buf);
+            var hashStr = Convert.ToHexStringLower(hash);
+            // truncate the hash to 8 characters for the filename.
+            if (hashStr.Length > 8)
+            {
+                hashStr = hashStr[..8];
+            }
+            var mtrlPathWithoutExtension = Path.GetFileNameWithoutExtension(mtrlPath);
+            var shaderName = materialInfo?.Shpk ?? mtrlFile.GetShaderPackageName();
+            var colorTablePath = Path.Combine(texCacheDir, $"{mtrlPathWithoutExtension}_{shaderName}_{hashStr}.png");
+            if (!File.Exists(colorTablePath) || refreshExistingFiles)
+            {
+                using var memoryStream = new MemoryStream();
+                tex.Bitmap.Encode(memoryStream, SKEncodedImageFormat.Png, 100);
+                WriteAllBytesAtomic(colorTablePath, memoryStream.ToArray());
+            }
+            return TrackCacheFile(colorTablePath);
         }
         
         string materialName;

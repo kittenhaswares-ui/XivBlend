@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -17,18 +17,21 @@ bl_info = {
 }
 
 import json
+import hashlib
+import importlib
 import math
 import os
 from pathlib import Path
+import sys
 import time
+import types
 import uuid
 
-import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import IntProperty, StringProperty
 from bpy.types import Menu, Operator, Panel
-from mathutils import Matrix, Vector
+from mathutils import Euler, Matrix, Vector
 
 try:
     import bpy.utils.previews as _previews
@@ -59,9 +62,15 @@ MAX_CATALOG_ENTRIES = 20_000
 MAX_BUNDLE_LAYERS = 4_096
 MAX_BUNDLE_VISUALS = 65_536
 MAX_BUNDLE_PROPS = 16_384
+MAX_AVFX_BYTES = 32 * 1024 * 1024
+PROP_CACHE_MANIFEST = "prop-cache-v1.json"
+MAX_PROP_CACHE_FILE_BYTES = 512 * 1024 * 1024
+MAX_PROP_CACHE_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 FAST_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
 FAST_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
 RUNTIME_EFFECT_COLLECTION_PREFIX = "XivBlend Runtime Effects |"
+MATERIAL_RUNTIME_MODULE = "_xivblend_meddle_material_runtime"
+SYNC_CONTROL_VFX = "vfx/common/eff/syncactiontimelineclip01t.avfx"
 
 _catalog = None
 _catalog_signature = None
@@ -568,8 +577,11 @@ def _read_bundle_manifest(catalog, bundle_path):
     if not isinstance(document, dict):
         raise ClipError(f"{bundle_path.name} must contain a JSON object")
     schema = _int_value(_field(document, "SchemaVersion"), 0)
-    if schema != 1:
-        raise ClipError(f"Animation bundle {bundle_path.name} uses unsupported schema {schema}")
+    if schema != 2:
+        raise ClipError(
+            f"Animation bundle {bundle_path.name} uses obsolete schema {schema}; "
+            "rebuild it with the current XivBlend plugin"
+        )
     layers = _field(document, "Layers")
     if not isinstance(layers, list) or not any(isinstance(layer, dict) for layer in layers):
         raise ClipError(f"Animation bundle {bundle_path.name} contains no playable layers")
@@ -647,13 +659,185 @@ def _valid_animation_layer_file(path):
         return False
 
 
+def _sha256_file(path, hash_cache):
+    key = str(path)
+    actual_hash = hash_cache.get(key)
+    if actual_hash is None:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        actual_hash = digest.hexdigest()
+        hash_cache[key] = actual_hash
+    return actual_hash
+
+
+def _valid_prop_cache_integrity(asset_path, cache_path, hash_cache):
+    manifest_path = (asset_path.parent / PROP_CACHE_MANIFEST).resolve()
+    if not _inside(manifest_path, asset_path.parent):
+        return False
+    document = _read_json(manifest_path)
+    if not isinstance(document, dict) or _int_value(
+        _field(document, "SchemaVersion"), 0
+    ) != 1:
+        return False
+    asset_hash = str(_field(document, "AssetSha256", default="") or "").strip()
+    files = _field(document, "Files")
+    if (
+        len(asset_hash) != 64
+        or asset_hash != asset_hash.casefold()
+        or any(character not in "0123456789abcdef" for character in asset_hash)
+        or not isinstance(files, list)
+        or not 1 <= len(files) <= MAX_BUNDLE_PROPS
+        or _sha256_file(asset_path, hash_cache) != asset_hash
+    ):
+        return False
+
+    seen = set()
+    total_bytes = 0
+    for item in files:
+        if not isinstance(item, dict):
+            return False
+        relative = str(_field(item, "RelativePath", default="") or "").strip()
+        expected_length = _field(item, "Length")
+        expected_hash = str(_field(item, "Sha256", default="") or "").strip()
+        folded = relative.casefold()
+        if (
+            not relative
+            or len(relative) > 32_768
+            or Path(relative).is_absolute()
+            or "\\" in relative
+            or ":" in relative
+            or any(segment in {"", ".", ".."} for segment in relative.split("/"))
+            or folded in seen
+            or isinstance(expected_length, bool)
+            or not isinstance(expected_length, int)
+            or not 0 < expected_length <= MAX_PROP_CACHE_FILE_BYTES
+            or len(expected_hash) != 64
+            or expected_hash != expected_hash.casefold()
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+        ):
+            return False
+        seen.add(folded)
+        total_bytes += expected_length
+        if total_bytes > MAX_PROP_CACHE_TOTAL_BYTES:
+            return False
+        file_path = _resolve_child(cache_path, relative, "prop cache file")
+        if (
+            not file_path.is_file()
+            or file_path.stat().st_size != expected_length
+            or _sha256_file(file_path, hash_cache) != expected_hash
+        ):
+            return False
+    return True
+
+
+def _valid_bundle_prop_asset(catalog, event, hash_cache):
+    status = str(_field(event, "AssetStatus", default="") or "").strip().casefold()
+    if status == "exportfailed":
+        return False
+    if status != "ready":
+        return status in {"missingmodel", "unsupportedkind"}
+    try:
+        asset_path, cache_path = _resolve_prop_asset(catalog, event)
+        return (
+            _valid_animation_layer_file(asset_path)
+            and cache_path.is_dir()
+            and _valid_prop_cache_integrity(asset_path, cache_path, hash_cache)
+        )
+    except (CatalogError, ClipError, OSError):
+        return False
+
+
+def _valid_bundle_vfx_asset(catalog, event, hash_cache):
+    status = str(_field(event, "AssetStatus", default="") or "").strip().casefold()
+    source_relative = str(
+        _field(event, "SourceRelativePath", default="") or ""
+    ).strip()
+    preview_relative = str(
+        _field(event, "StaticPreviewRelativePath", default="") or ""
+    ).strip()
+    preview_hash_value = str(
+        _field(event, "StaticPreviewSha256", default="") or ""
+    ).strip()
+
+    if status == "exportfailed":
+        return False
+    if status in {"synccontrol", "missingasset", "analysisfailed"}:
+        return not source_relative and not preview_relative and not preview_hash_value
+    if status not in {
+        "staticembeddedmeshpreview", "unsupportedapricot", "metadataonly"
+    }:
+        return False
+
+    expected_hash = str(_field(event, "ContentSha256", default="") or "").strip()
+    if (
+        len(expected_hash) != 64
+        or expected_hash != expected_hash.casefold()
+        or any(character not in "0123456789abcdef" for character in expected_hash)
+        or not source_relative
+    ):
+        return False
+    try:
+        source_path = _resolve_child(
+            catalog["library_root"], source_relative, "SourceRelativePath"
+        )
+        if source_path.suffix.casefold() != ".avfx" or not source_path.is_file():
+            return False
+        size = source_path.stat().st_size
+        if size < 8 or size > MAX_AVFX_BYTES:
+            return False
+        if _sha256_file(source_path, hash_cache) != expected_hash:
+            return False
+
+        if status == "staticembeddedmeshpreview":
+            if not preview_relative:
+                return False
+            preview_hash = preview_hash_value
+            if (
+                len(preview_hash) != 64
+                or preview_hash != preview_hash.casefold()
+                or any(character not in "0123456789abcdef" for character in preview_hash)
+            ):
+                return False
+            preview_path = _resolve_child(
+                catalog["library_root"], preview_relative,
+                "StaticPreviewRelativePath",
+            )
+            return (
+                preview_path.suffix.casefold() == ".glb"
+                and _valid_animation_layer_file(preview_path)
+                and _sha256_file(preview_path, hash_cache) == preview_hash
+            )
+        return (
+            not preview_relative
+            and not preview_hash_value
+        )
+    except (CatalogError, OSError):
+        return False
+
+
 def _bundle_is_ready(catalog, bundle_path, entry, variant):
     try:
         manifest = _read_bundle_manifest(catalog, bundle_path)
         _validate_bundle_identity(manifest, catalog, entry, variant)
-        return all(
+        if not all(
             _valid_animation_layer_file(_bundle_layer_path(catalog, layer))
             for layer in _as_list(_field(manifest, "Layers"))
+        ):
+            return False
+        hash_cache = {}
+        props = _as_list(_field(manifest, "Props"))
+        if any(not isinstance(event, dict) for event in props) or not all(
+            _valid_bundle_prop_asset(catalog, event, hash_cache) for event in props
+        ):
+            return False
+        visual_effects = _as_list(_field(manifest, "VisualEffects"))
+        if any(not isinstance(event, dict) for event in visual_effects):
+            return False
+        return all(
+            _valid_bundle_vfx_asset(catalog, event, hash_cache)
+            for event in visual_effects
         )
     except (CatalogError, ClipError, OSError):
         return False
@@ -857,7 +1041,13 @@ def _remove_runtime_visuals(target=None):
                     bpy.data.materials.remove(material)
             except (ReferenceError, RuntimeError):
                 pass
-    for data_collection in (bpy.data.meshes, bpy.data.materials):
+    for data_collection in (
+        bpy.data.meshes,
+        bpy.data.materials,
+        bpy.data.images,
+        bpy.data.textures,
+        bpy.data.node_groups,
+    ):
         for data_block in list(data_collection):
             try:
                 if data_block.users == 0 and bool(data_block.get(TRANSIENT_PROPERTY, False)):
@@ -951,7 +1141,7 @@ def _purge_transient_actions(restore=True):
 def _data_snapshot():
     names = (
         "objects", "actions", "meshes", "armatures", "materials", "images",
-        "textures", "collections", "cameras", "lights",
+        "textures", "collections", "cameras", "lights", "node_groups",
     )
     return {name: set(getattr(bpy.data, name)) for name in names if hasattr(bpy.data, name)}
 
@@ -1339,85 +1529,6 @@ def _runtime_effect_collection(scene, target):
     return collection
 
 
-def _runtime_material(name, color, emission_strength=0.0):
-    material = bpy.data.materials.new(name)
-    material[TRANSIENT_PROPERTY] = True
-    material.diffuse_color = (*color[:3], color[3])
-    material.use_nodes = True
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-    nodes.clear()
-    output = nodes.new("ShaderNodeOutputMaterial")
-    if emission_strength > 0.0:
-        shader = nodes.new("ShaderNodeEmission")
-        shader.inputs["Color"].default_value = color
-        shader.inputs["Strength"].default_value = emission_strength
-    else:
-        shader = nodes.new("ShaderNodeBsdfPrincipled")
-        shader.inputs["Base Color"].default_value = color
-        shader.inputs["Roughness"].default_value = 0.42
-    links.new(shader.outputs[0], output.inputs["Surface"])
-    return material
-
-
-def _runtime_mesh_object(collection, name, shape, material):
-    mesh = bpy.data.meshes.new(f"{name} Mesh")
-    mesh[TRANSIENT_PROPERTY] = True
-    bm = bmesh.new()
-    try:
-        if shape == "apple":
-            result = bmesh.ops.create_uvsphere(
-                bm, u_segments=20, v_segments=12, radius=1.0
-            )
-            bmesh.ops.scale(
-                bm, vec=Vector((0.064, 0.064, 0.058)), verts=result["verts"]
-            )
-        else:
-            bmesh.ops.create_cone(
-                bm, cap_ends=True, cap_tris=False, segments=16,
-                radius1=0.011, radius2=0.011, depth=0.23,
-            )
-        bm.to_mesh(mesh)
-    finally:
-        bm.free()
-    for polygon in mesh.polygons:
-        polygon.use_smooth = True
-    obj = bpy.data.objects.new(name, mesh)
-    obj[TRANSIENT_PROPERTY] = True
-    obj["xivblend_runtime_approximation"] = True
-    collection.objects.link(obj)
-    obj.data.materials.append(material)
-    return obj
-
-
-def _parent_runtime_effect(obj, target, preferred_bone, fallback_bone, location, rotation=(0.0, 0.0, 0.0)):
-    bone_name = next((
-        name for name in (preferred_bone, fallback_bone)
-        if name and target.pose.bones.get(name) is not None
-    ), None)
-    if bone_name is None:
-        return False
-    obj.parent = target
-    obj.parent_type = "BONE"
-    obj.parent_bone = bone_name
-    obj.location = location
-    obj.rotation_euler = rotation
-    return True
-
-
-def _discard_runtime_object(obj):
-    data = getattr(obj, "data", None)
-    try:
-        bpy.data.objects.remove(obj, do_unlink=True)
-    except (ReferenceError, RuntimeError):
-        return
-    try:
-        if data is not None and data.users == 0:
-            bpy.data.meshes.remove(data)
-    except (ReferenceError, RuntimeError):
-        pass
-
-
 def _key_runtime_visibility(obj, start_frame, duration_frames):
     start = int(start_frame)
     end = start + max(1, int(duration_frames))
@@ -1432,120 +1543,364 @@ def _key_runtime_visibility(obj, start_frame, duration_frames):
         action["xivblend_runtime_effect"] = True
 
 
-def _is_apple_prop(event):
-    return (
-        str(_field(event, "Kind", default="") or "").casefold() in {"c198", "model"}
-        and _int_value(_field(event, "ModelId"), -1) == 9901
-        and _int_value(_field(event, "BodyId"), -1) == 16
-        and _int_value(_field(event, "Variant"), -1) == 1
-    )
+def _is_sync_control_vfx(event):
+    path = str(_field(event, "GamePath", default="") or "").replace("\\", "/").casefold()
+    return path == SYNC_CONTROL_VFX
 
 
-def _glowstick_color(path):
-    lowered = str(path or "").casefold()
-    colors = (
-        ("yellow", (1.0, 0.72, 0.06, 1.0)),
-        ("orange", (1.0, 0.28, 0.03, 1.0)),
-        ("red", (1.0, 0.025, 0.02, 1.0)),
-        ("pink", (1.0, 0.06, 0.42, 1.0)),
-        ("purple", (0.55, 0.08, 1.0, 1.0)),
-        ("violet", (0.55, 0.08, 1.0, 1.0)),
-        ("blue", (0.02, 0.28, 1.0, 1.0)),
-        ("green", (0.03, 1.0, 0.18, 1.0)),
-        ("white", (0.82, 0.92, 1.0, 1.0)),
-    )
-    return next((color for token, color in colors if token in lowered), (0.08, 0.55, 1.0, 1.0))
-
-
-def _is_glowstick_vfx(event):
-    path = str(_field(event, "GamePath", default="") or "").casefold()
-    return "cyalume" in path or "cyalu" in path
-
-
-def _create_bundle_visuals(context, target, manifest):
-    props = [event for event in _as_list(_field(manifest, "Props")) if isinstance(event, dict)]
-    effects = [event for event in _as_list(_field(manifest, "VisualEffects")) if isinstance(event, dict)]
-    apple_events = [event for event in props if _is_apple_prop(event)]
-    glow_events = [event for event in effects if _is_glowstick_vfx(event)]
-    if not apple_events and not glow_events:
-        return []
-
-    collection = _runtime_effect_collection(context.scene, target)
-    warnings = []
-    apple_material = None
-    for index, event in enumerate(apple_events):
-        if apple_material is None:
-            apple_material = _runtime_material(
-                "XivBlend Runtime Apple Material", (0.52, 0.018, 0.012, 1.0)
-            )
-        obj = _runtime_mesh_object(
-            collection, f"XivBlend Runtime Approximation | Eat Apple {index + 1}",
-            "apple", apple_material,
+def _material_runtime_modules():
+    addon_root = Path(__file__).resolve().parent
+    package_root = (addon_root / "MeddleTools").resolve()
+    # The installer deliberately places the runtime inside the add-on folder.
+    # The reviewed source tree keeps both folders next to one another, which is
+    # useful for background validation before packaging a release.
+    if not (package_root / "shaders.blend").is_file():
+        source_tree_runtime = (addon_root.parent / "MeddleTools").resolve()
+        if source_tree_runtime.parent == addon_root.parent.resolve():
+            package_root = source_tree_runtime
+    if not (package_root / "shaders.blend").is_file():
+        raise ClipError(
+            "The exact FFXIV prop material runtime is missing. Reinstall the XivBlend Blender panel."
         )
-        if not _parent_runtime_effect(
-            obj, target, "n_buki_r", "j_te_r", (0.0, 0.045, 0.02)
-        ):
-            warnings.append("Apple prop could not attach because the right-hand bones are missing")
-            _discard_runtime_object(obj)
-            continue
-        start = _int_value(_field(event, "StartFrame"), 0)
-        duration = _int_value(_field(event, "DurationFrames"), 1)
-        _key_runtime_visibility(obj, start, duration)
+    package = sys.modules.get(MATERIAL_RUNTIME_MODULE)
+    if package is None:
+        package = types.ModuleType(MATERIAL_RUNTIME_MODULE)
+        package.__file__ = str(package_root / "__init__.py")
+        package.__package__ = MATERIAL_RUNTIME_MODULE
+        package.__path__ = [str(package_root)]
+        sys.modules[MATERIAL_RUNTIME_MODULE] = package
+    version = importlib.import_module(f"{MATERIAL_RUNTIME_MODULE}.version")
+    blend_import = importlib.import_module(f"{MATERIAL_RUNTIME_MODULE}.blend_import")
+    node_configs = importlib.import_module(
+        f"{MATERIAL_RUNTIME_MODULE}.node_setup.node_configs"
+    )
+    return version, blend_import, node_configs
 
-    # A cheer PAP may contain separate left/right AVFX records for the same
-    # color and time. Group them so the approximation creates exactly one pair.
-    grouped_glows = {}
-    for event in glow_events:
+
+def _new_data(snapshot, name):
+    collection = getattr(bpy.data, name, None)
+    if collection is None:
+        return []
+    return [value for value in collection if value not in snapshot.get(name, set())]
+
+
+def _tag_transient_data(snapshot):
+    for name in (
+        "actions", "meshes", "armatures", "materials", "images", "textures",
+        "collections", "node_groups",
+    ):
+        for data_block in _new_data(snapshot, name):
+            try:
+                data_block[TRANSIENT_PROPERTY] = True
+            except (AttributeError, ReferenceError, TypeError):
+                pass
+
+
+def _remove_zero_user_new_data(snapshot):
+    # Source glTF materials and unused shader templates become unreferenced
+    # after MeddleTools maps the prop. Remove only data created by this import.
+    for name in (
+        "materials", "images", "textures", "node_groups", "armatures",
+        "actions", "meshes",
+    ):
+        collection = getattr(bpy.data, name, None)
+        if collection is None:
+            continue
+        for data_block in list(_new_data(snapshot, name)):
+            try:
+                if data_block.users == 0:
+                    collection.remove(data_block)
+            except (AttributeError, ReferenceError, RuntimeError):
+                pass
+
+
+def _map_runtime_prop_materials(imported_objects, cache_directory, snapshot):
+    material_slots = {}
+    for obj in imported_objects:
+        if obj.type != "MESH":
+            continue
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                material_slots.setdefault(slot.material, []).append(slot)
+    expected = {
+        material for material in material_slots
+        if str(material.get("ShaderPackage", "") or "").strip()
+    }
+    if not expected:
+        _tag_transient_data(snapshot)
+        return 0
+
+    version, blend_import, node_configs = _material_runtime_modules()
+    version.updateCurrentRelease()
+    blend_import.import_shaders()
+    failures = []
+    for source_material, slots in material_slots.items():
+        node_configs.map_mesh(source_material, slots, str(cache_directory))
+        if source_material not in expected:
+            continue
+        replacements = [slot.material for slot in slots]
+        if not all(
+            replacement is not None
+            and replacement is not source_material
+            and replacement.node_tree is not None
+            for replacement in replacements
+        ):
+            failures.append(
+                f"{source_material.name} ({source_material.get('ShaderPackage')})"
+            )
+    _tag_transient_data(snapshot)
+    _remove_zero_user_new_data(snapshot)
+    if failures:
+        raise ClipError(
+            "The exact FFXIV material mapper could not map " + ", ".join(failures)
+        )
+    return len(expected)
+
+
+def _resolve_prop_asset(catalog, event):
+    status = str(_field(event, "AssetStatus", default="") or "").strip()
+    relative = str(_field(event, "AssetRelativePath", default="") or "").strip()
+    if status and status.casefold() not in {"ready", "supported", "available"}:
+        raise ClipError(status)
+    if not relative:
+        raise ClipError("no real extracted prop asset is available; rebuild this emote bundle")
+    try:
+        asset_path = _resolve_child(catalog["library_root"], relative, "AssetRelativePath")
+    except CatalogError as error:
+        raise ClipError(str(error)) from error
+    if asset_path.suffix.casefold() not in {".glb", ".gltf"}:
+        raise ClipError(f"prop asset must be glTF: {asset_path.name}")
+    if not _valid_animation_layer_file(asset_path):
+        raise ClipError(f"real prop asset is missing or invalid: {asset_path.name}")
+
+    cache_relative = str(
+        _field(event, "AssetCacheRelativePath", default="") or ""
+    ).strip()
+    if not cache_relative:
+        cache_path = asset_path.parent / "cache"
+    else:
+        try:
+            cache_path = _resolve_child(
+                catalog["library_root"], cache_relative, "AssetCacheRelativePath"
+            )
+        except CatalogError as error:
+            raise ClipError(str(error)) from error
+    if not _inside(cache_path, catalog["default_root"]):
+        raise ClipError("prop material cache is outside XivBlend/AnimationLibrary")
+    if not cache_path.is_dir():
+        raise ClipError("real prop material cache is missing; rebuild this emote bundle")
+    return asset_path, cache_path
+
+
+def _attachment_bone(target, event):
+    configured = str(_field(event, "AttachmentBone", default="") or "").strip()
+    flags = _int_value(_field(event, "Flags", "AttachmentFlags"), 0)
+    if not configured:
+        configured = "n_buki_l" if flags & 0x1 else "n_buki_r"
+    fallbacks = (
+        configured,
+        "j_te_l" if configured.endswith("_l") else "j_te_r",
+    )
+    return next((name for name in fallbacks if target.pose.bones.get(name) is not None), None)
+
+
+def _attachment_matrix(event):
+    scale = _float_value(_field(event, "AttachmentScale", "Scale"), 1.0)
+    if not math.isfinite(scale) or scale <= 0.0 or scale > 100.0:
+        scale = 1.0
+    offset = Vector((
+        _float_value(_field(event, "AttachmentOffsetX", "OffsetX"), 0.0),
+        _float_value(_field(event, "AttachmentOffsetY", "OffsetY"), 0.0),
+        _float_value(_field(event, "AttachmentOffsetZ", "OffsetZ"), 0.0),
+    ))
+    rotation = Euler((
+        _float_value(_field(event, "AttachmentRotationX", "RotationX"), 0.0),
+        _float_value(_field(event, "AttachmentRotationY", "RotationY"), 0.0),
+        _float_value(_field(event, "AttachmentRotationZ", "RotationZ"), 0.0),
+    ), "XYZ").to_matrix().to_4x4()
+    # SharpGLTF stores the FFXIV Y-up transform. Blender's glTF importer maps
+    # it to X/Z-up as (x, -z, y); apply the same basis to ATCH metadata.
+    basis = Matrix((
+        (1.0, 0.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0, 0.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    game_matrix = Matrix.Translation(offset) @ rotation @ Matrix.Scale(scale, 4)
+    return basis @ game_matrix @ basis.inverted()
+
+
+def _restore_selection(context, original_active, original_selected):
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        for obj in original_selected:
+            if obj.name in bpy.data.objects:
+                obj.select_set(True)
+        if original_active is not None and original_active.name in bpy.data.objects:
+            context.view_layer.objects.active = original_active
+    except Exception:
+        pass
+
+
+def _import_runtime_prop(context, collection, target, catalog, event, index):
+    asset_path, cache_path = _resolve_prop_asset(catalog, event)
+    bone_name = _attachment_bone(target, event)
+    if bone_name is None:
+        raise ClipError("the exported rig has no compatible attachment bone")
+
+    snapshot = _data_snapshot()
+    original_active = getattr(context.view_layer.objects, "active", None)
+    original_selected = list(getattr(context, "selected_objects", []))
+    imported_objects = []
+    try:
+        _set_object_mode(context)
+        result = bpy.ops.import_scene.gltf(
+            filepath=str(asset_path), disable_bone_shape=True
+        )
+        if "FINISHED" not in result:
+            raise ClipError(f"Blender could not import {asset_path.name}")
+        imported_objects = _new_data(snapshot, "objects")
+        if not imported_objects or not any(obj.type == "MESH" for obj in imported_objects):
+            raise ClipError(f"{asset_path.name} contains no prop mesh")
+        if any(obj.type == "ARMATURE" for obj in imported_objects):
+            raise ClipError(f"{asset_path.name} is not a safe rigid prop asset")
+
+        mapped_count = _map_runtime_prop_materials(
+            imported_objects, cache_path, snapshot
+        )
+        imported_set = set(imported_objects)
+        roots = [obj for obj in imported_objects if obj.parent not in imported_set]
+        model_id = _int_value(_field(event, "ModelId"), 0)
+        body_id = _int_value(_field(event, "BodyId"), 0)
+        variant = _int_value(_field(event, "Variant"), 0)
+        bone_anchor = bpy.data.objects.new(
+            f"XivBlend Prop Bone | {bone_name} | {index + 1}",
+            None,
+        )
+        bone_anchor[TRANSIENT_PROPERTY] = True
+        bone_anchor["xivblend_runtime_real_game_asset"] = True
+        bone_anchor["xivblend_attachment_bone"] = bone_name
+        bone_anchor.empty_display_type = "PLAIN_AXES"
+        bone_anchor.empty_display_size = 0.02
+        collection.objects.link(bone_anchor)
+        constraint = bone_anchor.constraints.new(type="COPY_TRANSFORMS")
+        constraint.name = "XivBlend Exact ATCH Bone"
+        constraint.target = target
+        constraint.subtarget = bone_name
+
+        anchor = bpy.data.objects.new(
+            f"XivBlend Prop ATCH | w{model_id:04d}b{body_id:04d}v{variant:04d} | {index + 1}",
+            None,
+        )
+        anchor[TRANSIENT_PROPERTY] = True
+        anchor["xivblend_runtime_real_game_asset"] = True
+        anchor["xivblend_attachment_bone"] = bone_name
+        anchor["xivblend_model_game_path"] = str(
+            _field(event, "ModelGamePath", default="") or ""
+        )
+        anchor.empty_display_type = "PLAIN_AXES"
+        anchor.empty_display_size = 0.025
+        collection.objects.link(anchor)
+        anchor.parent = bone_anchor
+        anchor.matrix_parent_inverse = Matrix.Identity(4)
+        anchor.matrix_basis = _attachment_matrix(event)
+
+        for obj in imported_objects:
+            obj[TRANSIENT_PROPERTY] = True
+            obj["xivblend_runtime_real_game_asset"] = True
+            for owner in list(obj.users_collection):
+                try:
+                    owner.objects.unlink(obj)
+                except RuntimeError:
+                    pass
+            if obj.name not in collection.objects:
+                collection.objects.link(obj)
+        for root in roots:
+            local_matrix = root.matrix_world.copy()
+            root.parent = anchor
+            root.matrix_parent_inverse = Matrix.Identity(4)
+            root.matrix_basis = local_matrix
+
         start = _int_value(_field(event, "StartFrame"), 0)
         duration = max(1, _int_value(_field(event, "DurationFrames"), 1))
-        color = _glowstick_color(_field(event, "GamePath"))
-        grouped_glows.setdefault((start, duration, color), event)
-    for index, ((start, duration, color), _event) in enumerate(grouped_glows.items()):
-        material = _runtime_material(
-            f"XivBlend Runtime Glowstick Material {index + 1}", color, emission_strength=8.0
-        )
-        for side, preferred, fallback, offset in (
-            ("R", "n_buki_r", "j_te_r", (0.0, 0.085, 0.0)),
-            ("L", "n_buki_l", "j_te_l", (0.0, 0.085, 0.0)),
-        ):
-            obj = _runtime_mesh_object(
-                collection,
-                f"XivBlend Runtime Approximation | Glowstick {index + 1}{side}",
-                "glowstick", material,
-            )
-            if not _parent_runtime_effect(
-                obj, target, preferred, fallback, offset, (math.pi / 2.0, 0.0, 0.0)
-            ):
-                warnings.append(f"Glowstick could not attach because the {side.lower()}-hand bones are missing")
-                _discard_runtime_object(obj)
-                continue
+        for obj in imported_objects:
             _key_runtime_visibility(obj, start, duration)
+
+        # The glTF importer may create a temporary scene collection. All kept
+        # objects now live in XivBlend's transient runtime collection.
+        for imported_collection in list(_new_data(snapshot, "collections")):
+            if imported_collection == collection:
+                continue
+            try:
+                if len(imported_collection.objects) == 0:
+                    bpy.data.collections.remove(imported_collection)
+            except (ReferenceError, RuntimeError):
+                pass
+        _tag_transient_data(snapshot)
+        event["_RuntimeStatus"] = "Loaded exact game prop"
+        event["_RuntimeBone"] = bone_name
+        event["_RuntimeObjectCount"] = len(imported_objects)
+        event["_RuntimeMappedMaterials"] = mapped_count
+        return len(imported_objects)
+    except Exception:
+        _cleanup_import(snapshot)
+        raise
+    finally:
+        _restore_selection(context, original_active, original_selected)
+
+
+def _create_bundle_visuals(context, target, manifest, catalog):
+    props = [
+        event for event in _as_list(_field(manifest, "Props"))
+        if isinstance(event, dict)
+    ]
+    if not props:
+        return []
+    collection = _runtime_effect_collection(context.scene, target)
+    warnings = []
+    loaded = 0
+    for index, event in enumerate(props):
+        try:
+            loaded += _import_runtime_prop(
+                context, collection, target, catalog, event, index
+            )
+        except Exception as error:
+            event["_RuntimeStatus"] = f"Not loaded: {error}"
+            warnings.append(
+                f"Prop w{_int_value(_field(event, 'ModelId'), 0):04d}/"
+                f"b{_int_value(_field(event, 'BodyId'), 0):04d} was not loaded: {error}"
+            )
+    if loaded == 0:
+        try:
+            bpy.data.collections.remove(collection)
+        except (ReferenceError, RuntimeError):
+            pass
     return warnings
 
 
 def _bundle_runtime_warnings(manifest):
-    warnings = [str(value).strip() for value in _as_list(_field(manifest, "Warnings")) if str(value).strip()]
-    approximated = any(
-        isinstance(value, dict) and _is_glowstick_vfx(value)
-        for value in _as_list(_field(manifest, "VisualEffects"))
-    ) or any(
-        isinstance(value, dict) and _is_apple_prop(value)
-        for value in _as_list(_field(manifest, "Props"))
-    )
-    if approximated:
-        warnings.append("Apple/glowsticks use lightweight procedural previews; complex AVFX is not decoded yet")
-    visual_count = len([
+    warnings = [
+        str(value).strip()
+        for value in _as_list(_field(manifest, "Warnings"))
+        if str(value).strip()
+    ]
+    effects = [
         value for value in _as_list(_field(manifest, "VisualEffects"))
-        if isinstance(value, dict) and not _is_glowstick_vfx(value)
-    ])
-    prop_count = len([
-        value for value in _as_list(_field(manifest, "Props"))
-        if isinstance(value, dict) and not _is_apple_prop(value)
-    ])
-    if visual_count:
-        warnings.append(f"{visual_count} complex VFX event(s) are not previewed yet")
-    if prop_count:
-        warnings.append(f"{prop_count} unsupported prop event(s) are not previewed yet")
+        if isinstance(value, dict)
+    ]
+    native_effects = [value for value in effects if not _is_sync_control_vfx(value)]
+    cached_effects = [
+        value for value in native_effects
+        if str(_field(value, "SourceRelativePath", default="") or "").strip()
+    ]
+    failed_count = len(native_effects) - len(cached_effects)
+    if cached_effects:
+        warnings.append(
+            f"{len(cached_effects)} exact native AVFX source event(s) are cached with game timing and placement; "
+            "Blender does not simulate XIV's Apricot particle runtime yet"
+        )
+    if failed_count:
+        warnings.append(f"{failed_count} native AVFX source event(s) could not be extracted")
     return warnings
 
 
@@ -1599,10 +1954,10 @@ def _import_bundle(context, target, bundle_path, catalog, entry, variant, auto_p
         raise
 
     try:
-        visual_warnings = _create_bundle_visuals(context, target, manifest)
+        visual_warnings = _create_bundle_visuals(context, target, manifest, catalog)
     except Exception as error:
         _remove_runtime_visuals(target)
-        visual_warnings = [f"Runtime prop/VFX approximation failed: {error}"]
+        visual_warnings = [f"Real runtime prop import failed: {error}"]
 
     scene = context.scene
     fps = max(1, min(240, _int_value(_field(manifest, "FramesPerSecond"), 30)))
@@ -1623,6 +1978,7 @@ def _import_bundle(context, target, bundle_path, catalog, entry, variant, auto_p
         "clip_path": str(primary_path),
         "entry": entry,
         "variant": variant,
+        "manifest": manifest,
         "frame": frame_start,
         "playing": bool(auto_play),
         "warnings": warnings,
@@ -2695,6 +3051,186 @@ class XIVBLEND_PT_animation_browser(Panel):
             )
 
 
+def _active_effect_manifest(context):
+    target = _target_armature(context)
+    if target is None:
+        return None, None
+    session = _runtime_sessions.get(target.name)
+    if not isinstance(session, dict):
+        return None, None
+    manifest = session.get("manifest")
+    return (session, manifest) if isinstance(manifest, dict) else (session, None)
+
+
+def _timing_text(event):
+    start = _int_value(_field(event, "StartFrame"), 0)
+    duration = max(0, _int_value(_field(event, "DurationFrames"), 0))
+    kind = str(_field(event, "Kind", default="") or "").strip().casefold()
+    if kind == "asyncvfx" and duration == 0:
+        return f"starts frame {start} • native AVFX lifetime"
+    return f"frames {start}–{start + duration}"
+
+
+def _vfx_status_text(event):
+    status = str(_field(event, "AssetStatus", default="") or "").strip()
+    source_cached = bool(
+        str(_field(event, "SourceRelativePath", default="") or "").strip()
+    )
+    descriptions = {
+        "staticembeddedmeshpreview": (
+            "Exact AVFX cached • static draw mesh available for inspection • Apricot playback pending"
+        ),
+        "unsupportedapricot": "Exact AVFX cached • requires XIV's Apricot particle runtime",
+        "metadataonly": "Exact AVFX cached • metadata only; no independently drawable payload",
+        "missingasset": "AVFX was not found in the live game data",
+        "analysisfailed": "AVFX failed bounded structural analysis",
+        "exportfailed": (
+            "AVFX extraction was incomplete"
+            if not source_cached
+            else "Exact AVFX cached • optional preview export failed"
+        ),
+    }
+    return descriptions.get(
+        status.casefold(),
+        status or ("Exact AVFX cached" if source_cached else "AVFX metadata unavailable"),
+    )
+
+
+def _vfx_particle_text(event):
+    particles = [
+        value for value in _as_list(_field(event, "ParticleTypes"))
+        if isinstance(value, dict)
+    ]
+    labels = []
+    for value in particles[:4]:
+        name = str(_field(value, "TypeName", default="Unknown") or "Unknown")
+        count = max(0, _int_value(_field(value, "Count"), 0))
+        labels.append(f"{name} ×{count}")
+    if len(particles) > 4:
+        labels.append(f"+{len(particles) - 4} types")
+    return ", ".join(labels)
+
+
+class XIVBLEND_PT_emote_effects(Panel):
+    bl_idname = "XIVBLEND_PT_emote_effects"
+    bl_label = "Emote Effects"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XivBlend"
+
+    def draw(self, context):
+        layout = self.layout
+        session, manifest = _active_effect_manifest(context)
+        if manifest is None:
+            layout.label(text="Play an emote to inspect its effects", icon="INFO")
+            return
+
+        entry = session.get("entry", {}) if session else {}
+        layout.label(text=_entry_name(entry), icon="ACTION")
+        props = [
+            value for value in _as_list(_field(manifest, "Props"))
+            if isinstance(value, dict)
+        ]
+        effects = [
+            value for value in _as_list(_field(manifest, "VisualEffects"))
+            if isinstance(value, dict)
+        ]
+        sync = [value for value in effects if _is_sync_control_vfx(value)]
+        native = [value for value in effects if not _is_sync_control_vfx(value)]
+        cached_native = [
+            value for value in native
+            if str(_field(value, "SourceRelativePath", default="") or "").strip()
+        ]
+        static_previews = [
+            value for value in native
+            if str(_field(value, "AssetStatus", default="") or "").casefold()
+            == "staticembeddedmeshpreview"
+        ]
+
+        summary = layout.box()
+        summary.label(
+            text=f"{len(props)} real prop event(s) • {len(native)} native AVFX event(s)",
+            icon="SHADERFX",
+        )
+        if native:
+            summary.label(
+                text=f"{len(cached_native)} exact AVFX source(s) cached"
+                f" • {len(static_previews)} static mesh preview(s)",
+                icon="CHECKMARK" if len(cached_native) == len(native) else "INFO",
+            )
+            summary.label(text="TMB frames, color, scale, and placement are preserved")
+        if sync:
+            summary.label(
+                text=f"{len(sync)} internal sync-control event(s) ignored correctly",
+                icon="CHECKMARK",
+            )
+
+        if props:
+            box = layout.box()
+            box.label(text="Game Props", icon="OUTLINER_OB_MESH")
+            for event in props[:8]:
+                model = _int_value(_field(event, "ModelId"), 0)
+                body = _int_value(_field(event, "BodyId"), 0)
+                variant = _int_value(_field(event, "Variant"), 0)
+                status = str(
+                    _field(event, "_RuntimeStatus", "AssetStatus", default="Not prepared")
+                    or "Not prepared"
+                )
+                loaded = status.casefold().startswith("loaded")
+                row = box.row()
+                row.label(
+                    text=f"w{model:04d}/b{body:04d}/v{variant:04d} • {_timing_text(event)}",
+                    icon="CHECKMARK" if loaded else "ERROR",
+                )
+                detail = box.row()
+                detail.scale_y = 0.8
+                bone = str(
+                    _field(event, "_RuntimeBone", "AttachmentBone", default="") or ""
+                )
+                detail.label(text=f"{status}{f' • {bone}' if bone else ''}"[:92])
+            if len(props) > 8:
+                box.label(text=f"+ {len(props) - 8} more prop event(s)")
+
+        if native:
+            box = layout.box()
+            box.label(text="Native AVFX", icon="PARTICLES")
+            for event in native[:10]:
+                game_path = str(_field(event, "GamePath", default="") or "")
+                name = Path(game_path.replace("\\", "/")).name or "Unnamed AVFX"
+                status = _vfx_status_text(event)
+                source_cached = bool(
+                    str(_field(event, "SourceRelativePath", default="") or "").strip()
+                )
+                box.label(
+                    text=f"{name[:46]} • {_timing_text(event)}",
+                    icon="INFO" if source_cached else "ERROR",
+                )
+                detail = box.row()
+                detail.scale_y = 0.8
+                detail.label(text=status[:92])
+                models = max(0, _int_value(_field(event, "RenderableModelCount"), 0))
+                vertices = max(0, _int_value(_field(event, "EmbeddedVertexCount"), 0))
+                triangles = max(0, _int_value(_field(event, "EmbeddedTriangleCount"), 0))
+                textures = len(_as_list(_field(event, "TextureReferences")))
+                particles = _vfx_particle_text(event)
+                if models or vertices or triangles or textures or particles:
+                    metadata = []
+                    if models:
+                        metadata.append(f"{models} embedded mesh(es), {vertices} verts/{triangles} tris")
+                    if textures:
+                        metadata.append(f"{textures} texture ref(s)")
+                    if particles:
+                        metadata.append(particles)
+                    meta_row = box.row()
+                    meta_row.scale_y = 0.75
+                    meta_row.label(text=" • ".join(metadata)[:92])
+            if len(native) > 10:
+                box.label(text=f"+ {len(native) - 10} more AVFX event(s)")
+
+        if not props and not native:
+            layout.label(text="This emote has no visible prop or native AVFX events", icon="CHECKMARK")
+
+
 class XIVBLEND_PT_render_studio(Panel):
     bl_idname = "XIVBLEND_PT_render_studio"
     bl_label = "Render Studio"
@@ -2893,6 +3429,7 @@ _CLASSES = (
     XIVBLEND_OT_fit_camera_active_action,
     XIVBLEND_OT_render_portrait,
     XIVBLEND_PT_animation_browser,
+    XIVBLEND_PT_emote_effects,
     XIVBLEND_PT_render_studio,
 )
 

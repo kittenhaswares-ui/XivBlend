@@ -41,6 +41,9 @@ jobs:
       - name: Build release
         run: dotnet build Meddle.sln -c Release --nologo
 
+      - name: Run bounded parser and custom-manifest tests
+        run: dotnet run --project Meddle/Meddle.Utils.Tests/Meddle.Utils.Tests.csproj -c Release --no-build
+
       - name: Upload plugin package
         uses: actions/upload-artifact@v4
         with:

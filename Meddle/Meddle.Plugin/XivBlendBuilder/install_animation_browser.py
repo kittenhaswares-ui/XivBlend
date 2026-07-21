@@ -3,8 +3,8 @@
 Usage:
     blender --background --python install_animation_browser.py
 
-Only the adjacent, reviewed ``xivblend_animation_browser/__init__.py`` file is
-copied.  No game data, catalogs, icons, or animation clips are installed.
+The adjacent reviewed add-on and pinned MeddleTools material runtime are copied.
+No game data, catalogs, icons, models, textures, or animation clips are installed.
 """
 
 import json
@@ -19,6 +19,8 @@ import bpy
 
 MODULE_NAME = "xivblend_animation_browser"
 SOURCE_FILE = Path(__file__).resolve().with_name(MODULE_NAME) / "__init__.py"
+SOURCE_MATERIAL_RUNTIME = Path(__file__).resolve().with_name("MeddleTools")
+SOURCE_MATERIAL_LICENSE = Path(__file__).resolve().with_name("MEDDLETOOLS-LICENSE.txt")
 
 
 def _inside(path, root):
@@ -40,6 +42,12 @@ def install():
         )
     if not SOURCE_FILE.is_file() or SOURCE_FILE.name != "__init__.py":
         raise RuntimeError(f"Known add-on source is missing: {SOURCE_FILE}")
+    if not (SOURCE_MATERIAL_RUNTIME / "shaders.blend").is_file():
+        raise RuntimeError(
+            f"Known material runtime is missing: {SOURCE_MATERIAL_RUNTIME / 'shaders.blend'}"
+        )
+    if not SOURCE_MATERIAL_LICENSE.is_file():
+        raise RuntimeError(f"Known material-runtime license is missing: {SOURCE_MATERIAL_LICENSE}")
 
     scripts_value = bpy.utils.user_resource("SCRIPTS", create=True)
     if not scripts_value:
@@ -54,15 +62,38 @@ def install():
         raise RuntimeError(f"Unsafe add-on destination: {destination_file}")
 
     destination_folder.mkdir(parents=True, exist_ok=True)
-    temporary = destination_folder / f".__init__.{uuid.uuid4().hex}.tmp"
-    try:
-        shutil.copy2(SOURCE_FILE, temporary)
-        os.replace(temporary, destination_file)
-    finally:
+
+    def copy_reviewed_file(source, destination):
+        source = source.resolve()
+        destination = destination.resolve()
+        if not _inside(source, Path(__file__).resolve().parent):
+            raise RuntimeError(f"Unsafe companion source: {source}")
+        if not _inside(destination, destination_folder):
+            raise RuntimeError(f"Unsafe add-on destination: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
         try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    copy_reviewed_file(SOURCE_FILE, destination_file)
+    material_destination = destination_folder / "MeddleTools"
+    for source in sorted(SOURCE_MATERIAL_RUNTIME.rglob("*")):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(SOURCE_MATERIAL_RUNTIME)
+        if "__pycache__" in relative.parts or source.suffix == ".pyc" or source.suffix == ".blend1":
+            continue
+        copy_reviewed_file(source, material_destination / relative)
+    copy_reviewed_file(
+        SOURCE_MATERIAL_LICENSE,
+        destination_folder / "MEDDLETOOLS-LICENSE.txt",
+    )
 
     # Drop only this module from Python's cache.  The destination directory is
     # deliberately never recursively removed, even during upgrades.
@@ -89,6 +120,7 @@ def install():
         "Module": MODULE_NAME,
         "Source": str(SOURCE_FILE),
         "Destination": str(destination_file),
+        "MaterialRuntime": str(material_destination),
     }
     print("XIVBLEND_ANIMATION_BROWSER_INSTALL=" + json.dumps(report, ensure_ascii=False, sort_keys=True))
     return report

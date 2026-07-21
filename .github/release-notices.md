@@ -1,20 +1,21 @@
-# XivBlend Prototype 0.0.10
+# XivBlend Prototype 0.0.13
 
-This focused lighting update gives pale skin, clothing folds, and character silhouettes more depth instead of illuminating the whole subject too evenly.
+This update replaces the first fake emote props with exact local game assets, indexes native AVFX data without pretending Blender can already reproduce FFXIV's particle runtime, and fixes custom Penumbra animation mods whose player pose/loop files do not match a vanilla catalog entry.
 
 ## What changed
 
-- Reduces the warm key-light output by roughly 44% and makes its color more neutral.
-- Uses a smaller softbox footprint for soft but more readable directional shadows.
-- Reduces the broad fill by roughly 79%, allowing the key-side modelling to remain visible.
-- Reduces the cool rim by roughly 54% so it separates the silhouette without overpowering materials.
-- Slightly lowers exposure while retaining the existing 1440×1800, RGB16, 96-sample Eevee output.
-- Updates builder validation and the strict scene audit to enforce the refined preset.
+- Exports TMB-spawned props on demand from the local SqPack, including model, mapped materials, textures, colorset, hand selection, scale, lifetime, and verified food attachment data. Eat Apple now uses the real game prop.
+- Preserves each native AVFX source, content hash, TMB timing/color/scale/placement, particle types, texture references, and embedded-geometry metadata in the shared local cache.
+- Classifies effects that need FFXIV's Apricot runtime instead of substituting fake apples, glowsticks, or other Blender geometry. Static embedded AVFX meshes are inspection data only; full particle playback is not implemented yet.
+- Uses Penumbra's physical mod-directory API and bounded standard mod manifests, fixing the reported virtual-path `DirectoryNotFoundException`.
+- Discovers active standalone player pose/loop PAPs as **Custom** cards even when they do not replace a known vanilla emote.
+- Updates the Blender animation browser to 0.5.0 and animation bundles to schema 2. Old schema-1 bundles rebuild automatically.
 
 ## Install and test
 
-1. Update or reload XivBlend 0.0.10.
-2. Export the character again; existing `.blend` files retain their saved 0.0.9 lights.
-3. Render the captured pose or choose an emote pose and use **XivBlend** → **Render Studio** → **Fit Camera to Current Pose** first.
+1. Update or reload XivBlend 0.0.13.
+2. In **Animations**, press **Set Up / Update Animation Browser** to install browser 0.5.0.
+3. Click **Refresh Game Catalog** or simply click an emote and allow its old bundle to rebuild.
+4. For a custom mod, press **Refresh Penumbra Mods**, choose it, then press **Add Active Animation Overrides**. Active standalone pose/loop files should now appear under **Custom** in Blender.
 
-The character extraction, rig, materials, animation browser, cache, and packed-file behavior are unchanged by this patch.
+The plugin and Blender panel still ship without FFXIV assets. Exact props and AVFX sources are extracted locally only when a selected emote needs them, remain in the user's shared cache, and must not be redistributed.

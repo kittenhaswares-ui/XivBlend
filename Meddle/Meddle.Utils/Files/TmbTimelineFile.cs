@@ -173,6 +173,7 @@ public sealed class TmbTimelineFile
                         ReadInt16(timeline, position + 8),
                         ReadInt16(timeline, position + 10),
                         ReadInt32(timeline, position + 12),
+                        ReadInt32(timeline, position + 28),
                         ReadUInt16(timeline, position + 32),
                         ReadUInt16(timeline, position + 34),
                         ReadInt32(timeline, position + 36),
@@ -255,6 +256,7 @@ public sealed class TmbTimelineFile
                 item.Id,
                 item.Time,
                 item.Duration,
+                item.Flags,
                 item.ModelId,
                 item.BodyId,
                 item.Variant,
@@ -529,6 +531,7 @@ public sealed class TmbTimelineFile
         short id,
         short time,
         int duration,
+        int flags,
         ushort modelId,
         ushort bodyId,
         int variant,
@@ -537,6 +540,7 @@ public sealed class TmbTimelineFile
         public string Magic { get; } = magic;
         public short Time { get; } = time;
         public int Duration { get; } = duration;
+        public int Flags { get; } = flags;
         public ushort ModelId { get; } = modelId;
         public ushort BodyId { get; } = bodyId;
         public int Variant { get; } = variant;
@@ -600,6 +604,7 @@ public sealed record TmbPropEvent(
     short Id,
     int Time,
     int Duration,
+    int Flags,
     ushort ModelId,
     ushort BodyId,
     int Variant,

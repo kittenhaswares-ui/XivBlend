@@ -4,7 +4,10 @@ import threading
 import tomllib
 from pathlib import Path
 
-import requests
+try:
+    import requests
+except ImportError:  # XivBlend only needs the local manifest reader at runtime.
+    requests = None
 
 logger = logging.getLogger(__name__)
 try:
@@ -55,6 +58,9 @@ def updateLatestRelease():
         return
 
     attempted_version_check = True
+    if requests is None:
+        logger.info("The optional requests package is unavailable; skipping the MeddleTools update check.")
+        return
     try:
         response = requests.get(REPO_JSON_URL, timeout=5)
         response.raise_for_status()

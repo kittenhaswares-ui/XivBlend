@@ -8,16 +8,19 @@ namespace Meddle.Plugin.Services;
 
 /// <summary>
 /// Installs the asset-free XivBlend animation browser into the user's selected
-/// Blender profile.  The installer copies only the reviewed add-on source; game
-/// icons and animation data remain in XivBlend's local on-demand cache.
+/// Blender profile. The reviewed companion source includes the pinned
+/// MeddleTools material mapper and its shader templates; game icons, models,
+/// textures and animation data remain in XivBlend's local on-demand cache.
 /// </summary>
 public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
 {
-    public const string BrowserVersion = "0.4.0";
+    public const string BrowserVersion = "0.5.0";
 
     private const string ResourcePrefix = "XivBlendBuilder/";
     private const string InstallerResource = ResourcePrefix + "install_animation_browser.py";
     private const string AddonResource = ResourcePrefix + "xivblend_animation_browser/__init__.py";
+    private const string MeddleToolsResourcePrefix = ResourcePrefix + "MeddleTools/";
+    private const string MeddleToolsLicenseResource = ResourcePrefix + "MEDDLETOOLS-LICENSE.txt";
     private const string SuccessMarker = "XIVBLEND_ANIMATION_BROWSER_INSTALL=";
 
     private readonly ILogger<BlenderAnimationBrowserInstaller> logger;
@@ -189,7 +192,24 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
                 name => name,
                 StringComparer.Ordinal);
 
-        foreach (var normalizedResourceName in new[] { InstallerResource, AddonResource })
+        var reviewedResources = availableResources.Keys
+            .Where(name => name == InstallerResource
+                           || name == AddonResource
+                           || name == MeddleToolsLicenseResource
+                           || name.StartsWith(MeddleToolsResourcePrefix, StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!reviewedResources.Contains(InstallerResource, StringComparer.Ordinal)
+            || !reviewedResources.Contains(AddonResource, StringComparer.Ordinal)
+            || !reviewedResources.Contains(MeddleToolsLicenseResource, StringComparer.Ordinal)
+            || !reviewedResources.Any(name =>
+                name.Equals(MeddleToolsResourcePrefix + "shaders.blend", StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                "The plugin package is missing one or more reviewed Blender companion assets.");
+        }
+
+        foreach (var normalizedResourceName in reviewedResources)
         {
             if (!availableResources.TryGetValue(normalizedResourceName, out var resourceName))
             {

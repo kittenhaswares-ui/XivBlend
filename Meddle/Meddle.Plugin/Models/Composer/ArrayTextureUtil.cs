@@ -10,6 +10,45 @@ namespace Meddle.Plugin.Models.Composer;
 
 public static class ArrayTextureUtil
 {
+    private static void WriteAllBytesAtomic(string path, ReadOnlySpan<byte> data)
+    {
+        var parent = Path.GetDirectoryName(path)
+            ?? throw new InvalidOperationException("The array-texture output has no parent directory.");
+        Directory.CreateDirectory(parent);
+        var temporary = Path.Combine(parent, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            using (var stream = new FileStream(
+                       temporary,
+                       FileMode.CreateNew,
+                       FileAccess.Write,
+                       FileShare.None,
+                       64 * 1024,
+                       FileOptions.SequentialScan))
+            {
+                stream.Write(data);
+                stream.Flush(true);
+            }
+
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            try
+            {
+                File.Delete(temporary);
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup of a private cache staging file.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Best-effort cleanup of a private cache staging file.
+            }
+        }
+    }
+
     private static string GetOutDir(string cacheDir)
     {
         var outDir = Path.Combine(cacheDir, "array_textures");
@@ -29,7 +68,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(catchLightTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(catchlightOutDir, $"sphere_d_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(catchlightOutDir, $"sphere_d_array.{i}.png"), texture);
         }
         
         SaveAsVerticalArrayTexture(catchLightTex, catchlightOutDir, "sphere_d_array", catchLightTex.Header.CalculatedArraySize);
@@ -47,7 +86,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(tileNormTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(tileNormOutDir, $"tile_norm_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(tileNormOutDir, $"tile_norm_array.{i}.png"), texture);
         }
         
         var tileOrb = pack.GetFileOrReadFromDisk("chara/common/texture/tile_orb_array.tex");
@@ -59,7 +98,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(tileOrbTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(tileOrbOutDir, $"tile_orb_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(tileOrbOutDir, $"tile_orb_array.{i}.png"), texture);
         }
         
         SaveAsVerticalArrayTexture(tileNormTex, tileNormOutDir, "tile_norm_array", tileNormTex.Header.CalculatedArraySize);
@@ -79,7 +118,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(catchLightTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(catchlightOutDir, $"sphere_d_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(catchlightOutDir, $"sphere_d_array.{i}.png"), texture);
         }
         
         SaveAsVerticalArrayTexture(catchLightTex, catchlightOutDir, "sphere_d_array", catchLightTex.Header.CalculatedArraySize);
@@ -98,7 +137,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(detailDTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(detailDOutDir, $"detail_d_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(detailDOutDir, $"detail_d_array.{i}.png"), texture);
         }
 
         var detailN = pack.GetFileOrReadFromDisk("bgcommon/nature/detail/texture/detail_n_array.tex");
@@ -111,7 +150,7 @@ public static class ArrayTextureUtil
         {
             var img = ImageUtils.GetTexData(detailNTex, i, 0, 0);
             var texture = img.ImageAsPng();
-            File.WriteAllBytes(Path.Combine(detailNOutDir, $"detail_n_array.{i}.png"), texture.ToArray());
+            WriteAllBytesAtomic(Path.Combine(detailNOutDir, $"detail_n_array.{i}.png"), texture);
         }
         
         SaveAsVerticalArrayTexture(detailDTex, detailDOutDir, "detail_d_array", detailDTex.Header.CalculatedArraySize);
@@ -151,7 +190,7 @@ public static class ArrayTextureUtil
         using var memoryStream = new MemoryStream();
         combinedImage.Bitmap.Encode(memoryStream, SKEncodedImageFormat.Png, 100);
         var textureData = memoryStream.ToArray();
-        File.WriteAllBytes(combinedImagePath, textureData);
+        WriteAllBytesAtomic(combinedImagePath, textureData);
         Plugin.Logger.LogInformation("Saved vertical array texture to {Path}", combinedImagePath);
     }
 }

@@ -28,11 +28,15 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 {
     public const int CatalogSchemaVersion = 2;
     public const int QueueSchemaVersion = 2;
-    public const int BundleSchemaVersion = 1;
+    public const int BundleSchemaVersion = 2;
 
     private const long MaximumBundleJsonBytes = 4_194_304;
     private const int MaximumBundleLayers = 1_024;
     private const int MaximumBundleVisualEffects = 4_096;
+    private const int MaximumBundleVfxParticleTypes = 256;
+    private const int MaximumBundleVfxTextureReferences = 4_096;
+    private const int MaximumBundleVfxTypeNameLength = 128;
+    private const int MaximumBundleVfxGamePathLength = 512;
     private const int MaximumBundleProps = 1_024;
     private const int MaximumBundleWarnings = 256;
     private const int MaximumBundleWarningLength = 4_096;
@@ -63,6 +67,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
     private readonly IFramework framework;
     private readonly SqPack sqPack;
     private readonly VanillaPapAnimationExporter papExporter;
+    private readonly AnimationPropAssetExporter propAssetExporter;
+    private readonly AnimationVfxAssetExporter vfxAssetExporter;
     private readonly PenumbraAnimationModService customMods;
     private readonly SemaphoreSlim operationGate = new(1, 1);
     private readonly CancellationTokenSource disposeToken = new();
@@ -83,6 +89,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         IFramework framework,
         SqPack sqPack,
         VanillaPapAnimationExporter papExporter,
+        AnimationPropAssetExporter propAssetExporter,
+        AnimationVfxAssetExporter vfxAssetExporter,
         PenumbraAnimationModService customMods)
     {
         this.logger = logger;
@@ -91,6 +99,8 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         this.framework = framework;
         this.sqPack = sqPack;
         this.papExporter = papExporter;
+        this.propAssetExporter = propAssetExporter;
+        this.vfxAssetExporter = vfxAssetExporter;
         this.customMods = customMods;
 
         Directory.CreateDirectory(LibraryRoot);
@@ -613,10 +623,18 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 
         if (variant.Kind == "Body")
         {
-            actionTimeline = TryReadVanillaTimeline(
-                $"chara/action/{variant.TimelineKey}.tmb",
-                warnings,
-                "The emote action timeline could not be read");
+            // Standalone custom PAPs discovered from Penumbra metadata have no
+            // corresponding ActionTimeline sheet row. Their embedded PAP
+            // timeline remains authoritative, so do not invent a vanilla TMB
+            // lookup (or a misleading missing-TMB warning) for timeline ID 0.
+            if (variant.ActionTimelineId != 0)
+            {
+                actionTimeline = TryReadVanillaTimeline(
+                    $"chara/action/{variant.TimelineKey}.tmb",
+                    warnings,
+                    "The emote action timeline could not be read");
+            }
+
             var bodyEvent = actionTimeline?.Animations
                 .Where(item => item.Magic == "C010")
                 .OrderBy(item => item.Time)
@@ -631,7 +649,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 requestedTrack = bodyEvent.Path;
                 exactTrack = true;
             }
-            else
+            else if (variant.ActionTimelineId != 0)
             {
                 warnings.Add("The TMB did not name a primary body track; XivBlend used its deterministic PAP fallback.");
             }
@@ -698,7 +716,14 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 
             if (embeddedTimeline is not null)
             {
-                AddVisibleTimelineEvents(embeddedTimeline, visualEffects, props, warnings);
+                AddVisibleTimelineEvents(
+                    embeddedTimeline,
+                    visualEffects,
+                    props,
+                    warnings,
+                    request.RaceCode,
+                    GetBuildRoot(activeCatalog),
+                    cancellationToken);
                 await AddFacialLayersAsync(
                         activeCatalog,
                         entry,
@@ -758,6 +783,27 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             {
                 throw new InvalidDataException(
                     $"The generated animation layer '{layer.ClipRelativePath}' is missing or invalid.");
+            }
+        }
+
+        foreach (var prop in manifest.Props.Where(item =>
+                     item.AssetStatus == AnimationPropAssetStatuses.Ready))
+        {
+            if (!AnimationPropAssetExporter.IsValidPublishedAsset(
+                    ResolveInside(LibraryRoot, prop.AssetRelativePath!),
+                    ResolveInside(LibraryRoot, prop.AssetCacheRelativePath!)))
+            {
+                throw new InvalidDataException(
+                    $"The generated prop asset '{prop.AssetRelativePath}' is missing or invalid.");
+            }
+        }
+
+        foreach (var visualEffect in manifest.VisualEffects)
+        {
+            if (!IsValidBundleVfxAsset(visualEffect))
+            {
+                throw new InvalidDataException(
+                    $"The generated VFX metadata or asset '{visualEffect.GamePath}' is missing or invalid.");
             }
         }
 
@@ -922,14 +968,17 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         }
     }
 
-    private static void AddVisibleTimelineEvents(
+    private void AddVisibleTimelineEvents(
         TmbTimelineFile timeline,
         ICollection<AnimationBundleVisualEvent> visualEffects,
         ICollection<AnimationBundlePropEvent> props,
-        ICollection<string> warnings)
+        ICollection<string> warnings,
+        ushort raceCode,
+        string buildRoot,
+        CancellationToken cancellationToken)
     {
         var usableVisualEffects = timeline.VisualEffects
-            .Where(item => !string.IsNullOrWhiteSpace(item.Path))
+            .Where(item => IsSafeVfxGamePath(item.Path))
             .Take(MaximumBundleVisualEffects)
             .ToArray();
         if (usableVisualEffects.Length < timeline.VisualEffects.Count)
@@ -940,7 +989,17 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 
         foreach (var item in usableVisualEffects)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var startFrame = Math.Clamp(item.Time, 0, MaximumBundleFrame);
+            var asset = vfxAssetExporter.Export(item.Path, buildRoot, cancellationToken);
+            if (asset.Status != AnimationVfxAssetStatus.SyncControl)
+            {
+                foreach (var warning in asset.Warnings)
+                {
+                    warnings.Add(warning);
+                }
+            }
+
             visualEffects.Add(new AnimationBundleVisualEvent(
                 Kind: item.Magic == "C173" ? "AsyncVfx" : "Vfx",
                 StartFrame: startFrame,
@@ -948,7 +1007,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                     Math.Max(0L, item.Duration),
                     0L,
                     MaximumBundleFrame - (long)startFrame),
-                GamePath: item.Path,
+                GamePath: asset.GamePath,
                 BindPoint1: item.BindPoint1,
                 BindPoint2: item.BindPoint2,
                 BindPoint3: item.BindPoint3,
@@ -968,7 +1027,28 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 ColorA: FiniteOr(item.Color.W, 1.0f),
                 Visibility: item.Visibility,
                 TrackOrder: item.TrackOrder ?? int.MaxValue,
-                ItemOrder: item.ItemOrder));
+                ItemOrder: item.ItemOrder,
+                AssetStatus: asset.Status.ToString(),
+                SourceRelativePath: asset.AvfxAssetPath is null
+                    ? null
+                    : ToLibraryRelative(asset.AvfxAssetPath),
+                StaticPreviewRelativePath: asset.StaticPreviewPath is null
+                    ? null
+                    : ToLibraryRelative(asset.StaticPreviewPath),
+                StaticPreviewSha256: asset.StaticPreviewSha256,
+                ContentSha256: asset.ContentSha256,
+                RequiresApricotRuntime: asset.RequiresApricotRuntime,
+                EmbeddedModelCount: asset.EmbeddedModelCount,
+                RenderableModelCount: asset.RenderableModelCount,
+                EmbeddedVertexCount: asset.EmbeddedVertexCount,
+                EmbeddedTriangleCount: asset.EmbeddedTriangleCount,
+                ParticleTypes: asset.ParticleTypes
+                    .Select(value => new AnimationBundleVfxParticleType(
+                        value.TypeId,
+                        value.TypeName,
+                        value.Count))
+                    .ToArray(),
+                TextureReferences: asset.TextureReferences.ToArray()));
         }
 
         var summonVisibleFrame = timeline.Visibility
@@ -986,6 +1066,7 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
 
         foreach (var item in usableProps)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var authoredStart = Math.Clamp(item.Time, 0, MaximumBundleFrame);
             var visibleStart = summonVisibleFrame is { } frame
                 ? Math.Max(authoredStart, frame)
@@ -995,15 +1076,51 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                 authoredStart + Math.Max(0L, item.Duration),
                 authoredStart,
                 MaximumBundleFrame);
+            var assetDirectory = ResolveInside(
+                buildRoot,
+                Path.Combine(
+                    "assets",
+                    "props",
+                    $"w{item.ModelId:D4}",
+                    $"b{item.BodyId:D4}",
+                    $"v{item.Variant:D4}"));
+            var asset = propAssetExporter.Export(
+                "Model",
+                item.ModelId,
+                item.BodyId,
+                item.Variant,
+                item.Flags,
+                raceCode,
+                assetDirectory,
+                ResolveInside(buildRoot, Path.Combine("assets", "props", "cache")),
+                cancellationToken);
+            if (!string.IsNullOrWhiteSpace(asset.Warning))
+            {
+                warnings.Add(asset.Warning);
+            }
+
             props.Add(new AnimationBundlePropEvent(
                 Kind: "Model",
                 StartFrame: visibleStart,
                 DurationFrames: Math.Max(0, authoredEnd - visibleStart),
+                Flags: item.Flags,
                 ModelId: item.ModelId,
                 BodyId: item.BodyId,
                 Variant: item.Variant,
                 TrackOrder: item.TrackOrder ?? int.MaxValue,
-                ItemOrder: item.ItemOrder));
+                ItemOrder: item.ItemOrder,
+                AssetStatus: asset.Status,
+                AssetRelativePath: asset.AssetPath is null ? null : ToLibraryRelative(asset.AssetPath),
+                AssetCacheRelativePath: asset.CacheDirectory is null ? null : ToLibraryRelative(asset.CacheDirectory),
+                ModelGamePath: asset.ModelGamePath,
+                AttachmentBone: asset.Attachment.Bone,
+                AttachmentScale: FiniteOr(asset.Attachment.Scale, 1.0f),
+                AttachmentOffsetX: FiniteOr(asset.Attachment.Offset.X, 0.0f),
+                AttachmentOffsetY: FiniteOr(asset.Attachment.Offset.Y, 0.0f),
+                AttachmentOffsetZ: FiniteOr(asset.Attachment.Offset.Z, 0.0f),
+                AttachmentRotationX: FiniteOr(asset.Attachment.Rotation.X, 0.0f),
+                AttachmentRotationY: FiniteOr(asset.Attachment.Rotation.Y, 0.0f),
+                AttachmentRotationZ: FiniteOr(asset.Attachment.Rotation.Z, 0.0f)));
         }
     }
 
@@ -1226,8 +1343,11 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                    || layer.SourceEndFrame < layer.SourceStartFrame)
                && !manifest.VisualEffects.Any(item =>
                    item is null
+                   || string.IsNullOrWhiteSpace(item.Kind)
+                   || item.Kind.Length > 128
                    || string.IsNullOrWhiteSpace(item.GamePath)
                    || item.GamePath.Length > 4_096
+                   || !IsSafeVfxGamePath(item.GamePath)
                    || item.StartFrame < manifest.FrameStart
                    || item.DurationFrames < 0
                    || item.StartFrame > manifest.FrameEnd - item.DurationFrames
@@ -1243,15 +1363,172 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
                    || !float.IsFinite(item.ColorR)
                    || !float.IsFinite(item.ColorG)
                    || !float.IsFinite(item.ColorB)
-                   || !float.IsFinite(item.ColorA))
+                   || !float.IsFinite(item.ColorA)
+                   || !HasValidVfxMetadataShape(item))
                && !manifest.Props.Any(item =>
                    item is null
                    || string.IsNullOrWhiteSpace(item.Kind)
                    || item.StartFrame < manifest.FrameStart
                    || item.DurationFrames < 0
-                   || item.StartFrame > manifest.FrameEnd - item.DurationFrames)
+                   || item.StartFrame > manifest.FrameEnd - item.DurationFrames
+                   || !AnimationPropAssetStatuses.IsKnown(item.AssetStatus)
+                   || string.IsNullOrWhiteSpace(item.AttachmentBone)
+                   || item.AttachmentBone.Length > 256
+                   || !float.IsFinite(item.AttachmentScale)
+                   || item.AttachmentScale <= 0.0f
+                   || !float.IsFinite(item.AttachmentOffsetX)
+                   || !float.IsFinite(item.AttachmentOffsetY)
+                   || !float.IsFinite(item.AttachmentOffsetZ)
+                   || !float.IsFinite(item.AttachmentRotationX)
+                   || !float.IsFinite(item.AttachmentRotationY)
+                   || !float.IsFinite(item.AttachmentRotationZ)
+                   || (item.ModelGamePath is not null
+                       && (!IsSafeGameAssetPath(item.ModelGamePath, ".mdl")
+                           || item.ModelGamePath.Length > 4_096))
+                   || (item.AssetStatus == AnimationPropAssetStatuses.Ready
+                       && (string.IsNullOrWhiteSpace(item.AssetRelativePath)
+                           || string.IsNullOrWhiteSpace(item.AssetCacheRelativePath)))
+                   || (item.AssetStatus != AnimationPropAssetStatuses.Ready
+                       && (item.AssetRelativePath is not null
+                           || item.AssetCacheRelativePath is not null)))
                && !manifest.Warnings.Any(item =>
                    item is null || item.Length > MaximumBundleWarningLength);
+    }
+
+    private static bool HasValidVfxMetadataShape(AnimationBundleVisualEvent item)
+    {
+        if (!AnimationVfxAssetStatuses.IsKnown(item.AssetStatus)
+            || item.EmbeddedModelCount < 0
+            || item.EmbeddedModelCount > AvfxAnalysisOptions.Default.MaximumModels
+            || item.RenderableModelCount is < 0
+            || item.RenderableModelCount > item.EmbeddedModelCount
+            || item.EmbeddedVertexCount < 0
+            || item.EmbeddedVertexCount > AvfxAnalysisOptions.Default.MaximumVertices
+            || item.EmbeddedTriangleCount < 0
+            || item.EmbeddedTriangleCount > AvfxAnalysisOptions.Default.MaximumTriangles
+            || item.ParticleTypes is null
+                or { Count: > MaximumBundleVfxParticleTypes }
+            || item.TextureReferences is null
+                or { Count: > MaximumBundleVfxTextureReferences })
+        {
+            return false;
+        }
+
+        var previousTypeId = int.MinValue;
+        long totalParticleNodes = 0;
+        foreach (var particle in item.ParticleTypes)
+        {
+            if (particle is null
+                || particle.TypeId <= previousTypeId
+                || string.IsNullOrWhiteSpace(particle.TypeName)
+                || particle.TypeName.Length > MaximumBundleVfxTypeNameLength
+                || particle.Count <= 0
+                || particle.Count > AvfxAnalysisOptions.Default.MaximumChunkCount)
+            {
+                return false;
+            }
+
+            var expectedName = Enum.IsDefined(typeof(AvfxParticleType), particle.TypeId)
+                ? ((AvfxParticleType)particle.TypeId).ToString()
+                : $"Unknown({particle.TypeId})";
+            if (!string.Equals(particle.TypeName, expectedName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            previousTypeId = particle.TypeId;
+            totalParticleNodes += particle.Count;
+        }
+
+        if (totalParticleNodes > AvfxAnalysisOptions.Default.MaximumChunkCount
+            || item.TextureReferences.Any(path =>
+                !IsSafeVfxTexturePath(path) || path.Length > 4_096)
+            || item.TextureReferences.Distinct(StringComparer.OrdinalIgnoreCase).Count()
+            != item.TextureReferences.Count)
+        {
+            return false;
+        }
+
+        var sourcePresent = item.SourceRelativePath is not null;
+        var previewPresent = item.StaticPreviewRelativePath is not null;
+        var previewHashPresent = item.StaticPreviewSha256 is not null;
+        var hashPresent = item.ContentSha256 is not null;
+        if (sourcePresent && !IsSafeLibraryAssetPath(item.SourceRelativePath!, ".avfx")
+            || previewPresent && !IsSafeLibraryAssetPath(item.StaticPreviewRelativePath!, ".glb")
+            || previewHashPresent && !IsLowerHexSha256(item.StaticPreviewSha256!)
+            || hashPresent && !IsLowerHexSha256(item.ContentSha256!))
+        {
+            return false;
+        }
+
+        if (previewPresent != previewHashPresent) return false;
+
+        if (hashPresent)
+        {
+            var shortHash = item.ContentSha256![..20];
+            if (sourcePresent
+                && !item.SourceRelativePath!.Replace('\\', '/').EndsWith(
+                    $"/assets/vfx/{shortHash}/source.avfx",
+                    StringComparison.Ordinal)
+                || previewPresent
+                && !item.StaticPreviewRelativePath!.Replace('\\', '/').EndsWith(
+                    $"/assets/vfx/{shortHash}/static-preview-v1.glb",
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        var hasNoExtractedMetadata = item.EmbeddedModelCount == 0
+                                     && item.RenderableModelCount == 0
+                                     && item.EmbeddedVertexCount == 0
+                                     && item.EmbeddedTriangleCount == 0
+                                     && item.ParticleTypes.Count == 0
+                                     && item.TextureReferences.Count == 0;
+        return item.AssetStatus switch
+        {
+            AnimationVfxAssetStatuses.SyncControl =>
+                AvfxAnalyzer.IsSyncControlPath(item.GamePath)
+                && !sourcePresent
+                && !previewPresent
+                && !hashPresent
+                && !item.RequiresApricotRuntime
+                && hasNoExtractedMetadata,
+            AnimationVfxAssetStatuses.StaticEmbeddedMeshPreview =>
+                sourcePresent
+                && previewPresent
+                && previewHashPresent
+                && hashPresent
+                && item.RenderableModelCount > 0
+                && item.EmbeddedVertexCount > 0
+                && item.EmbeddedTriangleCount > 0,
+            AnimationVfxAssetStatuses.UnsupportedApricot =>
+                sourcePresent
+                && !previewPresent
+                && !previewHashPresent
+                && hashPresent
+                && item.RequiresApricotRuntime
+                && item.RenderableModelCount == 0,
+            AnimationVfxAssetStatuses.MetadataOnly =>
+                sourcePresent
+                && !previewPresent
+                && !previewHashPresent
+                && hashPresent
+                && !item.RequiresApricotRuntime
+                && item.RenderableModelCount == 0,
+            AnimationVfxAssetStatuses.MissingAsset or AnimationVfxAssetStatuses.AnalysisFailed =>
+                !sourcePresent
+                && !previewPresent
+                && !previewHashPresent
+                && !hashPresent
+                && !item.RequiresApricotRuntime
+                && hasNoExtractedMetadata,
+            AnimationVfxAssetStatuses.ExportFailed =>
+                !previewPresent
+                && !previewHashPresent
+                && hashPresent,
+            _ => false,
+        };
     }
 
     private AnimationBundleManifest? ReadValidBundle(
@@ -1279,6 +1556,36 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
             foreach (var layer in manifest!.Layers)
             {
                 if (!IsValidAnimationGlb(ResolveInside(LibraryRoot, layer.ClipRelativePath)))
+                {
+                    return null;
+                }
+            }
+
+            foreach (var prop in manifest.Props.Where(item =>
+                         item.AssetStatus == AnimationPropAssetStatuses.Ready))
+            {
+                if (!AnimationPropAssetExporter.IsValidPublishedAsset(
+                        ResolveInside(LibraryRoot, prop.AssetRelativePath!),
+                        ResolveInside(LibraryRoot, prop.AssetCacheRelativePath!)))
+                {
+                    return null;
+                }
+            }
+
+            // Export failures can be transient (locked cache, interrupted
+            // publication, permissions). Do not make them permanent merely
+            // because a bundle manifest was written successfully.
+            if (manifest.Props.Any(item =>
+                    item.AssetStatus == AnimationPropAssetStatuses.ExportFailed)
+                || manifest.VisualEffects.Any(item =>
+                    item.AssetStatus == AnimationVfxAssetStatuses.ExportFailed))
+            {
+                return null;
+            }
+
+            foreach (var visualEffect in manifest.VisualEffects)
+            {
+                if (!IsValidBundleVfxAsset(visualEffect))
                 {
                     return null;
                 }
@@ -1536,6 +1843,177 @@ public sealed partial class AnimationLibraryService : IService, IDisposable
         }
 
         return resolved;
+    }
+
+    private static bool IsSafeGameAssetPath(string path, string requiredExtension)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || Path.IsPathRooted(path)
+            || path.Contains('\\')
+            || path.Contains(':')
+            || !path.EndsWith(requiredExtension, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length > 1
+               && segments.All(segment => segment is not "." and not "..")
+               && string.Equals(segments[0], "chara", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSafeVfxGamePath(string? path)
+    {
+        return IsSafeCanonicalVfxPath(path, ".avfx", MaximumBundleVfxGamePathLength);
+    }
+
+    private static bool IsSafeVfxTexturePath(string? path)
+    {
+        return IsSafeCanonicalVfxPath(path, ".atex", 4_096);
+    }
+
+    private static bool IsSafeCanonicalVfxPath(
+        string? path,
+        string requiredExtension,
+        int maximumLength)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || path.Length > maximumLength
+            || Path.IsPathRooted(path)
+            || path.Contains('\\')
+            || path.Contains(':')
+            || path.Contains('\0')
+            || !path.StartsWith("vfx/", StringComparison.Ordinal)
+            || !path.EndsWith(requiredExtension, StringComparison.Ordinal)
+            || path.Any(character =>
+                !(char.IsAsciiLetterOrDigit(character) || character is '/' or '_' or '-' or '.')))
+        {
+            return false;
+        }
+
+        var segments = path.Split('/');
+        return segments.Length > 1
+               && segments.All(segment => segment is not "" and not "." and not "..");
+    }
+
+    private static bool IsSafeLibraryAssetPath(string path, string requiredExtension)
+    {
+        if (string.IsNullOrWhiteSpace(path)
+            || path.Length > 32_768
+            || Path.IsPathRooted(path)
+            || path.Contains('\\')
+            || path.Contains(':')
+            || !path.EndsWith(requiredExtension, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var segments = path.Split('/');
+        return segments.Length > 1
+               && segments.All(segment => segment is not "" and not "." and not "..");
+    }
+
+    private static bool IsLowerHexSha256(string value)
+    {
+        return value.Length == 64
+               && value.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
+    }
+
+    private static bool IsValidBundleVfxAsset(AnimationBundleVisualEvent item)
+    {
+        try
+        {
+            if (!HasValidVfxMetadataShape(item)) return false;
+            if (item.SourceRelativePath is null)
+            {
+                return item.AssetStatus is AnimationVfxAssetStatuses.SyncControl
+                    or AnimationVfxAssetStatuses.MissingAsset
+                    or AnimationVfxAssetStatuses.AnalysisFailed
+                    or AnimationVfxAssetStatuses.ExportFailed;
+            }
+
+            var sourcePath = ResolveInside(LibraryRoot, item.SourceRelativePath);
+            byte[] bytes;
+            using (var stream = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                if (stream.Length < 8
+                    || stream.Length > AvfxAnalysisOptions.Default.MaximumFileBytes
+                    || stream.Length > int.MaxValue)
+                {
+                    return false;
+                }
+
+                bytes = new byte[(int)stream.Length];
+                stream.ReadExactly(bytes);
+            }
+
+            var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            if (!string.Equals(hash, item.ContentSha256, StringComparison.Ordinal)) return false;
+
+            var analysis = AvfxAnalyzer.Analyze(bytes, item.GamePath);
+            if (analysis.IsSyncControl
+                || analysis.RequiresApricotRuntime != item.RequiresApricotRuntime
+                || analysis.EmbeddedModels.Count != item.EmbeddedModelCount
+                || analysis.RenderableModelCount != item.RenderableModelCount
+                || analysis.EmbeddedModels.Sum(model => model.Vertices.Count) != item.EmbeddedVertexCount
+                || analysis.EmbeddedModels.Sum(model => model.Triangles.Count) != item.EmbeddedTriangleCount)
+            {
+                return false;
+            }
+
+            if (item.AssetStatus != AnimationVfxAssetStatuses.ExportFailed
+                && !string.Equals(
+                    analysis.PreviewStatus.ToString(),
+                    item.AssetStatus,
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var expectedParticles = analysis.ParticleTypeHistogram
+                .OrderBy(value => value.Key)
+                .Select(value => new AnimationBundleVfxParticleType(
+                    value.Key,
+                    Enum.IsDefined(typeof(AvfxParticleType), value.Key)
+                        ? ((AvfxParticleType)value.Key).ToString()
+                        : $"Unknown({value.Key})",
+                    value.Value))
+                .ToArray();
+            if (!expectedParticles.SequenceEqual(item.ParticleTypes)
+                || !analysis.ReferencedTexturePaths.SequenceEqual(
+                    item.TextureReferences,
+                    StringComparer.Ordinal))
+            {
+                return false;
+            }
+
+            if (item.AssetStatus != AnimationVfxAssetStatuses.StaticEmbeddedMeshPreview)
+            {
+                return true;
+            }
+
+            var previewPath = ResolveInside(LibraryRoot, item.StaticPreviewRelativePath!);
+            if (!IsValidAnimationGlb(previewPath)) return false;
+            using var previewStream = new FileStream(
+                previewPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read);
+            var previewHash = Convert.ToHexString(SHA256.HashData(previewStream)).ToLowerInvariant();
+            return string.Equals(
+                previewHash,
+                item.StaticPreviewSha256,
+                StringComparison.Ordinal);
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or InvalidDataException
+                or ArgumentException
+                or OverflowException)
+        {
+            return false;
+        }
     }
 
     private static bool IsValidAnimationGlb(string path)

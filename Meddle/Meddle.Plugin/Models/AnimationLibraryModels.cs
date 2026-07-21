@@ -138,14 +138,79 @@ public sealed record AnimationBundleVisualEvent(
     float ColorA,
     int Visibility,
     int TrackOrder,
-    int ItemOrder);
+    int ItemOrder,
+    string AssetStatus,
+    string? SourceRelativePath,
+    string? StaticPreviewRelativePath,
+    string? StaticPreviewSha256,
+    string? ContentSha256,
+    bool RequiresApricotRuntime,
+    int EmbeddedModelCount,
+    int RenderableModelCount,
+    int EmbeddedVertexCount,
+    int EmbeddedTriangleCount,
+    IReadOnlyList<AnimationBundleVfxParticleType> ParticleTypes,
+    IReadOnlyList<string> TextureReferences);
+
+public sealed record AnimationBundleVfxParticleType(
+    int TypeId,
+    string TypeName,
+    int Count);
+
+public static class AnimationVfxAssetStatuses
+{
+    public const string SyncControl = "SyncControl";
+    public const string StaticEmbeddedMeshPreview = "StaticEmbeddedMeshPreview";
+    public const string UnsupportedApricot = "UnsupportedApricot";
+    public const string MetadataOnly = "MetadataOnly";
+    public const string MissingAsset = "MissingAsset";
+    public const string AnalysisFailed = "AnalysisFailed";
+    public const string ExportFailed = "ExportFailed";
+
+    public static bool IsKnown(string? value)
+    {
+        return value is SyncControl
+            or StaticEmbeddedMeshPreview
+            or UnsupportedApricot
+            or MetadataOnly
+            or MissingAsset
+            or AnalysisFailed
+            or ExportFailed;
+    }
+}
 
 public sealed record AnimationBundlePropEvent(
     string Kind,
     int StartFrame,
     int DurationFrames,
+    int Flags,
     ushort ModelId,
     ushort BodyId,
     int Variant,
     int TrackOrder,
-    int ItemOrder);
+    int ItemOrder,
+    string AssetStatus,
+    string? AssetRelativePath,
+    string? AssetCacheRelativePath,
+    string? ModelGamePath,
+    string AttachmentBone,
+    float AttachmentScale,
+    float AttachmentOffsetX,
+    float AttachmentOffsetY,
+    float AttachmentOffsetZ,
+    float AttachmentRotationX,
+    float AttachmentRotationY,
+    float AttachmentRotationZ);
+
+public static class AnimationPropAssetStatuses
+{
+    public const string Ready = "Ready";
+    public const string MissingModel = "MissingModel";
+    public const string UnsupportedKind = "UnsupportedKind";
+    public const string ExportFailed = "ExportFailed";
+
+    public static bool IsKnown(string? value)
+    {
+        return value is Ready or MissingModel or UnsupportedKind or ExportFailed;
+    }
+}

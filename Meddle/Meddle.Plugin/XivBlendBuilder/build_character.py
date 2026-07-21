@@ -25,7 +25,7 @@ from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.7.0"
+BUILDER_VERSION = "0.8.0"
 ANIMATION_CATALOG_SCHEMA = 2
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -1415,8 +1415,11 @@ def write_embedded_readme() -> None:
         "catalog, game icons and game animation assets are not embedded in this file; only "
         "the selected runtime preview bundle is loaded, and it is removed before saving.\n"
         "- The animation browser uses on-demand player-emote bundles with synchronized facial motion. "
-        "Combat and weapon actions are not included; visible emote effects are lightweight Blender approximations.\n"
-        "- Optional custom cards come only from animation PAP overrides explicitly imported through Penumbra for your own character.\n"
+        "Exact supported game props are prepared on demand and removed before saving. Native AVFX "
+        "sources and metadata remain in XivBlend's shared local cache; Blender does not yet simulate "
+        "Apricot particle playback. Combat and weapon actions are not included.\n"
+        "- Optional custom cards come only from active animation PAPs explicitly imported through Penumbra "
+        "for your own character, including standalone player pose and loop replacements.\n"
         "- Textures used by the materials are packed into this file.\n"
         "- The external xivblend-manifest.json contains private character/mod paths and "
         "should not be shared casually. The embedded provenance is redacted.\n"

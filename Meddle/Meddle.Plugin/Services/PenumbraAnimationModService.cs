@@ -22,10 +22,17 @@ namespace Meddle.Plugin.Services;
 /// </summary>
 public sealed class PenumbraAnimationModService : IService
 {
-    private const int RegistrySchemaVersion = 1;
+    private const int RegistrySchemaVersion = 2;
     private const int ExpectedPenumbraBreakingVersion = 5;
     private const long MaximumPapBytes = 32L * 1024L * 1024L;
     private const long MaximumImportBytes = 512L * 1024L * 1024L;
+    private const int MaximumMetadataFiles = 512;
+    private const long MaximumMetadataFileBytes = 16L * 1024L * 1024L;
+    private const long MaximumMetadataBytes = 64L * 1024L * 1024L;
+    private const int MaximumDiscoveredPapPaths = 4_096;
+    private const int MaximumRegistryTextLength = 4_096;
+    private const int MaximumSelectedOptions = 4_096;
+    private const int MaximumSelectedOptionCharacters = 1_048_576;
     private const uint FileFlagBackupSemantics = 0x02000000;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -39,7 +46,7 @@ public sealed class PenumbraAnimationModService : IService
     private readonly ResolverService resolverService;
     private readonly ICallGateSubscriber<(int Breaking, int Features)> apiVersion;
     private readonly ICallGateSubscriber<Dictionary<string, string>> getModList;
-    private readonly ICallGateSubscriber<string, string, (int ErrorCode, string FullPath, bool FullDefault, bool NameDefault)> getModPath;
+    private readonly ICallGateSubscriber<string> getModDirectory;
     private readonly ICallGateSubscriber<int, (bool ObjectValid, bool IndividualSet, (Guid Id, string Name) EffectiveCollection)> getCollectionForObject;
     private readonly ICallGateSubscriber<
         Guid,
@@ -75,7 +82,7 @@ public sealed class PenumbraAnimationModService : IService
         this.resolverService = resolverService;
         apiVersion = pluginInterface.GetIpcSubscriber<(int, int)>("Penumbra.ApiVersion.V5");
         getModList = pluginInterface.GetIpcSubscriber<Dictionary<string, string>>("Penumbra.GetModList");
-        getModPath = pluginInterface.GetIpcSubscriber<string, string, (int, string, bool, bool)>("Penumbra.GetModPath.V5");
+        getModDirectory = pluginInterface.GetIpcSubscriber<string>("Penumbra.GetModDirectory");
         getCollectionForObject = pluginInterface.GetIpcSubscriber<int, (bool, bool, (Guid, string))>(
             "Penumbra.GetCollectionForObject.V5");
         getCurrentModSettingsWithTemp = pluginInterface.GetIpcSubscriber<
@@ -224,12 +231,23 @@ public sealed class PenumbraAnimationModService : IService
                 ?.DisplayName
                 ?? getModList.InvokeFunc().GetValueOrDefault(modIdentifier)
                 ?? modIdentifier;
+            if (displayName.Length > 1_024
+                || collection.Name is null
+                || collection.Name.Length > MaximumRegistryTextLength)
+            {
+                throw new InvalidDataException("Penumbra returned animation-mod metadata that exceeds XivBlend's safety limits.");
+            }
+
             var modRoot = ResolveModRoot(modIdentifier);
             var canonicalModRoot = ResolveFinalDirectoryPath(modRoot);
-            var candidates = BuildCandidates(vanillaEntries, targetRace);
+            var discoveredPaths = DiscoverManifestBodyPapPaths(
+                modRoot,
+                canonicalModRoot,
+                targetRace);
+            var candidates = BuildCandidates(vanillaEntries, targetRace, discoveredPaths);
             if (candidates.Count == 0)
             {
-                throw new InvalidOperationException("The vanilla emote catalog contains no compatible body PAP paths.");
+                throw new InvalidOperationException("No compatible player body PAP paths were available to check.");
             }
 
             Status = $"Asking Penumbra which {displayName} animation files are active...";
@@ -268,14 +286,14 @@ public sealed class PenumbraAnimationModService : IService
                     fileIdentities.Add(physicalPath, fileIdentity);
                 }
 
-                var identity = $"{modIdentifier}\n{targetRace}\n{candidate.BaseEntry.EntryId}\n{candidate.CanonicalGamePath}\n{fileIdentity.ContentSha256}";
+                var identity = $"{modIdentifier}\n{targetRace}\n{candidate.BaseEntry?.EntryId ?? candidate.AnimationKey}\n{candidate.CanonicalGamePath}\n{fileIdentity.ContentSha256}";
                 var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..20]
                     .ToLowerInvariant();
                 var binding = new CustomAnimationBinding(
                     EntryId: $"custom:{digest}",
                     VariantId: $"custom-{digest}",
-                    BaseEntryId: candidate.BaseEntry.EntryId,
-                    BaseEmoteId: candidate.BaseEntry.EmoteId ?? 0,
+                    BaseEntryId: candidate.BaseEntry?.EntryId,
+                    BaseEmoteId: candidate.BaseEntry?.EmoteId,
                     TargetRaceCode: targetRace,
                     SourceRaceCode: candidate.SourceRaceCode,
                     CanonicalGamePath: candidate.CanonicalGamePath,
@@ -285,20 +303,17 @@ public sealed class PenumbraAnimationModService : IService
 
                 // Candidates are ordered race-specific first, common fallback
                 // second, so the authored target-race PAP wins when both exist.
-                winners.TryAdd(candidate.BaseEntry.EntryId, binding);
+                winners.TryAdd(candidate.WinnerKey, binding);
             }
 
             if (winners.Count == 0)
             {
                 throw new InvalidOperationException(
-                    "Penumbra found no active winning emote PAP from that mod for your current character. " +
+                    "Penumbra found no active winning player-animation PAP from that mod for your current character. " +
                     "Enable the desired option, resolve any conflicts, then try again.");
             }
 
-            var selectedOptions = settings.Options
-                .OrderBy(item => item.Key, StringComparer.CurrentCultureIgnoreCase)
-                .Select(item => $"{item.Key}: {string.Join(", ", item.Value)}")
-                .ToArray();
+            var selectedOptions = FormatSelectedOptions(settings.Options);
             var source = new CustomAnimationSource(
                 ModIdentifier: modIdentifier,
                 DisplayName: displayName,
@@ -306,7 +321,10 @@ public sealed class PenumbraAnimationModService : IService
                 CollectionId: collection.Id,
                 CollectionName: collection.Name,
                 SelectedOptions: selectedOptions,
-                Bindings: winners.Values.OrderBy(item => item.BaseEmoteId).ToArray());
+                Bindings: winners.Values
+                    .OrderBy(item => item.BaseEmoteId ?? uint.MaxValue)
+                    .ThenBy(item => item.CanonicalGamePath, StringComparer.Ordinal)
+                    .ToArray());
             lock (registryLock)
             {
                 var existingSource = registry.Sources.FirstOrDefault(item => string.Equals(
@@ -321,7 +339,8 @@ public sealed class PenumbraAnimationModService : IService
                             .Where(item => item.TargetRaceCode != targetRace)
                             .Concat(source.Bindings)
                             .OrderBy(item => item.TargetRaceCode)
-                            .ThenBy(item => item.BaseEmoteId)
+                            .ThenBy(item => item.BaseEmoteId ?? uint.MaxValue)
+                            .ThenBy(item => item.CanonicalGamePath, StringComparer.Ordinal)
                             .ToArray(),
                     };
                 }
@@ -398,6 +417,10 @@ public sealed class PenumbraAnimationModService : IService
         var vanillaById = vanillaEntries
             .Where(item => string.Equals(item.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase))
             .ToDictionary(item => item.EntryId, StringComparer.Ordinal);
+        var genericPoseIcon = vanillaEntries.FirstOrDefault(item => item.Command == "/pose")
+                              ?? vanillaEntries.FirstOrDefault(item => item.Command == "/groundsit")
+                              ?? vanillaEntries.FirstOrDefault(item => item.Command == "/lounge")
+                              ?? vanillaEntries.FirstOrDefault();
         var entries = new List<AnimationCatalogEntry>();
         foreach (var source in snapshot.Sources)
         {
@@ -408,8 +431,7 @@ public sealed class PenumbraAnimationModService : IService
                     || binding.EntryId["custom:".Length..].Any(character => !Uri.IsHexDigit(character))
                     || !binding.VariantId.Equals(
                         $"custom-{binding.EntryId["custom:".Length..]}",
-                        StringComparison.Ordinal)
-                    || binding.BaseEmoteId == 0)
+                        StringComparison.Ordinal))
                 {
                     logger.LogWarning(
                         "Skipping malformed custom animation registry binding {EntryId}",
@@ -417,30 +439,44 @@ public sealed class PenumbraAnimationModService : IService
                     continue;
                 }
 
-                if (!vanillaById.TryGetValue(binding.BaseEntryId, out var baseEntry))
+                if (!PenumbraAnimationManifestDiscovery.TryParseCanonicalBodyPapPath(
+                        binding.CanonicalGamePath,
+                        out var papReference))
                 {
+                    logger.LogWarning(
+                        "Skipping custom animation binding {EntryId} with invalid body PAP path {Path}",
+                        binding.EntryId,
+                        binding.CanonicalGamePath);
                     continue;
                 }
 
-                var baseVariant = baseEntry.Variants.FirstOrDefault(
-                    item => item.VariantId == baseEntry.DefaultVariantId && item.Kind == "Body")
-                    ?? baseEntry.Variants.FirstOrDefault(item => item.Kind == "Body");
-                if (baseVariant is null)
+                AnimationCatalogEntry? baseEntry = null;
+                AnimationCatalogVariant? baseVariant = null;
+                if (!string.IsNullOrWhiteSpace(binding.BaseEntryId)
+                    && vanillaById.TryGetValue(binding.BaseEntryId, out baseEntry))
                 {
-                    continue;
+                    baseVariant = baseEntry.Variants.FirstOrDefault(
+                        item => item.VariantId == baseEntry.DefaultVariantId && item.Kind == "Body")
+                        ?? baseEntry.Variants.FirstOrDefault(item => item.Kind == "Body");
                 }
 
+                var animationKey = papReference.AnimationKey;
+                var isStandalone = baseEntry is null || baseVariant is null;
+                var iconEntry = isStandalone
+                    ? SelectStandaloneIcon(vanillaEntries, animationKey) ?? genericPoseIcon
+                    : baseEntry;
                 var variant = new AnimationCatalogVariant(
                     VariantId: binding.VariantId,
-                    ActionTimelineId: baseVariant.ActionTimelineId,
-                    Slot: baseVariant.Slot,
-                    Label: "Active Penumbra override",
+                    ActionTimelineId: baseVariant?.ActionTimelineId ?? 0,
+                    Slot: baseVariant?.Slot ?? 0,
+                    Label: isStandalone ? "Active standalone Penumbra animation" : "Active Penumbra override",
                     Kind: "Body",
-                    Key: baseVariant.Key,
-                    TimelineKey: baseVariant.TimelineKey,
-                    LoadType: baseVariant.LoadType,
+                    Key: baseVariant?.Key ?? animationKey,
+                    TimelineKey: baseVariant?.TimelineKey ?? animationKey,
+                    LoadType: baseVariant?.LoadType ?? 0,
                     IsDefault: true,
-                    IsLoop: baseVariant.IsLoop,
+                    IsLoop: baseVariant?.IsLoop
+                            ?? animationKey.EndsWith("_loop", StringComparison.OrdinalIgnoreCase),
                     CacheRelativePathTemplate:
                         $"clips/custom/{binding.EntryId["custom:".Length..]}/{{race}}/{{faceKey}}/{binding.VariantId}.glb",
                     BundleRelativePathTemplate:
@@ -453,12 +489,14 @@ public sealed class PenumbraAnimationModService : IService
                     CompatibleRaceCodes: [binding.TargetRaceCode]);
                 entries.Add(new AnimationCatalogEntry(
                     EntryId: binding.EntryId,
-                    EmoteId: binding.BaseEmoteId,
-                    Name: $"{source.DisplayName} — {baseEntry.Name}",
-                    Command: baseEntry.Command,
-                    IconId: baseEntry.IconId,
-                    ResolvedIconId: baseEntry.ResolvedIconId,
-                    IconRelativePath: baseEntry.IconRelativePath,
+                    EmoteId: isStandalone ? null : binding.BaseEmoteId,
+                    Name: isStandalone
+                        ? StandaloneDisplayName(source, animationKey)
+                        : $"{source.DisplayName} — {baseEntry!.Name}",
+                    Command: isStandalone ? string.Empty : baseEntry!.Command,
+                    IconId: iconEntry?.IconId ?? 0,
+                    ResolvedIconId: iconEntry?.ResolvedIconId ?? 0,
+                    IconRelativePath: iconEntry?.IconRelativePath ?? string.Empty,
                     Category: "Custom",
                     SourceKind: "PenumbraMod",
                     SourceDisplayName: source.DisplayName,
@@ -468,6 +506,75 @@ public sealed class PenumbraAnimationModService : IService
         }
 
         return entries;
+    }
+
+    private static AnimationCatalogEntry? SelectStandaloneIcon(
+        IReadOnlyList<AnimationCatalogEntry> vanillaEntries,
+        string animationKey)
+    {
+        if (animationKey.Contains("sit", StringComparison.OrdinalIgnoreCase)
+            || animationKey.Contains("pose", StringComparison.OrdinalIgnoreCase))
+        {
+            return vanillaEntries.FirstOrDefault(item => item.Command == "/groundsit")
+                   ?? vanillaEntries.FirstOrDefault(item => item.Command == "/lounge")
+                   ?? vanillaEntries.FirstOrDefault(item => item.Command == "/pose");
+        }
+
+        return vanillaEntries.FirstOrDefault(item => item.Command == "/pose");
+    }
+
+    private static IReadOnlyList<string> FormatSelectedOptions(
+        IReadOnlyDictionary<string, List<string>> options)
+    {
+        if (options.Count > MaximumSelectedOptions)
+        {
+            throw new InvalidDataException(
+                $"Penumbra returned more than {MaximumSelectedOptions:N0} selected animation-mod option groups.");
+        }
+
+        var result = new List<string>(options.Count);
+        var totalCharacters = 0;
+        foreach (var item in options.OrderBy(
+                     value => value.Key,
+                     StringComparer.CurrentCultureIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(item.Key)
+                || item.Key.Length > MaximumRegistryTextLength
+                || item.Value is null
+                || item.Value.Count > MaximumSelectedOptions
+                || item.Value.Any(value => value is null || value.Length > MaximumRegistryTextLength))
+            {
+                throw new InvalidDataException("Penumbra returned invalid selected animation-mod option metadata.");
+            }
+
+            var text = $"{item.Key}: {string.Join(", ", item.Value)}";
+            if (text.Length > MaximumRegistryTextLength)
+            {
+                throw new InvalidDataException("A selected animation-mod option description exceeds XivBlend's safety limit.");
+            }
+
+            totalCharacters = checked(totalCharacters + text.Length);
+            if (totalCharacters > MaximumSelectedOptionCharacters)
+            {
+                throw new InvalidDataException("Selected animation-mod option metadata exceeds XivBlend's total safety limit.");
+            }
+
+            result.Add(text);
+        }
+
+        return result;
+    }
+
+    private static string StandaloneDisplayName(CustomAnimationSource source, string animationKey)
+    {
+        if (source.Bindings.Count == 1)
+        {
+            return source.DisplayName;
+        }
+
+        var leaf = animationKey.Split('/').LastOrDefault() ?? animationKey;
+        var friendly = string.Join(' ', leaf.Split('_', StringSplitOptions.RemoveEmptyEntries));
+        return $"{source.DisplayName} — {friendly}";
     }
 
     public TrustedCustomPap ReadTrustedPap(AnimationCatalogVariant variant, ushort requestedRaceCode)
@@ -521,14 +628,29 @@ public sealed class PenumbraAnimationModService : IService
 
     private string ResolveModRoot(string modIdentifier)
     {
-        var result = getModPath.InvokeFunc(modIdentifier, string.Empty);
-        if (result.ErrorCode != 0 || string.IsNullOrWhiteSpace(result.FullPath))
+        if (!IsSingleDirectoryName(modIdentifier))
         {
-            throw new DirectoryNotFoundException(
-                $"Penumbra could not locate mod '{modIdentifier}' (error {result.ErrorCode}).");
+            throw new InvalidDataException("Penumbra returned an unsafe mod directory identifier.");
         }
 
-        var root = Path.GetFullPath(result.FullPath);
+        var baseValue = getModDirectory.InvokeFunc();
+        if (string.IsNullOrWhiteSpace(baseValue) || !Path.IsPathRooted(baseValue))
+        {
+            throw new DirectoryNotFoundException("Penumbra did not return a valid physical mod directory.");
+        }
+
+        var baseRoot = Path.GetFullPath(baseValue);
+        if (!Directory.Exists(baseRoot))
+        {
+            throw new DirectoryNotFoundException($"Penumbra's physical mod directory does not exist: {baseRoot}");
+        }
+
+        var root = Path.GetFullPath(Path.Combine(baseRoot, modIdentifier));
+        if (!IsInside(root, baseRoot))
+        {
+            throw new InvalidDataException("The selected Penumbra mod path leaves its physical mod directory.");
+        }
+
         if (!Directory.Exists(root))
         {
             throw new DirectoryNotFoundException($"Penumbra's mod directory no longer exists: {root}");
@@ -539,9 +661,11 @@ public sealed class PenumbraAnimationModService : IService
 
     private static List<AnimationCandidate> BuildCandidates(
         IReadOnlyList<AnimationCatalogEntry> vanillaEntries,
-        ushort targetRace)
+        ushort targetRace,
+        IReadOnlyList<PenumbraBodyPapReference> discoveredPaths)
     {
         var result = new List<AnimationCandidate>();
+        var knownPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in vanillaEntries
                      .Where(item => string.Equals(item.SourceKind, "Vanilla", StringComparison.OrdinalIgnoreCase)))
         {
@@ -553,20 +677,127 @@ public sealed class PenumbraAnimationModService : IService
                 continue;
             }
 
-            result.Add(new AnimationCandidate(
-                entry,
-                targetRace,
-                $"chara/human/c{targetRace:D4}/animation/a0001/bt_common/{variant.Key}.pap"));
+            AddCatalogCandidate(result, knownPaths, entry, variant, targetRace);
             if (targetRace != 101)
             {
-                result.Add(new AnimationCandidate(
-                    entry,
-                    101,
-                    $"chara/human/c0101/animation/a0001/bt_common/{variant.Key}.pap"));
+                AddCatalogCandidate(result, knownPaths, entry, variant, 101);
             }
         }
 
+        foreach (var discovered in discoveredPaths)
+        {
+            if (knownPaths.Contains(discovered.CanonicalGamePath))
+            {
+                continue;
+            }
+
+            result.Add(new AnimationCandidate(
+                BaseEntry: null,
+                SourceRaceCode: discovered.SourceRaceCode,
+                CanonicalGamePath: discovered.CanonicalGamePath,
+                AnimationKey: discovered.AnimationKey,
+                WinnerKey: $"pap:{discovered.AnimationKey}"));
+        }
+
         return result;
+    }
+
+    private static void AddCatalogCandidate(
+        ICollection<AnimationCandidate> result,
+        ISet<string> knownPaths,
+        AnimationCatalogEntry entry,
+        AnimationCatalogVariant variant,
+        ushort sourceRaceCode)
+    {
+        var gamePath = $"chara/human/c{sourceRaceCode:D4}/animation/a0001/bt_common/{variant.Key}.pap";
+        if (!PenumbraAnimationManifestDiscovery.TryParseCanonicalBodyPapPath(gamePath, out var parsed))
+        {
+            return;
+        }
+
+        result.Add(new AnimationCandidate(
+            BaseEntry: entry,
+            SourceRaceCode: sourceRaceCode,
+            CanonicalGamePath: parsed.CanonicalGamePath,
+            AnimationKey: parsed.AnimationKey,
+            WinnerKey: $"base:{entry.EntryId}"));
+        knownPaths.Add(parsed.CanonicalGamePath);
+    }
+
+    private static IReadOnlyList<PenumbraBodyPapReference> DiscoverManifestBodyPapPaths(
+        string modRoot,
+        string canonicalModRoot,
+        ushort targetRaceCode)
+    {
+        var metadataFiles = new List<string>();
+        var defaultMetadata = Path.Combine(modRoot, "default_mod.json");
+        if (File.Exists(defaultMetadata))
+        {
+            metadataFiles.Add(defaultMetadata);
+        }
+
+        foreach (var path in Directory.EnumerateFiles(modRoot, "group_*.json", SearchOption.TopDirectoryOnly))
+        {
+            metadataFiles.Add(path);
+            if (metadataFiles.Count > MaximumMetadataFiles)
+            {
+                throw new InvalidDataException(
+                    $"The selected mod contains more than {MaximumMetadataFiles:N0} Penumbra metadata files.");
+            }
+        }
+
+        metadataFiles.Sort((left, right) => StringComparer.OrdinalIgnoreCase.Compare(
+            Path.GetFileName(left),
+            Path.GetFileName(right)));
+
+        long totalBytes = 0;
+        var discovered = new Dictionary<string, PenumbraBodyPapReference>(StringComparer.OrdinalIgnoreCase);
+        foreach (var metadataPath in metadataFiles)
+        {
+            using var stream = OpenContainedMetadata(metadataPath, modRoot, canonicalModRoot);
+            if (stream.Length is <= 0 or > MaximumMetadataFileBytes)
+            {
+                throw new InvalidDataException(
+                    $"Penumbra metadata '{Path.GetFileName(metadataPath)}' has invalid size {stream.Length:N0} bytes.");
+            }
+
+            totalBytes = checked(totalBytes + stream.Length);
+            if (totalBytes > MaximumMetadataBytes)
+            {
+                throw new InvalidDataException(
+                    $"The selected mod contains more than {MaximumMetadataBytes / 1024 / 1024} MiB of Penumbra metadata.");
+            }
+
+            IReadOnlyList<PenumbraBodyPapReference> fileReferences;
+            try
+            {
+                fileReferences = PenumbraAnimationManifestDiscovery.ReadBodyPapReferences(
+                    stream,
+                    targetRaceCode,
+                    MaximumDiscoveredPapPaths);
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidDataException(
+                    $"Penumbra metadata '{Path.GetFileName(metadataPath)}' is invalid JSON.",
+                    exception);
+            }
+
+            foreach (var reference in fileReferences)
+            {
+                discovered.TryAdd(reference.CanonicalGamePath, reference);
+                if (discovered.Count > MaximumDiscoveredPapPaths)
+                {
+                    throw new InvalidDataException(
+                        $"The selected mod exceeds the {MaximumDiscoveredPapPaths:N0}-path animation safety limit.");
+                }
+            }
+        }
+
+        return discovered.Values
+            .OrderBy(item => item.SourceRaceCode == targetRaceCode ? 0 : 1)
+            .ThenBy(item => item.CanonicalGamePath, StringComparer.Ordinal)
+            .ToArray();
     }
 
     private static bool TryResolveContainedFile(
@@ -647,6 +878,45 @@ public sealed class PenumbraAnimationModService : IService
             {
                 throw new InvalidDataException(
                     "The resolved PAP leaves the selected Penumbra mod directory through a link or junction.");
+            }
+
+            return stream;
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    private static FileStream OpenContainedMetadata(
+        string path,
+        string modRoot,
+        string canonicalModRoot)
+    {
+        var lexicalPath = Path.GetFullPath(path);
+        if (!File.Exists(lexicalPath) || !IsInside(lexicalPath, modRoot))
+        {
+            throw new InvalidDataException("Penumbra metadata leaves the selected mod directory.");
+        }
+
+        var stream = new FileStream(
+            lexicalPath,
+            FileMode.Open,
+            FileAccess.Read,
+            // Keep the bounded length check stable for the entire JSON parse.
+            // If Penumbra is replacing this file concurrently, the user can
+            // retry after that short update instead of parsing a growing file.
+            FileShare.Read,
+            64 * 1024,
+            FileOptions.SequentialScan);
+        try
+        {
+            var finalPath = ResolveFinalPath(stream.SafeFileHandle);
+            if (!IsInside(finalPath, canonicalModRoot))
+            {
+                throw new InvalidDataException(
+                    "Penumbra metadata leaves the selected mod directory through a link or junction.");
             }
 
             return stream;
@@ -740,6 +1010,22 @@ public sealed class PenumbraAnimationModService : IService
         return fullPath.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsSingleDirectoryName(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)
+            || !string.Equals(value, value.Trim(), StringComparison.Ordinal)
+            || value is "." or ".."
+            || Path.IsPathRooted(value)
+            || value.IndexOf(Path.DirectorySeparatorChar) >= 0
+            || value.IndexOf(Path.AltDirectorySeparatorChar) >= 0
+            || value.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            return false;
+        }
+
+        return string.Equals(Path.GetFileName(value), value, StringComparison.Ordinal);
+    }
+
     private CustomAnimationRegistry LoadRegistry()
     {
         try
@@ -759,49 +1045,104 @@ public sealed class PenumbraAnimationModService : IService
                 File.ReadAllText(RegistryPath),
                 JsonOptions);
             if (loaded is null
-                || loaded.SchemaVersion != RegistrySchemaVersion
+                || loaded.SchemaVersion is not 1 and not RegistrySchemaVersion
                 || loaded.Sources is null
                 || loaded.Sources.Count > 1_024
-                || loaded.Sources.Any(source =>
-                    source is null
-                    || string.IsNullOrWhiteSpace(source.ModIdentifier)
-                    || source.ModIdentifier.Length > 1_024
-                    || string.IsNullOrWhiteSpace(source.DisplayName)
-                    || source.DisplayName.Length > 1_024
-                    || source.SelectedOptions is null
-                    || source.SelectedOptions.Count > 4_096
-                    || source.Bindings is null
-                    || source.Bindings.Count > 16_384
-                    || source.Bindings.Any(binding =>
-                        binding is null
-                        || string.IsNullOrWhiteSpace(binding.EntryId)
-                        || string.IsNullOrWhiteSpace(binding.VariantId)
-                        || string.IsNullOrWhiteSpace(binding.BaseEntryId)
-                        || binding.BaseEmoteId == 0
-                        || !PlayerRaceCode(binding.TargetRaceCode)
-                        || !PlayerRaceCode(binding.SourceRaceCode)
-                        || string.IsNullOrWhiteSpace(binding.CanonicalGamePath)
-                        || binding.CanonicalGamePath.Length > 4_096
-                        || string.IsNullOrWhiteSpace(binding.ModRelativePath)
-                        || binding.ModRelativePath.Length > 32_768
-                        || Path.IsPathRooted(binding.ModRelativePath)
-                        || binding.ContentSha256 is null
-                        || binding.ContentSha256.Length != 64
-                        || binding.ContentSha256.Any(character => !Uri.IsHexDigit(character))
-                        || binding.ContentLength is < 32 or > MaximumPapBytes)))
+                || loaded.Sources.Any(source => !ValidRegistrySource(source, loaded.SchemaVersion == 1)))
             {
                 throw new InvalidDataException("Custom animation registry uses an unsupported schema.");
             }
 
-            return loaded;
+            return loaded.SchemaVersion == RegistrySchemaVersion
+                ? loaded
+                : loaded with { SchemaVersion = RegistrySchemaVersion };
         }
         catch (Exception exception) when (
-            exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+            exception is IOException
+                or UnauthorizedAccessException
+                or JsonException
+                or InvalidDataException
+                or ArgumentException
+                or OverflowException)
         {
             logger.LogWarning(exception, "Ignoring invalid XivBlend custom animation registry {Path}", RegistryPath);
             LastError = "The saved custom animation list was invalid and has been ignored.";
             return new CustomAnimationRegistry(RegistrySchemaVersion, []);
         }
+    }
+
+    private static bool ValidRegistrySource(CustomAnimationSource? source, bool legacySchema)
+    {
+        if (source is null
+            || !IsSingleDirectoryName(source.ModIdentifier)
+            || source.ModIdentifier.Length > 1_024
+            || string.IsNullOrWhiteSpace(source.DisplayName)
+            || source.DisplayName.Length > 1_024
+            || source.CollectionName is null
+            || source.CollectionName.Length > 4_096
+            || source.SelectedOptions is null
+            || source.SelectedOptions.Count > MaximumSelectedOptions
+            || source.SelectedOptions.Any(item => item is null || item.Length > MaximumRegistryTextLength)
+            || source.SelectedOptions.Sum(item => (long)item.Length) > MaximumSelectedOptionCharacters
+            || source.Bindings is null
+            || source.Bindings.Count > 16_384
+            || source.Bindings.Any(binding => !ValidRegistryBinding(binding, legacySchema)))
+        {
+            return false;
+        }
+
+        return source.Bindings.Select(item => item.EntryId).Distinct(StringComparer.Ordinal).Count()
+               == source.Bindings.Count;
+    }
+
+    private static bool ValidRegistryBinding(CustomAnimationBinding? binding, bool legacySchema)
+    {
+        if (binding is null) return false;
+        var entryId = binding.EntryId;
+        var variantId = binding.VariantId;
+        if (string.IsNullOrWhiteSpace(entryId)
+            || !entryId.StartsWith("custom:", StringComparison.Ordinal)
+            || entryId.Length != "custom:".Length + 20
+            || entryId["custom:".Length..].Any(character => !Uri.IsHexDigit(character))
+            || string.IsNullOrWhiteSpace(variantId)
+            || !variantId.Equals(
+                $"custom-{entryId["custom:".Length..]}",
+                StringComparison.Ordinal)
+            || !PlayerRaceCode(binding.TargetRaceCode)
+            || !PlayerRaceCode(binding.SourceRaceCode)
+            || string.IsNullOrWhiteSpace(binding.CanonicalGamePath)
+            || binding.CanonicalGamePath.Length > 4_096
+            || !PenumbraAnimationManifestDiscovery.TryParseCanonicalBodyPapPath(
+                binding.CanonicalGamePath,
+                out var papReference)
+            || papReference.SourceRaceCode != binding.SourceRaceCode
+            || string.IsNullOrWhiteSpace(binding.ModRelativePath)
+            || binding.ModRelativePath.Length > 32_768
+            || !IsSafeRelativeFilePath(binding.ModRelativePath)
+            || binding.ContentSha256 is null
+            || binding.ContentSha256.Length != 64
+            || binding.ContentSha256.Any(character => !Uri.IsHexDigit(character))
+            || binding.ContentLength is < 32 or > MaximumPapBytes)
+        {
+            return false;
+        }
+
+        var hasBaseEntry = !string.IsNullOrWhiteSpace(binding.BaseEntryId);
+        var hasBaseEmote = binding.BaseEmoteId is > 0;
+        return legacySchema
+            ? hasBaseEntry && hasBaseEmote
+            : hasBaseEntry == hasBaseEmote;
+    }
+
+    private static bool IsSafeRelativeFilePath(string value)
+    {
+        if (Path.IsPathRooted(value) || value.IndexOf('\0') >= 0)
+        {
+            return false;
+        }
+
+        var segments = value.Replace('\\', '/').Split('/');
+        return segments.Length > 0 && segments.All(segment => segment is not "" and not "." and not "..");
     }
 
     private static void SaveRegistry(CustomAnimationRegistry value)
@@ -853,9 +1194,11 @@ public sealed class PenumbraAnimationModService : IService
         uint flags);
 
     private sealed record AnimationCandidate(
-        AnimationCatalogEntry BaseEntry,
+        AnimationCatalogEntry? BaseEntry,
         ushort SourceRaceCode,
-        string CanonicalGamePath);
+        string CanonicalGamePath,
+        string AnimationKey,
+        string WinnerKey);
 
     private sealed record PapFileIdentity(string ContentSha256, long ContentLength);
 }
