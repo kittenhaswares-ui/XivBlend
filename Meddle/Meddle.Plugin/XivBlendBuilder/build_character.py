@@ -25,7 +25,7 @@ from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.5.1"
+BUILDER_VERSION = "0.6.0"
 ANIMATION_CATALOG_SCHEMA = 1
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -43,6 +43,8 @@ MESH_COLLECTION = "Meshes"
 EXTRAS_COLLECTION = "Character Extras"
 SETUP_COLLECTION = "Scene Setup"
 CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
+MATERIAL_SURFACE_CLASSIFICATION_PROPERTY = "xivblend_surface_classification"
+MATERIAL_OPAQUE_ALPHA_LINKS_PROPERTY = "xivblend_opaque_alpha_links_removed"
 
 POSE_REST_FRAME = 0
 POSE_CAPTURED_FRAME = 100
@@ -648,6 +650,75 @@ def apply_meddle_materials(
             pass
 
 
+def source_material_is_known_opaque(material: bpy.types.Material) -> bool:
+    """Use Meddle's copied FFXIV flags to identify surfaces that cannot be translucent."""
+    return (
+        "IsTransparent" in material
+        and material.get("IsTransparent") is False
+        and material.get("ApplyAlphaClip") == "ApplyAlphaClipOff"
+        and material.get("ApplyDitherClip") == "ApplyDitherClipOff"
+    )
+
+
+def optimize_character_materials(
+    imported: Iterable[bpy.types.Object],
+) -> dict[str, Any]:
+    """Remove accidental Eevee transparency from source-declared opaque materials.
+
+    MeddleTools maps every FFXIV shader through a Principled alpha socket and the
+    glTF importer consequently leaves every material in Eevee's dithered path.
+    During animation that produces crawling one-sample stipple even on fully
+    opaque skin and equipment.  The copied FFXIV material flags let us repair
+    only surfaces that explicitly opt out of transparency, alpha clipping and
+    dither clipping; genuine hair, glass and translucent mods remain untouched.
+    """
+    materials = {
+        slot.material
+        for obj in imported
+        if obj.type == "MESH"
+        for slot in obj.material_slots
+        if slot.material is not None
+    }
+    optimized = 0
+    preserved = 0
+    removed_links = 0
+    for material in materials:
+        if not source_material_is_known_opaque(material):
+            material[MATERIAL_SURFACE_CLASSIFICATION_PROPERTY] = (
+                "transparent-or-unknown"
+            )
+            preserved += 1
+            continue
+
+        material_links = 0
+        if material.node_tree is not None:
+            for node in material.node_tree.nodes:
+                if node.type != "BSDF_PRINCIPLED":
+                    continue
+                alpha = node.inputs.get("Alpha")
+                if alpha is None:
+                    continue
+                for link in list(alpha.links):
+                    material.node_tree.links.remove(link)
+                    material_links += 1
+                alpha.default_value = 1.0
+        if hasattr(material, "use_transparent_shadow"):
+            material.use_transparent_shadow = False
+        material[MATERIAL_SURFACE_CLASSIFICATION_PROPERTY] = "opaque"
+        material[MATERIAL_OPAQUE_ALPHA_LINKS_PROPERTY] = material_links
+        optimized += 1
+        removed_links += material_links
+
+    report = {
+        "materials": len(materials),
+        "opaque_optimized": optimized,
+        "transparent_or_unknown_preserved": preserved,
+        "alpha_links_removed": removed_links,
+    }
+    log("character_materials_optimized", **report)
+    return report
+
+
 def new_collection(name: str, parent: bpy.types.Collection) -> bpy.types.Collection:
     collection = bpy.data.collections.new(name)
     parent.children.link(collection)
@@ -824,6 +895,7 @@ def add_area_light(
     role: str,
     size_y: float | None = None,
     spread: float = math.pi,
+    use_shadow: bool = True,
 ) -> bpy.types.Object:
     light_data = bpy.data.lights.new(name, type="AREA")
     light_data.energy = energy
@@ -833,7 +905,7 @@ def add_area_light(
     light_data.size = size
     light_data.size_y = size if size_y is None else size_y
     light_data.spread = spread
-    light_data.use_shadow = True
+    light_data.use_shadow = use_shadow
     light = bpy.data.objects.new(name, light_data)
     setup.objects.link(light)
     light.location = location
@@ -912,7 +984,7 @@ def create_studio_backdrop(
     )
     if principled is not None:
         principled.inputs["Base Color"].default_value = material.diffuse_color
-        principled.inputs["Roughness"].default_value = 0.82
+        principled.inputs["Roughness"].default_value = 0.72
         specular = principled.inputs.get("Specular IOR Level")
         if specular is not None:
             specular.default_value = 0.22
@@ -972,7 +1044,10 @@ def configure_scene_setup(
     scene.render.image_settings.color_depth = "16"
     scene.render.film_transparent = False
     if hasattr(scene, "eevee"):
+        scene.eevee.taa_samples = 16
         scene.eevee.taa_render_samples = 96
+        scene.eevee.use_taa_reprojection = True
+        scene.eevee.use_shadow_jitter_viewport = False
         scene.eevee.shadow_pool_size = "512"
         scene.eevee.shadow_ray_count = 3
         scene.eevee.use_raytracing = False
@@ -986,7 +1061,7 @@ def configure_scene_setup(
     except TypeError:
         # Keep Blender's default transform when a future build renames the view.
         pass
-    scene.view_settings.exposure = -0.58
+    scene.view_settings.exposure = -0.40
     scene.view_settings.gamma = 1.0
 
     world = bpy.data.worlds.new("Neutral World")
@@ -996,7 +1071,7 @@ def configure_scene_setup(
     background = world.node_tree.nodes.get("Background") if world.node_tree else None
     if background is not None:
         background.inputs["Color"].default_value = (0.004, 0.007, 0.014, 1.0)
-        background.inputs["Strength"].default_value = 0.035
+        background.inputs["Strength"].default_value = 0.045
     scene.world = world
 
     center, size, _ = character_bounds_across_frames(scene, imported)
@@ -1071,42 +1146,45 @@ def configure_scene_setup(
         source_light.hide_render = True
         source_light.hide_viewport = True
 
-    light_target = captured_center + Vector((0.0, 0.0, captured_size.z * 0.16))
+    light_target = captured_center + Vector((0.0, 0.0, captured_size.z * 0.27))
     add_area_light(
         setup,
         "Key Light (Warm Softbox)",
-        captured_center + Vector((-largest * 1.15, -largest * 1.35, largest * 1.35)),
+        captured_center
+        + Vector((-largest * 1.125, -largest * 1.358, largest * 1.242)),
         light_target,
-        145.0 * largest * largest,
-        largest * 0.62,
-        (1.0, 0.94, 0.90),
+        129.0 * largest * largest,
+        largest * 0.736,
+        (1.0, 0.955, 0.92),
         role="key",
-        size_y=largest * 1.05,
+        size_y=largest * 1.056,
         spread=math.radians(115.0),
     )
     add_area_light(
         setup,
         "Fill Light (Cool Softbox)",
-        captured_center + Vector((largest * 1.35, -largest * 0.95, largest * 0.75)),
+        captured_center + Vector((largest * 1.35, -largest * 0.95, largest * 0.73)),
         light_target,
-        10.0 * largest * largest,
+        8.2 * largest * largest,
         largest * 1.50,
-        (0.75, 0.82, 1.0),
+        (0.76, 0.86, 1.0),
         role="fill",
-        size_y=largest * 1.85,
+        size_y=largest * 1.855,
         spread=math.radians(125.0),
+        use_shadow=False,
     )
     add_area_light(
         setup,
         "Rim Light (Cool Strip)",
-        captured_center + Vector((largest * 0.85, largest * 0.95, largest * 1.35)),
-        captured_center + Vector((0.0, 0.0, captured_size.z * 0.20)),
-        38.0 * largest * largest,
-        largest * 0.28,
-        (0.65, 0.78, 1.0),
+        captured_center + Vector((largest * 0.846, largest * 0.946, largest * 1.28)),
+        captured_center + Vector((0.0, 0.0, captured_size.z * 0.29)),
+        27.8 * largest * largest,
+        largest * 0.282,
+        (0.66, 0.80, 1.0),
         role="rim",
-        size_y=largest * 1.25,
+        size_y=largest * 1.248,
         spread=math.radians(85.0),
+        use_shadow=False,
     )
     create_studio_backdrop(setup, center, size, largest, ground_plane_z)
     bpy.context.view_layer.update()
@@ -1323,6 +1401,9 @@ def write_embedded_readme() -> None:
         "XivBlend Blender add-on installed, open the N sidebar and use XivBlend > "
         "Render Studio to fit the camera to the current pose or whole animation, then "
         "press Render Portrait.\n"
+        "- Render Studio > Smooth Animation uses a temporary clay View Layer override "
+        "for responsive playback. Full Detail restores the exact materials; F12 renders "
+        "and saving always remove the preview override automatically.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
         "Scene Setup collection and can be hidden or replaced without touching the character.\n"
         "- Native glTF rest/bind axes are preserved. For an FBX round trip, choose Primary "
@@ -1768,13 +1849,28 @@ def validate_scene_setup(
         problems.append(f"expected 3 studio lights, found {len(studio_lights)}")
     expected_lights = {
         "key": (
-            145.0, 0.62, 1.05, (1.0, 0.94, 0.90), math.radians(115.0)
+            129.0,
+            0.736,
+            1.056,
+            (1.0, 0.955, 0.92),
+            math.radians(115.0),
+            True,
         ),
         "fill": (
-            10.0, 1.50, 1.85, (0.75, 0.82, 1.0), math.radians(125.0)
+            8.2,
+            1.50,
+            1.855,
+            (0.76, 0.86, 1.0),
+            math.radians(125.0),
+            False,
         ),
         "rim": (
-            38.0, 0.28, 1.25, (0.65, 0.78, 1.0), math.radians(85.0)
+            27.8,
+            0.282,
+            1.248,
+            (0.66, 0.80, 1.0),
+            math.radians(85.0),
+            False,
         ),
     }
     if {
@@ -1786,7 +1882,7 @@ def validate_scene_setup(
         expected = expected_lights.get(role)
         exact_settings_valid = False
         if expected is not None and light.type == "LIGHT":
-            energy_scale, size_scale, size_y_scale, color, spread = expected
+            energy_scale, size_scale, size_y_scale, color, spread, use_shadow = expected
             expected_energy = energy_scale * validation_largest * validation_largest
             energy_tolerance = max(1.0e-5, expected_energy * 1.0e-5)
             exact_settings_valid = (
@@ -1805,7 +1901,7 @@ def validate_scene_setup(
                     for actual, wanted in zip(light.data.color, color)
                 )
                 and light.data.normalize
-                and light.data.use_shadow
+                and light.data.use_shadow == use_shadow
             )
         if (
             light.type != "LIGHT"
@@ -1883,8 +1979,11 @@ def validate_scene_setup(
         and not scene.render.film_transparent
         and scene.view_settings.view_transform == "AgX"
         and scene.view_settings.look == "AgX - Medium High Contrast"
-        and approximately_equal(scene.view_settings.exposure, -0.58)
+        and approximately_equal(scene.view_settings.exposure, -0.40)
+        and scene.eevee.taa_samples == 16
         and scene.eevee.taa_render_samples == 96
+        and scene.eevee.use_taa_reprojection
+        and not scene.eevee.use_shadow_jitter_viewport
         and scene.eevee.shadow_pool_size == "512"
         and scene.eevee.shadow_ray_count == 3
         and not scene.eevee.use_raytracing
@@ -1916,7 +2015,7 @@ def validate_scene_setup(
                 (0.004, 0.007, 0.014, 1.0),
             )
         )
-        or not approximately_equal(background.inputs["Strength"].default_value, 0.035)
+        or not approximately_equal(background.inputs["Strength"].default_value, 0.045)
     ):
         problems.append("the neutral studio world is missing or changed")
 
@@ -2002,6 +2101,7 @@ def validate_output(
     collections: dict[str, bpy.types.Collection],
     removed_vertex_groups: int,
     material_mapping: dict[str, Any],
+    material_optimization: dict[str, Any],
     redacted_properties: int,
     captured_pose: dict[bpy.types.Object, dict[str, Matrix]],
     pose_configuration: dict[str, Any],
@@ -2047,6 +2147,50 @@ def validate_output(
         )
     if bad_materials:
         raise BuildError("Final character meshes contain placeholder materials: " + ", ".join(bad_materials))
+
+    optimized_materials = {
+        slot.material
+        for obj in meshes
+        for slot in obj.material_slots
+        if slot.material is not None
+        and slot.material.get(MATERIAL_SURFACE_CLASSIFICATION_PROPERTY) == "opaque"
+    }
+    invalid_opaque_materials = []
+    for material in optimized_materials:
+        alpha_inputs = (
+            [
+                node.inputs.get("Alpha")
+                for node in material.node_tree.nodes
+                if node.type == "BSDF_PRINCIPLED"
+            ]
+            if material.node_tree is not None
+            else []
+        )
+        if (
+            not alpha_inputs
+            or any(
+                alpha is None
+                or bool(alpha.links)
+                or not approximately_equal(alpha.default_value, 1.0)
+                for alpha in alpha_inputs
+            )
+            or (
+                hasattr(material, "use_transparent_shadow")
+                and material.use_transparent_shadow
+            )
+        ):
+            invalid_opaque_materials.append(material.name)
+    if len(optimized_materials) != material_optimization["opaque_optimized"]:
+        raise BuildError(
+            "Opaque material optimization count changed before save: "
+            f"expected {material_optimization['opaque_optimized']}, "
+            f"found {len(optimized_materials)}"
+        )
+    if invalid_opaque_materials:
+        raise BuildError(
+            "Opaque materials regained dithered alpha: "
+            + ", ".join(sorted(invalid_opaque_materials))
+        )
     if unpacked:
         raise BuildError("Final character images are not packed: " + ", ".join(unpacked))
     linked_datablocks = [
@@ -2102,6 +2246,7 @@ def validate_output(
         "ExpectedMappedMaterials": material_mapping["expected"],
         "MappedMaterials": material_mapping["mapped"],
         "UnmappedMaterials": material_mapping["unmapped"],
+        "MaterialOptimization": material_optimization,
         "Images": len(bpy.data.images),
         "PackedImages": sum(image_is_packed(image) for image in bpy.data.images),
         "EmptyVertexGroupsRemoved": removed_vertex_groups,
@@ -2202,6 +2347,7 @@ def main() -> None:
     removed_vertex_groups = remove_empty_vertex_groups(character_meshes)
     captured_pose, pose_configuration = configure_armatures(scene, armatures)
     material_mapping = apply_meddle_materials(source, imported, meddle_location)
+    material_optimization = optimize_character_materials(imported)
     collections = organize_objects(scene, imported)
     configure_scene_setup(scene, imported, collections["setup"])
     viewport_configuration = configure_viewport_defaults()
@@ -2216,6 +2362,12 @@ def main() -> None:
     scene["xivblend_unmapped_materials"] = len(material_mapping["unmapped"])
     scene["clean_extract_material_mode"] = material_mode
     scene["clean_extract_mapped_materials"] = material_mapping["mapped"]
+    scene["xivblend_opaque_materials_optimized"] = material_optimization[
+        "opaque_optimized"
+    ]
+    scene["xivblend_transparent_materials_preserved"] = material_optimization[
+        "transparent_or_unknown_preserved"
+    ]
     pack_resources()
     redacted_properties = sanitize_packed_provenance(imported)
     primary_armature = select_primary_armature(armatures)
@@ -2224,6 +2376,7 @@ def main() -> None:
         collections,
         removed_vertex_groups,
         material_mapping,
+        material_optimization,
         redacted_properties,
         captured_pose,
         pose_configuration,

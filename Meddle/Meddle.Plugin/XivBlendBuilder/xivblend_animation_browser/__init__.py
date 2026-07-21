@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -52,6 +52,8 @@ SCENE_SETUP_COLLECTION = "Scene Setup"
 CHARACTER_COLLECTION = "FFXIV Character"
 CHARACTER_MESH_COMPONENT = "Meshes"
 MAX_CAMERA_ACTION_SAMPLES = 96
+FAST_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
+FAST_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
 
 _catalog = None
 _catalog_signature = None
@@ -62,6 +64,9 @@ _captured_actions = {}
 _scene_settings = {}
 _runtime_sessions = {}
 _save_sessions = []
+_fast_preview_session = None
+_resume_fast_preview_after_save = False
+_resume_fast_preview_after_render = False
 _status = "Ready"
 _render_status = "Fit the camera to the current pose or the whole active animation."
 
@@ -1140,6 +1145,151 @@ def _character_meshes(context, target):
     return associated if associated else candidates
 
 
+def _new_fast_preview_material():
+    for material in bpy.data.materials:
+        if bool(material.get(FAST_PREVIEW_MATERIAL_PROPERTY, False)):
+            return material
+    material = bpy.data.materials.new(FAST_PREVIEW_MATERIAL_NAME)
+    material.use_nodes = True
+    material.diffuse_color = (0.30, 0.24, 0.20, 1.0)
+    material[FAST_PREVIEW_MATERIAL_PROPERTY] = True
+    if hasattr(material, "use_transparent_shadow"):
+        material.use_transparent_shadow = False
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.location = (320.0, 0.0)
+    shader = nodes.new("ShaderNodeBsdfPrincipled")
+    shader.location = (20.0, 0.0)
+    links.new(shader.outputs["BSDF"], output.inputs["Surface"])
+    shader.inputs["Base Color"].default_value = material.diffuse_color
+    shader.inputs["Roughness"].default_value = 0.58
+    specular = shader.inputs.get("Specular IOR Level")
+    if specular is not None:
+        specular.default_value = 0.30
+    alpha = shader.inputs.get("Alpha")
+    if alpha is not None:
+        alpha.default_value = 1.0
+    return material
+
+
+def _remove_unused_fast_preview_materials():
+    for material in list(bpy.data.materials):
+        if bool(material.get(FAST_PREVIEW_MATERIAL_PROPERTY, False)) and material.users == 0:
+            try:
+                bpy.data.materials.remove(material)
+            except (ReferenceError, RuntimeError):
+                pass
+
+
+def _preview_override_layers():
+    return [
+        view_layer
+        for scene in bpy.data.scenes
+        for view_layer in scene.view_layers
+        if view_layer.material_override is not None
+        and bool(
+            view_layer.material_override.get(
+                FAST_PREVIEW_MATERIAL_PROPERTY,
+                False,
+            )
+        )
+    ]
+
+
+def _fast_preview_is_active():
+    return bool(_preview_override_layers())
+
+
+def _enable_fast_preview(context=None, update_status=True):
+    """Use a non-destructive View Layer material override for smooth playback."""
+    global _fast_preview_session
+    if _fast_preview_is_active():
+        if update_status:
+            _set_render_status("Smooth Animation is already active")
+        return True
+    if _fast_preview_session is not None:
+        _restore_full_detail(update_status=False)
+    context = context or bpy.context
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        raise ClipError("No active scene is available for Smooth Animation")
+    target = _target_armature(context)
+    if target is None:
+        raise ClipError("No character armature was found in this scene")
+    meshes = [obj for obj in _character_meshes(context, target) if len(obj.material_slots)]
+    if not meshes:
+        raise ClipError("No character materials were found for Smooth Animation")
+
+    session = {
+        "view_layer": context.view_layer,
+        "original_override": context.view_layer.material_override,
+    }
+    _fast_preview_session = session
+    try:
+        preview_material = _new_fast_preview_material()
+        session["material"] = preview_material
+        context.view_layer.material_override = preview_material
+        context.view_layer.update()
+    except Exception:
+        _restore_full_detail(update_status=False)
+        raise
+
+    if update_status:
+        _set_render_status(
+            "Smooth Animation active: lightweight clay preview; renders and saves use Full Detail"
+        )
+    return True
+
+
+def _restore_full_detail(update_status=True):
+    global _fast_preview_session
+    session, _fast_preview_session = _fast_preview_session, None
+    restored = False
+    if session is not None:
+        try:
+            session["view_layer"].material_override = session["original_override"]
+            restored = True
+        except (KeyError, ReferenceError, RuntimeError):
+            pass
+
+    # Undo/redo can resurrect a material override without restoring Python
+    # globals. Scan every View Layer so render/save can never serialize it.
+    for view_layer in _preview_override_layers():
+        try:
+            view_layer.material_override = None
+            restored = True
+        except (ReferenceError, RuntimeError):
+            continue
+
+    _remove_unused_fast_preview_materials()
+    try:
+        bpy.context.view_layer.update()
+    except (AttributeError, RuntimeError):
+        pass
+    if update_status:
+        _set_render_status(
+            "Full Detail active: exact FFXIV materials and studio lighting"
+            if restored
+            else "Full Detail is already active"
+        )
+    return restored
+
+
+def _resume_fast_preview():
+    global _resume_fast_preview_after_render
+    should_resume = _resume_fast_preview_after_render
+    _resume_fast_preview_after_render = False
+    if should_resume:
+        try:
+            _enable_fast_preview(bpy.context, update_status=False)
+            _set_render_status("Render finished; Smooth Animation preview restored")
+        except Exception as error:
+            _set_render_status(f"Render finished, but Smooth Animation could not resume: {error}")
+    return None
+
+
 def _evaluated_bound_points(context, meshes):
     context.view_layer.update()
     depsgraph = context.evaluated_depsgraph_get()
@@ -1443,6 +1593,45 @@ class XIVBLEND_OT_restore_captured_pose(Operator):
         return {"FINISHED"}
 
 
+class XIVBLEND_OT_enable_smooth_preview(Operator):
+    bl_idname = "xivblend.enable_smooth_preview"
+    bl_label = "Smooth Animation"
+    bl_description = (
+        "Temporarily replace the expensive FFXIV shaders with one lightweight clay shader "
+        "for smoother playback; F12 renders and saved files automatically use Full Detail"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return not _fast_preview_is_active() and _target_armature(context) is not None
+
+    def execute(self, context):
+        try:
+            _enable_fast_preview(context)
+            return {"FINISHED"}
+        except Exception as error:
+            message = str(error)
+            _set_render_status(message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+
+class XIVBLEND_OT_disable_smooth_preview(Operator):
+    bl_idname = "xivblend.disable_smooth_preview"
+    bl_label = "Full Detail"
+    bl_description = "Restore the exact exported FFXIV materials and full viewport quality"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, _context):
+        return _fast_preview_is_active()
+
+    def execute(self, _context):
+        _restore_full_detail()
+        return {"FINISHED"}
+
+
 def _execute_camera_fit(operator, context, sample_action):
     was_playing = _is_playback_running()
     if was_playing:
@@ -1607,6 +1796,21 @@ class XIVBLEND_PT_render_studio(Panel):
             camera = None
             camera_error = str(error)
 
+        performance = layout.box()
+        performance.label(text="Viewport Quality", icon="SHADING_RENDERED")
+        buttons = performance.row(align=True)
+        smooth = buttons.row(align=True)
+        smooth.enabled = not _fast_preview_is_active() and target is not None
+        smooth.operator(XIVBLEND_OT_enable_smooth_preview.bl_idname, icon="PLAY")
+        detail = buttons.row(align=True)
+        detail.enabled = _fast_preview_is_active()
+        detail.operator(XIVBLEND_OT_disable_smooth_preview.bl_idname, icon="MATERIAL")
+        if _fast_preview_is_active():
+            performance.label(text="Smooth clay preview active", icon="CHECKMARK")
+        else:
+            performance.label(text="Full FFXIV materials active", icon="CHECKMARK")
+        performance.label(text="F12 renders and saves use Full Detail", icon="LOCKED")
+
         header = layout.row()
         header.label(
             text=f"Camera: {camera.name}" if camera else "No usable portrait camera",
@@ -1650,8 +1854,13 @@ class XIVBLEND_PT_render_studio(Panel):
 
 @persistent
 def _save_pre_handler(_filepath):
-    global _save_sessions
+    global _save_sessions, _resume_fast_preview_after_save
     _save_sessions = []
+    _resume_fast_preview_after_save = (
+        _resume_fast_preview_after_save or _fast_preview_is_active()
+    )
+    if _resume_fast_preview_after_save:
+        _restore_full_detail(update_status=False)
     _stop_playback()
     for target_name, session in list(_runtime_sessions.items()):
         target = bpy.data.objects.get(target_name)
@@ -1667,7 +1876,7 @@ def _save_pre_handler(_filepath):
 
 
 def _resume_after_save():
-    global _save_sessions
+    global _save_sessions, _resume_fast_preview_after_save
     sessions, _save_sessions = _save_sessions, []
     for session in sessions:
         target = bpy.data.objects.get(session["target"])
@@ -1685,18 +1894,50 @@ def _resume_after_save():
             ))
         except Exception as error:
             _set_status(f"Saved safely, but could not resume the preview: {error}")
+    resume_preview = _resume_fast_preview_after_save
+    _resume_fast_preview_after_save = False
+    if resume_preview:
+        try:
+            _enable_fast_preview(bpy.context, update_status=False)
+            _set_render_status("Saved in Full Detail; Smooth Animation preview restored")
+        except Exception as error:
+            _set_render_status(f"Saved safely, but Smooth Animation could not resume: {error}")
     return None
 
 
 @persistent
 def _save_post_handler(_filepath):
-    if _save_sessions:
-        bpy.app.timers.register(_resume_after_save, first_interval=0.1)
+    if _save_sessions or _resume_fast_preview_after_save:
+        if not bpy.app.timers.is_registered(_resume_after_save):
+            bpy.app.timers.register(_resume_after_save, first_interval=0.1)
+
+
+@persistent
+def _render_pre_handler(_scene, *_args):
+    global _resume_fast_preview_after_render
+    if not _fast_preview_is_active():
+        return
+    _resume_fast_preview_after_render = True
+    _restore_full_detail(update_status=False)
+    _set_render_status("Rendering with Full Detail materials and studio lighting…")
+
+
+@persistent
+def _render_finished_handler(_scene, *_args):
+    if not _resume_fast_preview_after_render:
+        return
+    try:
+        if not bpy.app.timers.is_registered(_resume_fast_preview):
+            bpy.app.timers.register(_resume_fast_preview, first_interval=0.1)
+    except Exception:
+        _resume_fast_preview()
 
 
 @persistent
 def _load_post_handler(_filepath):
     global _catalog, _catalog_signature, _save_sessions
+    global _fast_preview_session, _resume_fast_preview_after_save
+    global _resume_fast_preview_after_render
     _stop_playback()
     _purge_transient_actions(restore=True)
     _pending_requests.clear()
@@ -1704,6 +1945,10 @@ def _load_post_handler(_filepath):
     _scene_settings.clear()
     _runtime_sessions.clear()
     _save_sessions = []
+    _fast_preview_session = None
+    _resume_fast_preview_after_save = False
+    _resume_fast_preview_after_render = False
+    _restore_full_detail(update_status=False)
     _catalog = None
     _catalog_signature = None
     _close_previews()
@@ -1718,6 +1963,8 @@ _CLASSES = (
     XIVBLEND_OT_change_animation_page,
     XIVBLEND_OT_play_emote,
     XIVBLEND_OT_restore_captured_pose,
+    XIVBLEND_OT_enable_smooth_preview,
+    XIVBLEND_OT_disable_smooth_preview,
     XIVBLEND_OT_fit_camera_current_pose,
     XIVBLEND_OT_fit_camera_active_action,
     XIVBLEND_OT_render_portrait,
@@ -1760,6 +2007,9 @@ def register():
     for handlers, callback in (
         (bpy.app.handlers.save_pre, _save_pre_handler),
         (bpy.app.handlers.save_post, _save_post_handler),
+        (bpy.app.handlers.render_pre, _render_pre_handler),
+        (bpy.app.handlers.render_complete, _render_finished_handler),
+        (bpy.app.handlers.render_cancel, _render_finished_handler),
         (bpy.app.handlers.load_post, _load_post_handler),
     ):
         if callback not in handlers:
@@ -1767,7 +2017,9 @@ def register():
 
 
 def unregister():
-    global _save_sessions
+    global _save_sessions, _resume_fast_preview_after_save
+    global _resume_fast_preview_after_render
+    _restore_full_detail(update_status=False)
     _stop_playback()
     for target_name in list(_runtime_sessions):
         target = bpy.data.objects.get(target_name)
@@ -1785,10 +2037,20 @@ def unregister():
             bpy.app.timers.unregister(_resume_after_save)
     except Exception:
         pass
+    try:
+        if bpy.app.timers.is_registered(_resume_fast_preview):
+            bpy.app.timers.unregister(_resume_fast_preview)
+    except Exception:
+        pass
     _save_sessions = []
+    _resume_fast_preview_after_save = False
+    _resume_fast_preview_after_render = False
     for handlers, callback in (
         (bpy.app.handlers.save_pre, _save_pre_handler),
         (bpy.app.handlers.save_post, _save_post_handler),
+        (bpy.app.handlers.render_pre, _render_pre_handler),
+        (bpy.app.handlers.render_complete, _render_finished_handler),
+        (bpy.app.handlers.render_cancel, _render_finished_handler),
         (bpy.app.handlers.load_post, _load_post_handler),
     ):
         if callback in handlers:

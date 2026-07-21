@@ -39,6 +39,7 @@ STUDIO_CAMERA_TAG = "studio_camera"
 STUDIO_LIGHT_TAG = "studio_light"
 STUDIO_BACKDROP_TAG = "studio_backdrop"
 COMPONENT_PROPERTY = "xivblend_component"
+MATERIAL_SURFACE_CLASSIFICATION_PROPERTY = "xivblend_surface_classification"
 
 EXPECTED_STUDIO_LIGHTS = 3
 EXPECTED_RESOLUTION = (1440, 1800, 100)
@@ -271,6 +272,11 @@ def audit_material(material: bpy.types.Material) -> dict[str, Any]:
     nodes = list(material.node_tree.nodes) if material.node_tree else []
     image_nodes = [node for node in nodes if node.type == "TEX_IMAGE"]
     group_nodes = [node for node in nodes if node.type == "GROUP"]
+    alpha_inputs = [
+        node.inputs.get("Alpha")
+        for node in nodes
+        if node.type == "BSDF_PRINCIPLED" and node.inputs.get("Alpha") is not None
+    ]
     return {
         "name": material.name,
         "users": material.users,
@@ -278,6 +284,13 @@ def audit_material(material: bpy.types.Material) -> dict[str, Any]:
         "use_nodes": material.node_tree is not None,
         "nodes": len(nodes),
         "render_method": material_render_method(material),
+        "surface_classification": material.get(
+            MATERIAL_SURFACE_CLASSIFICATION_PROPERTY
+        ),
+        "principled_alpha_inputs": len(alpha_inputs),
+        "linked_principled_alpha_inputs": sum(bool(alpha.links) for alpha in alpha_inputs),
+        "principled_alpha_values": [float(alpha.default_value) for alpha in alpha_inputs],
+        "transparent_shadows": getattr(material, "use_transparent_shadow", None),
         "image_nodes": len(image_nodes),
         "empty_optional_image_nodes": sum(node.image is None for node in image_nodes),
         "empty_optional_image_node_names": sorted(
@@ -678,8 +691,8 @@ def audit_studio(
         },
         "exposure": {
             "actual": scene.view_settings.exposure,
-            "expected": -0.58,
-            "valid": abs(scene.view_settings.exposure - (-0.58)) <= FLOAT_EPSILON,
+            "expected": -0.40,
+            "valid": abs(scene.view_settings.exposure - (-0.40)) <= FLOAT_EPSILON,
         },
         "gamma": {
             "actual": scene.view_settings.gamma,
@@ -707,6 +720,36 @@ def audit_studio(
             "valid": scene.unit_settings.system == "METRIC"
             and abs(scene.unit_settings.scale_length - 1.0) <= FLOAT_EPSILON
             and scene.unit_settings.length_unit == "METERS",
+        },
+        "viewport_samples": {
+            "actual": scene.eevee.taa_samples,
+            "expected": 16,
+            "valid": scene.eevee.taa_samples == 16,
+        },
+        "render_samples": {
+            "actual": scene.eevee.taa_render_samples,
+            "expected": 96,
+            "valid": scene.eevee.taa_render_samples == 96,
+        },
+        "temporal_reprojection": {
+            "actual": scene.eevee.use_taa_reprojection,
+            "expected": True,
+            "valid": scene.eevee.use_taa_reprojection is True,
+        },
+        "viewport_jittered_shadows": {
+            "actual": scene.eevee.use_shadow_jitter_viewport,
+            "expected": False,
+            "valid": scene.eevee.use_shadow_jitter_viewport is False,
+        },
+        "shadow_rays": {
+            "actual": scene.eevee.shadow_ray_count,
+            "expected": 3,
+            "valid": scene.eevee.shadow_ray_count == 3,
+        },
+        "raytracing": {
+            "actual": scene.eevee.use_raytracing,
+            "expected": False,
+            "valid": scene.eevee.use_raytracing is False,
         },
     }
 
@@ -736,6 +779,10 @@ def audit_studio(
                 "shape": obj.data.shape if obj.type == "LIGHT" else None,
                 "size": obj.data.size if obj.type == "LIGHT" else None,
                 "size_y": obj.data.size_y if obj.type == "LIGHT" else None,
+                "role": obj.get("xivblend_studio_role"),
+                "use_shadow": obj.data.use_shadow if obj.type == "LIGHT" else None,
+                "spread": obj.data.spread if obj.type == "LIGHT" else None,
+                "color": list(obj.data.color) if obj.type == "LIGHT" else None,
             }
             for obj in tagged_lights
         ],
@@ -977,6 +1024,55 @@ def main() -> int:
             if item["placeholder_material_slots"]
         },
     )
+    opaque_material_reports = [
+        item for item in material_reports if item["surface_classification"] == "opaque"
+    ]
+    transparent_material_reports = [
+        item
+        for item in material_reports
+        if item["surface_classification"] == "transparent-or-unknown"
+    ]
+    append_issue(
+        issues,
+        "invalid_opaque_material_optimization",
+        [
+            {
+                "name": item["name"],
+                "principled_alpha_inputs": item["principled_alpha_inputs"],
+                "linked_principled_alpha_inputs": item[
+                    "linked_principled_alpha_inputs"
+                ],
+                "principled_alpha_values": item["principled_alpha_values"],
+                "transparent_shadows": item["transparent_shadows"],
+            }
+            for item in opaque_material_reports
+            if item["principled_alpha_inputs"] == 0
+            or item["linked_principled_alpha_inputs"] != 0
+            or any(abs(value - 1.0) > FLOAT_EPSILON for value in item["principled_alpha_values"])
+            or item["transparent_shadows"] is not False
+        ],
+    )
+    expected_opaque = scene.get("xivblend_opaque_materials_optimized")
+    expected_transparent = scene.get("xivblend_transparent_materials_preserved")
+    append_issue(
+        issues,
+        "opaque_material_optimization_count",
+        (
+            {"actual": len(opaque_material_reports), "expected": expected_opaque}
+            if expected_opaque is None or len(opaque_material_reports) != int(expected_opaque)
+            else None
+        ),
+    )
+    append_issue(
+        issues,
+        "transparent_material_preservation_count",
+        (
+            {"actual": len(transparent_material_reports), "expected": expected_transparent}
+            if expected_transparent is None
+            or len(transparent_material_reports) != int(expected_transparent)
+            else None
+        ),
+    )
     append_issue(
         issues,
         "missing_images",
@@ -1048,6 +1144,22 @@ def main() -> int:
             or light["size"] <= 0
             or light["size_y"] is None
             or light["size_y"] <= 0
+        ],
+    )
+    expected_shadow_by_role = {"key": True, "fill": False, "rim": False}
+    append_issue(
+        issues,
+        "invalid_studio_light_shadow_roles",
+        [
+            {
+                "name": light["name"],
+                "role": light["role"],
+                "use_shadow": light["use_shadow"],
+                "expected": expected_shadow_by_role.get(light["role"]),
+            }
+            for light in tagged_lights
+            if light["role"] not in expected_shadow_by_role
+            or light["use_shadow"] != expected_shadow_by_role[light["role"]]
         ],
     )
     tagged_light_names = {light["name"] for light in tagged_lights}

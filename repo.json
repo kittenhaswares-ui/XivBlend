@@ -5,8 +5,8 @@
     "InternalName": "XivBlend.Plugin",
     "Punchline": "Export your character and preview vanilla emotes in Blender.",
     "Description": "Self-only Blender export with a local, on-demand vanilla player-emote browser, built on Meddle's AGPL extractor.",
-    "AssemblyVersion": "0.0.10.0",
-    "TestingAssemblyVersion": "0.0.10.0",
+    "AssemblyVersion": "0.0.11.0",
+    "TestingAssemblyVersion": "0.0.11.0",
     "RepoUrl": "https://github.com/kittenhaswares-ui/XivBlend",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
@@ -17,8 +17,8 @@
       "exporting",
       "animation"
     ],
-    "DownloadLinkInstall": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.10/latest.zip",
-    "DownloadLinkTesting": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.10/latest.zip",
-    "DownloadLinkUpdate": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.10/latest.zip"
+    "DownloadLinkInstall": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.11/latest.zip",
+    "DownloadLinkTesting": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.11/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/kittenhaswares-ui/XivBlend/releases/download/v0.0.11/latest.zip"
   }
 ]
