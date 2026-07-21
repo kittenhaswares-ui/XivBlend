@@ -25,7 +25,7 @@ from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.5.0"
+BUILDER_VERSION = "0.5.1"
 ANIMATION_CATALOG_SCHEMA = 1
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -986,7 +986,7 @@ def configure_scene_setup(
     except TypeError:
         # Keep Blender's default transform when a future build renames the view.
         pass
-    scene.view_settings.exposure = -0.55
+    scene.view_settings.exposure = -0.58
     scene.view_settings.gamma = 1.0
 
     world = bpy.data.worlds.new("Neutral World")
@@ -1077,11 +1077,11 @@ def configure_scene_setup(
         "Key Light (Warm Softbox)",
         captured_center + Vector((-largest * 1.15, -largest * 1.35, largest * 1.35)),
         light_target,
-        260.0 * largest * largest,
-        largest * 0.78,
-        (1.0, 0.86, 0.76),
+        145.0 * largest * largest,
+        largest * 0.62,
+        (1.0, 0.94, 0.90),
         role="key",
-        size_y=largest * 1.20,
+        size_y=largest * 1.05,
         spread=math.radians(115.0),
     )
     add_area_light(
@@ -1089,7 +1089,7 @@ def configure_scene_setup(
         "Fill Light (Cool Softbox)",
         captured_center + Vector((largest * 1.35, -largest * 0.95, largest * 0.75)),
         light_target,
-        48.0 * largest * largest,
+        10.0 * largest * largest,
         largest * 1.50,
         (0.75, 0.82, 1.0),
         role="fill",
@@ -1101,7 +1101,7 @@ def configure_scene_setup(
         "Rim Light (Cool Strip)",
         captured_center + Vector((largest * 0.85, largest * 0.95, largest * 1.35)),
         captured_center + Vector((0.0, 0.0, captured_size.z * 0.20)),
-        82.0 * largest * largest,
+        38.0 * largest * largest,
         largest * 0.28,
         (0.65, 0.78, 1.0),
         role="rim",
@@ -1768,13 +1768,13 @@ def validate_scene_setup(
         problems.append(f"expected 3 studio lights, found {len(studio_lights)}")
     expected_lights = {
         "key": (
-            260.0, 0.78, 1.20, (1.0, 0.86, 0.76), math.radians(115.0)
+            145.0, 0.62, 1.05, (1.0, 0.94, 0.90), math.radians(115.0)
         ),
         "fill": (
-            48.0, 1.50, 1.85, (0.75, 0.82, 1.0), math.radians(125.0)
+            10.0, 1.50, 1.85, (0.75, 0.82, 1.0), math.radians(125.0)
         ),
         "rim": (
-            82.0, 0.28, 1.25, (0.65, 0.78, 1.0), math.radians(85.0)
+            38.0, 0.28, 1.25, (0.65, 0.78, 1.0), math.radians(85.0)
         ),
     }
     if {
@@ -1883,7 +1883,7 @@ def validate_scene_setup(
         and not scene.render.film_transparent
         and scene.view_settings.view_transform == "AgX"
         and scene.view_settings.look == "AgX - Medium High Contrast"
-        and approximately_equal(scene.view_settings.exposure, -0.55)
+        and approximately_equal(scene.view_settings.exposure, -0.58)
         and scene.eevee.taa_render_samples == 96
         and scene.eevee.shadow_pool_size == "512"
         and scene.eevee.shadow_ray_count == 3

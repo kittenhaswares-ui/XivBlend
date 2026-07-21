@@ -678,8 +678,8 @@ def audit_studio(
         },
         "exposure": {
             "actual": scene.view_settings.exposure,
-            "expected": -0.55,
-            "valid": abs(scene.view_settings.exposure - (-0.55)) <= FLOAT_EPSILON,
+            "expected": -0.58,
+            "valid": abs(scene.view_settings.exposure - (-0.58)) <= FLOAT_EPSILON,
         },
         "gamma": {
             "actual": scene.view_settings.gamma,

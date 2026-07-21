@@ -1,6 +1,6 @@
 ﻿<Project Sdk="Dalamud.NET.Sdk/15.0.0">
     <PropertyGroup>
-        <Version>0.0.9</Version>
+        <Version>0.0.10</Version>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <RootNamespace>Meddle.Plugin</RootNamespace>
