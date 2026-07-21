@@ -1,17 +1,22 @@
-# XivBlend Prototype 0.0.7
+# XivBlend Prototype 0.0.8
 
-This patch fixes the first-click animation failure in version 0.0.6. XivBlend was reading PAP data correctly but comparing its little-endian header against a byte-reversed signature, so every valid vanilla animation was rejected as “not a PAP file” before Havok sampling began.
+This patch fixes the Blender-side reason version 0.0.7 could successfully create an animation clip while the character remained motionless.
 
 ## What changed
 
-- Corrects PAP signature validation for the game’s `pap ` header bytes.
-- Keeps the on-demand design: only the selected vanilla emote is read and converted, and successful clips remain in the shared local cache.
-- Does not require a new character export when the `.blend` was already created with version 0.0.6.
+- Explicitly binds the imported glTF Action slot to the exported character armature in Blender 4.4 and newer.
+- Keeps compatibility with legacy Actions on Blender versions without Action slots.
+- Preserves safe preview cleanup and restores the original captured-pose Action and slot when playback stops or the file is saved.
+- Updates the companion Blender animation browser to version 0.1.1.
+
+Blender 5 stores animation channels in layered Action slots. The generated clip had real changing transforms, but copying its Action from the temporary import rig to the differently named character rig left `action_slot` empty. The timeline therefore played an Action connected to no object. XivBlend now carries the imported slot across explicitly.
 
 ## Install and test
 
-Update or reload XivBlend, keep FFXIV running, and click an emote in Blender again. Previously failed requests are harmless; the new click creates a fresh request. The first uncached click needs the game and plugin running, while later playback uses the cached clip.
+1. Update or reload XivBlend 0.0.8.
+2. In XivBlend's **Animations** tab, press **Reinstall Blender Panel** (or **Set Up / Update Animation Browser**) and wait for success.
+3. Restart any Blender window that was already open, reopen the existing character `.blend`, and click an emote.
 
-The current library remains deliberately limited to 279 vanilla player emotes and facial expressions. Combat/job actions, weapons, VFX, sound, props, mounts, movement, NPC-only animations, modded PAP files, TMB orchestration, and auxiliary multi-clip layers remain out of scope.
+No character re-export or clip re-extraction is required. Clips already cached by 0.0.7 are reused immediately.
 
-The fix passes the .NET Debug and Release builds plus static PAP/SKLB header validation against live SqPack data. Broad in-game sampling across every race, face rig, and emote remains prototype coverage work.
+The fix was reproduced against the current c0801 character export and a live cached 117-frame emote: 96 shared rig bones evaluate across the Action, and **Stop / Restore Captured Pose** restores the original Action, slot, and frame 100. Combat/job actions, weapons, VFX, sound, props, mounts, movement, NPC-only animations, modded PAP files, TMB orchestration, and auxiliary multi-clip layers remain out of scope.

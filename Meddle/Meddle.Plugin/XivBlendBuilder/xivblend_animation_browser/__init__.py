@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse and play locally extracted FFXIV player emotes",
@@ -625,6 +625,49 @@ def _set_object_mode(context):
             raise ClipError("Switch to Object Mode before playing an animation") from error
 
 
+def _bind_action_slot(animation_data, action, source_slot_identifier):
+    """Bind a layered Action's copied slot to the target armature.
+
+    Blender 4.4+ Actions store channels in slots.  Assigning a copied glTF
+    Action to a differently named armature can leave ``action_slot`` empty,
+    which makes a healthy Action evaluate as a motionless pose.  Preserve the
+    imported armature's slot explicitly; older legacy Actions need no slot.
+    """
+    if not hasattr(animation_data, "action_slot"):
+        return
+    slots = list(getattr(action, "slots", ()))
+    if not slots:
+        return
+    selected = next(
+        (
+            slot for slot in slots
+            if slot.identifier == source_slot_identifier
+            and getattr(slot, "target_id_type", "OBJECT") == "OBJECT"
+        ),
+        None,
+    )
+    compatible = [
+        slot for slot in slots
+        if getattr(slot, "target_id_type", "OBJECT") == "OBJECT"
+    ]
+    if selected is None and len(compatible) == 1:
+        selected = compatible[0]
+    if selected is None:
+        raise ClipError(
+            f"Animation Action '{action.name}' has no unambiguous armature slot"
+        )
+    try:
+        animation_data.action_slot = selected
+    except Exception as error:
+        raise ClipError(
+            f"Animation Action '{action.name}' could not bind to its armature slot: {error}"
+        ) from error
+    if animation_data.action_slot is None:
+        raise ClipError(
+            f"Animation Action '{action.name}' did not bind to its armature slot"
+        )
+
+
 def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
     if not clip_path.is_file():
         raise ClipError(f"Animation clip is not ready: {clip_path.name}")
@@ -642,6 +685,7 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
     original_active = getattr(context.view_layer.objects, "active", None)
     original_selected = list(getattr(context, "selected_objects", []))
     copied_action = None
+    source_slot_identifier = None
     try:
         _set_object_mode(context)
         result = bpy.ops.import_scene.gltf(filepath=str(clip_path), disable_bone_shape=True)
@@ -654,6 +698,9 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
                 continue
             if imported.animation_data.action is not None:
                 source_action = imported.animation_data.action
+                source_slot = getattr(imported.animation_data, "action_slot", None)
+                if source_slot is not None:
+                    source_slot_identifier = source_slot.identifier
                 break
         if source_action is None:
             new_actions = [action for action in bpy.data.actions if action not in snapshot.get("actions", set())]
@@ -690,12 +737,20 @@ def _import_clip(context, target, clip_path, entry, variant, auto_play=True):
 
     animation_data = target.animation_data_create()
     old_action = animation_data.action
+    old_action_slot = getattr(animation_data, "action_slot", None)
     if old_action is not None and not bool(old_action.get(TRANSIENT_PROPERTY, False)):
         _captured_actions[target.name] = old_action
     new_scene_session = target.name not in _scene_settings
     try:
         animation_data.action = copied_action
+        _bind_action_slot(animation_data, copied_action, source_slot_identifier)
     except Exception as error:
+        try:
+            animation_data.action = old_action
+            if old_action_slot is not None and hasattr(animation_data, "action_slot"):
+                animation_data.action_slot = old_action_slot
+        except Exception:
+            animation_data.action = None
         _remove_action(copied_action)
         scene.render.fps = previous_scene_settings[2]
         scene.render.fps_base = previous_scene_settings[3]

@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.7 fixes the PAP signature validation that incorrectly rejected every valid game animation on the first uncached click. The optional Blender browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. The character exporter has passed release-build, Blender-reopen, and offline end-to-end checks; the corrected live first-click animation bridge still needs broad in-game coverage.
+> **Prototype status:** version 0.0.8 completes the first working live emote path by fixing Blender 5's layered-Action slot binding; version 0.0.7 fixed the preceding PAP signature rejection. The optional browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. Live extraction, GLB generation, Action assignment, animated evaluation, and captured-pose restoration have now been verified on the current c0801 export; broader race, face-rig, and emote coverage remains prototype work.
 
 ## What it exports
 
