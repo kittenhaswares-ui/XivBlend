@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.8 provides an optional Blender sidebar for previewing a deliberately narrow set of built-in FFXIV player animations. It is an on-demand local bridge, not a copy of the game's complete animation archive: the catalog and icons are prepared from the user's own live installation, and only the animation clicked in Blender is decoded. Penumbra is bypassed; see the TexTools integrity caveat below.
+XivBlend 0.0.9 provides an optional Blender sidebar for previewing a deliberately narrow set of built-in FFXIV player animations and framing portrait renders. It is an on-demand local bridge, not a copy of the game's complete animation archive: the catalog and icons are prepared from the user's own live installation, and only the animation clicked in Blender is decoded. Penumbra is bypassed; see the TexTools integrity caveat below.
 
 ## Scope
 
@@ -47,7 +47,7 @@ Runtime Actions are intentionally transient. Before Blender saves, the add-on re
 
 ## Set up and use
 
-1. Install XivBlend 0.0.8 or newer and select Blender in XivBlend's **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.9 or newer and select Blender in XivBlend's **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both the game catalog and Blender panel to report success.
 4. Export the character again with XivBlend 0.0.6 or newer. Older `.blend` files do not contain the race and face-rig metadata required by the browser.
@@ -58,6 +58,16 @@ Runtime Actions are intentionally transient. Before Blender saves, the add-on re
 9. Click **Stop / Restore Captured Pose** to unload the preview and return to the pose exported at frame 100.
 
 The browser targets the active armature, or the exported primary armature when no suitable rig is active.
+
+## Render Studio controls
+
+Animation-browser version 0.2.0 adds a second panel under **XivBlend** → **Render Studio**:
+
+- **Fit Camera to Current Pose** frames the visible character at the current Timeline frame. Use this for the strongest still-image composition after choosing an emote pose.
+- **Fit Camera to Whole Animation** measures up to 96 evenly spaced poses across the active Action. Use this before rendering a clip to keep its sampled motion inside the portrait; unusually long clips with a very brief extreme pose can still need a little manual margin.
+- **Render Portrait** opens Blender's normal render view with the scene's existing output settings. It does not silently save or overwrite an image.
+
+Both fitting controls preserve the camera lens, current frame, animation, and playback state. They ignore the generated studio scenery, hidden objects, dummy meshes, and custom bone widgets when measuring the character. Existing compatible XivBlend `.blend` files gain these controls after the panel is reinstalled; the upgraded physical studio itself requires a new export with XivBlend 0.0.9 or newer.
 
 ## Cache and updates
 

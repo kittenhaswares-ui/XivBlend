@@ -25,7 +25,7 @@ from mathutils import Matrix, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.4.0"
+BUILDER_VERSION = "0.5.0"
 ANIMATION_CATALOG_SCHEMA = 1
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -47,6 +47,7 @@ CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
 POSE_REST_FRAME = 0
 POSE_CAPTURED_FRAME = 100
 POSE_SAMPLE_FRAMES = (0, 25, 50, 75, 100)
+STUDIO_CAMERA_SAMPLE_FRAMES = (POSE_CAPTURED_FRAME,)
 POSE_REST_MARKER = "XIV A-POSE"
 POSE_CAPTURED_MARKER = "CAPTURED POSE"
 POSE_MATRIX_TOLERANCE = 1.0e-5
@@ -740,10 +741,7 @@ def character_bounds(
         )
 
     if not points:
-        minimum = Vector((-0.5, -0.5, 0.0))
-        maximum = Vector((0.5, 0.5, 2.0))
-        points = [minimum, maximum]
-        return (minimum + maximum) * 0.5, maximum - minimum, points
+        raise BuildError("No visible character mesh geometry was available for scene setup")
 
     minimum = Vector(tuple(min(point[axis] for point in points) for axis in range(3)))
     maximum = Vector(tuple(max(point[axis] for point in points) for axis in range(3)))
@@ -777,6 +775,43 @@ def point_at(obj: bpy.types.Object, target: Vector) -> None:
         obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
+def fit_front_camera(
+    scene: bpy.types.Scene,
+    camera: bpy.types.Object,
+    bounds: Iterable[Vector],
+    target: Vector,
+    margin: float = 1.08,
+) -> float:
+    """Place a front-facing perspective camera around the supplied bounds."""
+    bounds = list(bounds)
+    if not bounds:
+        raise BuildError("Cannot fit the studio camera without character bounds")
+    render_aspect = (
+        scene.render.resolution_x
+        * scene.render.pixel_aspect_x
+        / max(scene.render.resolution_y * scene.render.pixel_aspect_y, 1.0e-6)
+    )
+    tan_half_x = max(math.tan(camera.data.angle_x * 0.5), 1.0e-4)
+    tan_half_y = tan_half_x / max(render_aspect, 1.0e-4)
+    distance = max(
+        max(
+            abs(point.x - target.x) * margin / tan_half_x - (point.y - target.y),
+            abs(point.z - target.z) * margin / tan_half_y - (point.y - target.y),
+        )
+        for point in bounds
+    )
+    extent = max(
+        max(point[axis] for point in bounds) - min(point[axis] for point in bounds)
+        for axis in range(3)
+    )
+    distance = max(distance, extent * 0.75, 0.1)
+    camera.location = target + Vector((0.0, -distance, 0.0))
+    camera.data.clip_start = max(distance / 1000.0, 0.001)
+    camera.data.clip_end = max(distance + extent * 20.0, 100.0)
+    point_at(camera, target)
+    return distance
+
+
 def add_area_light(
     setup: bpy.types.Collection,
     name: str,
@@ -785,18 +820,26 @@ def add_area_light(
     energy: float,
     size: float,
     color: tuple[float, float, float],
+    *,
+    role: str,
+    size_y: float | None = None,
+    spread: float = math.pi,
 ) -> bpy.types.Object:
     light_data = bpy.data.lights.new(name, type="AREA")
     light_data.energy = energy
     light_data.color = color
     light_data.normalize = True
-    light_data.shape = "DISK"
+    light_data.shape = "RECTANGLE"
     light_data.size = size
+    light_data.size_y = size if size_y is None else size_y
+    light_data.spread = spread
+    light_data.use_shadow = True
     light = bpy.data.objects.new(name, light_data)
     setup.objects.link(light)
     light.location = location
     point_at(light, target)
     light["xivblend_component"] = "studio_light"
+    light["xivblend_studio_role"] = role
     return light
 
 
@@ -805,12 +848,18 @@ def create_studio_backdrop(
     center: Vector,
     size: Vector,
     largest: float,
+    floor_z: float | None = None,
 ) -> bpy.types.Object:
     """Create a removable curved studio sweep beneath and behind the character."""
-    floor_z = center.z - size.z * 0.5 - max(largest * 0.002, 0.001)
+    if floor_z is None:
+        floor_z = center.z - size.z * 0.5
+    floor_z -= max(largest * 0.002, 0.001)
     half_width = largest * 5.0
-    curve_steps = 12
-    width_steps = 16
+    # A coarse quarter-circle reads as horizontal bands once soft studio lights
+    # rake across it.  Dense geometry keeps the sweep visually continuous even
+    # in Eevee without a subdivision modifier.
+    curve_steps = 64
+    width_steps = 8
     radius = largest * 0.8
     curve_center_y = center.y + largest * 0.8
     curve_center_z = floor_z + radius
@@ -870,25 +919,29 @@ def create_studio_backdrop(
         nodes = material.node_tree.nodes
         links = material.node_tree.links
         output = nodes.get("Material Output")
-        emission = nodes.new("ShaderNodeEmission")
         coordinates = nodes.new("ShaderNodeTexCoord")
         separate = nodes.new("ShaderNodeSeparateXYZ")
         color_ramp = nodes.new("ShaderNodeValToRGB")
+        color_ramp.color_ramp.interpolation = "EASE"
         color_ramp.color_ramp.elements[0].position = 0.0
-        color_ramp.color_ramp.elements[0].color = (0.055, 0.075, 0.12, 1.0)
+        color_ramp.color_ramp.elements[0].color = (0.012, 0.022, 0.048, 1.0)
         color_ramp.color_ramp.elements[1].position = 1.0
-        color_ramp.color_ramp.elements[1].color = (0.012, 0.018, 0.035, 1.0)
+        color_ramp.color_ramp.elements[1].color = (0.002, 0.006, 0.016, 1.0)
         transition = nodes.new("ShaderNodeMapRange")
         transition.clamp = True
-        transition.inputs["From Min"].default_value = 0.015
-        transition.inputs["From Max"].default_value = 0.17
+        if hasattr(transition, "interpolation_type"):
+            transition.interpolation_type = "SMOOTHERSTEP"
+        transition.inputs["From Min"].default_value = 0.055
+        transition.inputs["From Max"].default_value = 0.19
         transition.inputs["To Min"].default_value = 0.0
         transition.inputs["To Max"].default_value = 1.0
-        mix = nodes.new("ShaderNodeMixShader")
+        emission = nodes.new("ShaderNodeEmission")
         emission.inputs["Strength"].default_value = 1.0
+        mix = nodes.new("ShaderNodeMixShader")
         links.new(coordinates.outputs["Generated"], separate.inputs["Vector"])
         links.new(separate.outputs["Z"], color_ramp.inputs["Fac"])
         links.new(separate.outputs["Z"], transition.inputs["Value"])
+        links.new(color_ramp.outputs["Color"], principled.inputs["Base Color"])
         links.new(color_ramp.outputs["Color"], emission.inputs["Color"])
         links.new(transition.outputs["Result"], mix.inputs[0])
         links.new(principled.outputs["BSDF"], mix.inputs[1])
@@ -911,20 +964,29 @@ def configure_scene_setup(
     setup: bpy.types.Collection,
 ) -> None:
     scene.render.engine = "BLENDER_EEVEE"
-    scene.render.resolution_x = 1080
-    scene.render.resolution_y = 1350
+    scene.render.resolution_x = 1440
+    scene.render.resolution_y = 1800
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
-    scene.render.image_settings.color_mode = "RGBA"
-    scene.render.image_settings.color_depth = "8"
+    scene.render.image_settings.color_mode = "RGB"
+    scene.render.image_settings.color_depth = "16"
     scene.render.film_transparent = False
+    if hasattr(scene, "eevee"):
+        scene.eevee.taa_render_samples = 96
+        scene.eevee.shadow_pool_size = "512"
+        scene.eevee.shadow_ray_count = 3
+        scene.eevee.use_raytracing = False
+        scene.eevee.ray_tracing_method = "SCREEN"
+        scene.eevee.use_fast_gi = True
+        scene.eevee.fast_gi_method = "AMBIENT_OCCLUSION_ONLY"
+        scene.eevee.fast_gi_quality = 0.75
     try:
         scene.view_settings.view_transform = "AgX"
         scene.view_settings.look = "AgX - Medium High Contrast"
     except TypeError:
         # Keep Blender's default transform when a future build renames the view.
         pass
-    scene.view_settings.exposure = -0.35
+    scene.view_settings.exposure = -0.55
     scene.view_settings.gamma = 1.0
 
     world = bpy.data.worlds.new("Neutral World")
@@ -933,12 +995,58 @@ def configure_scene_setup(
         world.use_nodes = True
     background = world.node_tree.nodes.get("Background") if world.node_tree else None
     if background is not None:
-        background.inputs["Color"].default_value = (0.018, 0.024, 0.038, 1.0)
-        background.inputs["Strength"].default_value = 0.18
+        background.inputs["Color"].default_value = (0.004, 0.007, 0.014, 1.0)
+        background.inputs["Strength"].default_value = 0.035
     scene.world = world
 
-    center, size, bounds = character_bounds_across_frames(scene, imported)
+    center, size, _ = character_bounds_across_frames(scene, imported)
     largest = max(max(size), 0.1)
+    if hasattr(scene, "eevee"):
+        scene.eevee.fast_gi_distance = max(largest * 0.10, 0.05)
+
+    # The Timeline's intermediate frames are a rig-editing convenience, not
+    # authored character poses.  Fit the default render to the captured pose,
+    # and anchor the floor to the armature object's world origin. FFXIV rigs
+    # use that as their ground plane. The real endpoint geometry may raise the
+    # floor by a small sole offset, but a low tail, robe or sheathed weapon must
+    # not drag the sweep below the rig ground and make the feet appear to float.
+    support_meshes = [
+        obj
+        for obj in imported
+        if obj.type == "MESH"
+        and re.search(r"(?:^|_)sho(?:_|$)", obj.name, re.IGNORECASE)
+    ]
+    support_bounds: list[Vector] = []
+    set_scene_frame(scene, POSE_REST_FRAME)
+    _, _, rest_bounds = character_bounds(imported)
+    if support_meshes:
+        try:
+            _, _, frame_support_bounds = character_bounds(support_meshes)
+            support_bounds.extend(frame_support_bounds)
+        except BuildError:
+            pass
+    set_scene_frame(scene, POSE_CAPTURED_FRAME)
+    captured_center, captured_size, captured_bounds = character_bounds(imported)
+    if support_meshes:
+        try:
+            _, _, frame_support_bounds = character_bounds(support_meshes)
+            support_bounds.extend(frame_support_bounds)
+        except BuildError:
+            pass
+    character_armatures = [obj for obj in imported if obj.type == "ARMATURE"]
+    if len(character_armatures) != 1:
+        raise BuildError(
+            "Scene setup requires exactly one character armature; "
+            f"found {len(character_armatures)}"
+        )
+    rig_ground_z = float(character_armatures[0].matrix_world.translation.z)
+    endpoint_minimum_z = min(point.z for point in rest_bounds + captured_bounds)
+    support_minimum_z = (
+        min(point.z for point in support_bounds)
+        if support_bounds
+        else endpoint_minimum_z
+    )
+    ground_plane_z = max(rig_ground_z, support_minimum_z)
 
     # Always create an unparented camera so an imported camera's hidden state,
     # constraints or parent transform cannot compromise deterministic framing.
@@ -948,34 +1056,13 @@ def configure_scene_setup(
     camera_data = bpy.data.cameras.new("XivBlend Studio Camera")
     camera = bpy.data.objects.new("XivBlend Studio Camera", camera_data)
     setup.objects.link(camera)
-    camera.data.lens = 55.0
+    camera.data.lens = 70.0
     camera.data.sensor_fit = "HORIZONTAL"
     camera.data.dof.use_dof = False
     camera.hide_render = False
     camera.hide_viewport = False
-    camera_target = center + Vector((0.0, 0.0, size.z * 0.02))
-    render_aspect = (
-        scene.render.resolution_x
-        * scene.render.pixel_aspect_x
-        / max(scene.render.resolution_y * scene.render.pixel_aspect_y, 1.0e-6)
-    )
-    tan_half_x = max(math.tan(camera.data.angle_x * 0.5), 1.0e-4)
-    tan_half_y = tan_half_x / max(render_aspect, 1.0e-4)
-    fit_margin = 1.12
-    camera_distance = max(
-        max(
-            abs(point.x - camera_target.x) * fit_margin / tan_half_x
-            - (point.y - camera_target.y),
-            abs(point.z - camera_target.z) * fit_margin / tan_half_y
-            - (point.y - camera_target.y),
-        )
-        for point in bounds
-    )
-    camera_distance = max(camera_distance, largest * 0.75)
-    camera.location = camera_target + Vector((0.0, -camera_distance, 0.0))
-    camera.data.clip_start = max(camera_distance / 1000.0, 0.001)
-    camera.data.clip_end = max(camera_distance + largest * 20.0, 100.0)
-    point_at(camera, camera_target)
+    camera_target = captured_center + Vector((0.0, 0.0, captured_size.z * 0.015))
+    fit_front_camera(scene, camera, captured_bounds, camera_target)
     camera["xivblend_component"] = "studio_camera"
     scene.camera = camera
 
@@ -984,35 +1071,44 @@ def configure_scene_setup(
         source_light.hide_render = True
         source_light.hide_viewport = True
 
-    light_target = center + Vector((0.0, 0.0, size.z * 0.14))
+    light_target = captured_center + Vector((0.0, 0.0, captured_size.z * 0.16))
     add_area_light(
         setup,
         "Key Light (Warm Softbox)",
-        center + Vector((-largest * 1.25, -largest * 1.45, largest * 1.45)),
+        captured_center + Vector((-largest * 1.15, -largest * 1.35, largest * 1.35)),
         light_target,
-        430.0 * largest * largest,
-        largest * 1.20,
-        (1.0, 0.88, 0.78),
+        260.0 * largest * largest,
+        largest * 0.78,
+        (1.0, 0.86, 0.76),
+        role="key",
+        size_y=largest * 1.20,
+        spread=math.radians(115.0),
     )
     add_area_light(
         setup,
         "Fill Light (Cool Softbox)",
-        center + Vector((largest * 1.35, -largest * 0.75, largest * 0.65)),
+        captured_center + Vector((largest * 1.35, -largest * 0.95, largest * 0.75)),
         light_target,
-        90.0 * largest * largest,
-        largest * 1.75,
-        (0.58, 0.72, 1.0),
+        48.0 * largest * largest,
+        largest * 1.50,
+        (0.75, 0.82, 1.0),
+        role="fill",
+        size_y=largest * 1.85,
+        spread=math.radians(125.0),
     )
     add_area_light(
         setup,
-        "Rim Light",
-        center + Vector((largest * 0.75, largest * 1.15, largest * 1.55)),
-        center + Vector((0.0, 0.0, size.z * 0.22)),
-        300.0 * largest * largest,
-        largest * 0.90,
-        (0.62, 0.78, 1.0),
+        "Rim Light (Cool Strip)",
+        captured_center + Vector((largest * 0.85, largest * 0.95, largest * 1.35)),
+        captured_center + Vector((0.0, 0.0, captured_size.z * 0.20)),
+        82.0 * largest * largest,
+        largest * 0.28,
+        (0.65, 0.78, 1.0),
+        role="rim",
+        size_y=largest * 1.25,
+        spread=math.radians(85.0),
     )
-    create_studio_backdrop(setup, center, size, largest)
+    create_studio_backdrop(setup, center, size, largest, ground_plane_z)
     bpy.context.view_layer.update()
 
 
@@ -1223,14 +1319,17 @@ def write_embedded_readme() -> None:
         "and the frames between them blend smoothly. The file opens at frame 100.\n"
         "- The armature uses Blender's compact Stick display. Camera/light icons, grid, "
         "axes and relationship lines are hidden as viewport overlays, not disabled.\n"
-        "- Press Numpad 0 for the generated camera and F12 to render.\n"
+        "- Press Numpad 0 for the generated camera and F12 to render. With the "
+        "XivBlend Blender add-on installed, open the N sidebar and use XivBlend > "
+        "Render Studio to fit the camera to the current pose or whole animation, then "
+        "press Render Portrait.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
         "Scene Setup collection and can be hidden or replaced without touching the character.\n"
         "- Native glTF rest/bind axes are preserved. For an FBX round trip, choose Primary "
         "Bone Axis X and Secondary Bone Axis Y at the FBX import/export boundary; do not "
         "remap this Blender armature in place.\n"
         "- When the XivBlend Animation Browser add-on is installed, open the sidebar "
-        "with N and use XivBlend > Animations to search by the in-game emote icons.\n"
+        "with N and use XivBlend > Player Emotes to search by the in-game emote icons.\n"
         "- Animation clips are prepared on demand in XivBlend's shared local cache. The "
         "catalog, game icons and game animation assets are not embedded in this file; only "
         "an action you explicitly load is added to the character.\n"
@@ -1629,6 +1728,8 @@ def validate_scene_setup(
     scene = bpy.context.scene
     setup = collections["setup"]
     problems: list[str] = []
+    _, validation_size, _ = character_bounds_across_frames(scene, meshes)
+    validation_largest = max(max(validation_size), 0.1)
 
     if setup.name != SETUP_COLLECTION or not any(
         child == setup for child in scene.collection.children
@@ -1650,8 +1751,13 @@ def validate_scene_setup(
         or camera.hide_render
         or camera.hide_viewport
         or camera.data.type != "PERSP"
+        or not approximately_equal(camera.data.lens, 70.0)
+        or camera.data.sensor_fit != "HORIZONTAL"
+        or camera.data.dof.use_dof
+        or camera.parent is not None
+        or len(camera.constraints) != 0
     ):
-        problems.append("the active studio camera is disabled or not perspective")
+        problems.append("the active studio camera is disabled or its portrait settings changed")
 
     studio_lights = [
         obj
@@ -1660,16 +1766,59 @@ def validate_scene_setup(
     ]
     if len(studio_lights) != 3:
         problems.append(f"expected 3 studio lights, found {len(studio_lights)}")
+    expected_lights = {
+        "key": (
+            260.0, 0.78, 1.20, (1.0, 0.86, 0.76), math.radians(115.0)
+        ),
+        "fill": (
+            48.0, 1.50, 1.85, (0.75, 0.82, 1.0), math.radians(125.0)
+        ),
+        "rim": (
+            82.0, 0.28, 1.25, (0.65, 0.78, 1.0), math.radians(85.0)
+        ),
+    }
+    if {
+        str(light.get("xivblend_studio_role", "")) for light in studio_lights
+    } != set(expected_lights):
+        problems.append("the expected key, fill and rim lights were not found")
     for light in studio_lights:
+        role = str(light.get("xivblend_studio_role", ""))
+        expected = expected_lights.get(role)
+        exact_settings_valid = False
+        if expected is not None and light.type == "LIGHT":
+            energy_scale, size_scale, size_y_scale, color, spread = expected
+            expected_energy = energy_scale * validation_largest * validation_largest
+            energy_tolerance = max(1.0e-5, expected_energy * 1.0e-5)
+            exact_settings_valid = (
+                approximately_equal(
+                    light.data.energy, expected_energy, energy_tolerance
+                )
+                and approximately_equal(
+                    light.data.size, size_scale * validation_largest
+                )
+                and approximately_equal(
+                    light.data.size_y, size_y_scale * validation_largest
+                )
+                and approximately_equal(light.data.spread, spread)
+                and all(
+                    approximately_equal(actual, wanted)
+                    for actual, wanted in zip(light.data.color, color)
+                )
+                and light.data.normalize
+                and light.data.use_shadow
+            )
         if (
             light.type != "LIGHT"
             or light.data.type != "AREA"
             or light.hide_render
             or light.hide_viewport
             or light.data.energy <= 0.0
+            or light.data.shape != "RECTANGLE"
             or light.data.size <= 0.0
+            or light.data.size_y <= 0.0
+            or not exact_settings_valid
         ):
-            problems.append(f"studio light {light.name} is disabled or not a usable AREA light")
+            problems.append(f"studio light {light.name} is disabled or its softbox settings changed")
 
     studio_backdrops = [
         obj
@@ -1680,27 +1829,73 @@ def validate_scene_setup(
         problems.append(f"expected 1 studio backdrop, found {len(studio_backdrops)}")
     else:
         backdrop = studio_backdrops[0]
+        material = (
+            backdrop.material_slots[0].material
+            if backdrop.type == "MESH"
+            and len(backdrop.material_slots) > 0
+            else None
+        )
+        node_types = (
+            {node.type for node in material.node_tree.nodes}
+            if material is not None and material.node_tree is not None
+            else set()
+        )
+        required_node_types = {
+            "BSDF_PRINCIPLED",
+            "EMISSION",
+            "MIX_SHADER",
+            "OUTPUT_MATERIAL",
+            "TEX_COORD",
+            "SEPXYZ",
+            "VALTORGB",
+            "MAP_RANGE",
+        }
+        has_surface_output = bool(
+            material is not None
+            and material.node_tree is not None
+            and any(
+                node.type == "OUTPUT_MATERIAL"
+                and node.inputs.get("Surface") is not None
+                and bool(node.inputs["Surface"].links)
+                for node in material.node_tree.nodes
+            )
+        )
         if (
             backdrop.type != "MESH"
             or backdrop.hide_render
             or backdrop.hide_viewport
-            or len(backdrop.data.polygons) == 0
+            or len(backdrop.data.polygons) < 500
             or len(backdrop.material_slots) == 0
             or any(slot.material is None for slot in backdrop.material_slots)
+            or not required_node_types.issubset(node_types)
+            or not has_surface_output
         ):
             problems.append("the studio backdrop is disabled or incomplete")
 
     expected_render_settings = (
         scene.render.engine == "BLENDER_EEVEE"
-        and scene.render.resolution_x == 1080
-        and scene.render.resolution_y == 1350
+        and scene.render.resolution_x == 1440
+        and scene.render.resolution_y == 1800
         and scene.render.resolution_percentage == 100
         and scene.render.image_settings.file_format == "PNG"
-        and scene.render.image_settings.color_mode == "RGBA"
-        and scene.render.image_settings.color_depth == "8"
+        and scene.render.image_settings.color_mode == "RGB"
+        and scene.render.image_settings.color_depth == "16"
         and not scene.render.film_transparent
         and scene.view_settings.view_transform == "AgX"
         and scene.view_settings.look == "AgX - Medium High Contrast"
+        and approximately_equal(scene.view_settings.exposure, -0.55)
+        and scene.eevee.taa_render_samples == 96
+        and scene.eevee.shadow_pool_size == "512"
+        and scene.eevee.shadow_ray_count == 3
+        and not scene.eevee.use_raytracing
+        and scene.eevee.ray_tracing_method == "SCREEN"
+        and scene.eevee.use_fast_gi
+        and scene.eevee.fast_gi_method == "AMBIENT_OCCLUSION_ONLY"
+        and approximately_equal(scene.eevee.fast_gi_quality, 0.75)
+        and approximately_equal(
+            scene.eevee.fast_gi_distance,
+            max(validation_largest * 0.10, 0.05),
+        )
     )
     if not expected_render_settings:
         problems.append("portrait render or AgX color-management settings changed")
@@ -1718,10 +1913,10 @@ def validate_scene_setup(
             approximately_equal(actual, expected)
             for actual, expected in zip(
                 background.inputs["Color"].default_value,
-                (0.018, 0.024, 0.038, 1.0),
+                (0.004, 0.007, 0.014, 1.0),
             )
         )
-        or not approximately_equal(background.inputs["Strength"].default_value, 0.18)
+        or not approximately_equal(background.inputs["Strength"].default_value, 0.035)
     ):
         problems.append("the neutral studio world is missing or changed")
 
@@ -1731,7 +1926,7 @@ def validate_scene_setup(
     if camera is not None and camera.type == "CAMERA":
         projected_across_frames = []
         try:
-            for frame in POSE_SAMPLE_FRAMES:
+            for frame in STUDIO_CAMERA_SAMPLE_FRAMES:
                 set_scene_frame(scene, frame)
                 _, _, bounds = character_bounds(meshes)
                 projected = [
@@ -1769,7 +1964,7 @@ def validate_scene_setup(
                 ):
                     problems.append(
                         "the studio camera does not frame all visible character "
-                        f"bounds at pose-slider frame {frame}"
+                        f"bounds at default render frame {frame}"
                     )
         finally:
             set_scene_frame(scene, POSE_CAPTURED_FRAME)
@@ -1794,7 +1989,7 @@ def validate_scene_setup(
         "CameraFrameMinimum": [round(value, 6) for value in frame_min or []],
         "CameraFrameMaximum": [round(value, 6) for value in frame_max or []],
         "CameraFramingSamples": frame_reports,
-        "CameraFramingFrames": list(POSE_SAMPLE_FRAMES),
+        "CameraFramingFrames": list(STUDIO_CAMERA_SAMPLE_FRAMES),
         "RenderEngine": scene.render.engine,
     }
 

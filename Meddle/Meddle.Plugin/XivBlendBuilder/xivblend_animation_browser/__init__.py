@@ -1,4 +1,4 @@
-"""XivBlend's lightweight, on-demand animation browser for Blender.
+"""XivBlend's lightweight animation browser and portrait tools for Blender.
 
 The add-on intentionally contains no FFXIV assets.  It reads a local catalog
 created by the XivBlend Dalamud plugin and asks that plugin to build a missing
@@ -9,10 +9,10 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 1, 1),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > XivBlend",
-    "description": "Browse and play locally extracted FFXIV player emotes",
+    "description": "Browse FFXIV player emotes and frame portrait renders",
     "category": "Animation",
 }
 
@@ -27,6 +27,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import IntProperty, StringProperty
 from bpy.types import Menu, Operator, Panel
+from mathutils import Matrix, Vector
 
 try:
     import bpy.utils.previews as _previews
@@ -44,6 +45,13 @@ TRANSIENT_PROPERTY = "xivblend_runtime_animation"
 SOURCE_CLIP_PROPERTY = "xivblend_source_clip"
 CAPTURED_ACTION_PREFIX = "XivBlend | A-Pose to Captured Pose"
 CAPTURED_MARKER = "CAPTURED POSE"
+STUDIO_COMPONENT_PROPERTY = "xivblend_component"
+STUDIO_CAMERA_COMPONENT = "studio_camera"
+CUSTOM_BONE_SHAPE_PROPERTY = "xivblend_custom_bone_shape"
+SCENE_SETUP_COLLECTION = "Scene Setup"
+CHARACTER_COLLECTION = "FFXIV Character"
+CHARACTER_MESH_COMPONENT = "Meshes"
+MAX_CAMERA_ACTION_SAMPLES = 96
 
 _catalog = None
 _catalog_signature = None
@@ -55,6 +63,7 @@ _scene_settings = {}
 _runtime_sessions = {}
 _save_sessions = []
 _status = "Ready"
+_render_status = "Fit the camera to the current pose or the whole active animation."
 
 
 class CatalogError(RuntimeError):
@@ -315,11 +324,13 @@ def _armature_from_object(obj):
 def _target_armature(context, kind="Body"):
     active = _armature_from_object(getattr(context, "active_object", None))
     armatures = sorted(
-        (obj for obj in bpy.data.objects if obj.type == "ARMATURE"),
+        (obj for obj in context.scene.objects if obj.type == "ARMATURE"),
         key=lambda obj: obj.name.casefold(),
     )
     if not armatures:
         return None
+    if active not in armatures:
+        active = None
     keys = ("xivblend_face_skeleton", "XivBlendFaceSkeleton") if str(kind).casefold() == "face" else (
         "xivblend_race_code", "XivBlendRaceCode"
     )
@@ -999,6 +1010,312 @@ def _wrap_lines(text, width=48):
     return lines or [""]
 
 
+def _set_render_status(message):
+    global _render_status
+    _render_status = str(message)
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is not None:
+        try:
+            window_manager.xivblend_render_status = _render_status
+        except Exception:
+            pass
+    _redraw()
+
+
+def _is_playback_running():
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return False
+    return any(
+        window.screen is not None and getattr(window.screen, "is_animation_playing", False)
+        for window in window_manager.windows
+    )
+
+
+def _collection_contains_object(collection, obj):
+    try:
+        return obj.name in collection.all_objects
+    except (AttributeError, ReferenceError, RuntimeError):
+        return False
+
+
+def _object_in_named_collection(obj, collection_name):
+    return any(
+        collection.name == collection_name and _collection_contains_object(collection, obj)
+        for collection in bpy.data.collections
+    )
+
+
+def _custom_shape_objects():
+    result = set()
+    for armature in bpy.data.objects:
+        if armature.type != "ARMATURE" or armature.pose is None:
+            continue
+        for pose_bone in armature.pose.bones:
+            shape = pose_bone.custom_shape
+            if shape is not None:
+                result.add(shape)
+    return result
+
+
+def _object_hidden(context, obj):
+    if obj.hide_render or obj.hide_viewport:
+        return True
+    try:
+        if obj.hide_get(view_layer=context.view_layer):
+            return True
+    except (AttributeError, RuntimeError, TypeError):
+        try:
+            if obj.hide_get():
+                return True
+        except (AttributeError, RuntimeError):
+            pass
+    try:
+        if not obj.visible_get(view_layer=context.view_layer):
+            return True
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    # A Blender object can be linked through more than one collection. It is
+    # still visible when at least one collection path is visible, so a hidden
+    # secondary collection must not exclude it from character framing.
+    collections = list(obj.users_collection)
+    return bool(collections) and all(
+        collection.hide_render or collection.hide_viewport
+        for collection in collections
+    )
+
+
+def _mesh_uses_armature(obj, target):
+    if target is None:
+        return False
+    parent = obj.parent
+    while parent is not None:
+        if parent == target:
+            return True
+        parent = parent.parent
+    try:
+        if obj.find_armature() == target:
+            return True
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
+    return any(
+        modifier.type == "ARMATURE" and modifier.object == target
+        for modifier in obj.modifiers
+    )
+
+
+def _character_meshes(context, target):
+    """Return visible character meshes, never render-rig or studio helpers."""
+    custom_shapes = _custom_shape_objects()
+    candidates = []
+    associated = []
+    for obj in context.scene.objects:
+        if obj.type != "MESH" or obj in custom_shapes:
+            continue
+        if bool(obj.get(CUSTOM_BONE_SHAPE_PROPERTY, False)):
+            continue
+        if str(obj.get(STUDIO_COMPONENT_PROPERTY, "")).startswith("studio_"):
+            continue
+        if _object_in_named_collection(obj, SCENE_SETUP_COLLECTION):
+            continue
+        if _object_hidden(context, obj):
+            continue
+        try:
+            if len(obj.data.polygons) == 0 or not obj.bound_box:
+                continue
+        except (AttributeError, ReferenceError):
+            continue
+        candidates.append(obj)
+        component = str(obj.get("clean_extract_component", ""))
+        if (
+            component == CHARACTER_MESH_COMPONENT
+            or _mesh_uses_armature(obj, target)
+            or _object_in_named_collection(obj, CHARACTER_COLLECTION)
+        ):
+            associated.append(obj)
+
+    # Older XivBlend exports did not have all of today's organization tags. A
+    # conservative fallback still makes their portrait camera usable while the
+    # studio setup and hidden helpers remain excluded above.
+    return associated if associated else candidates
+
+
+def _evaluated_bound_points(context, meshes):
+    context.view_layer.update()
+    depsgraph = context.evaluated_depsgraph_get()
+    depsgraph.update()
+    points = []
+    for obj in meshes:
+        try:
+            evaluated = obj.evaluated_get(depsgraph)
+            matrix = evaluated.matrix_world
+            for corner in evaluated.bound_box:
+                point = matrix @ Vector(corner)
+                if all(math.isfinite(float(value)) for value in point):
+                    points.append(point)
+        except (AttributeError, ReferenceError, RuntimeError, ValueError):
+            continue
+    if not points:
+        raise ClipError("No visible evaluated character geometry was found to frame")
+    return points
+
+
+def _set_fractional_frame(scene, value):
+    frame = math.floor(float(value))
+    scene.frame_set(frame, subframe=float(value) - frame)
+
+
+def _points_across_frames(context, meshes, frames):
+    scene = context.scene
+    original_frame = int(scene.frame_current)
+    original_subframe = float(scene.frame_subframe)
+    points = []
+    try:
+        for frame in frames:
+            _set_fractional_frame(scene, frame)
+            points.extend(_evaluated_bound_points(context, meshes))
+    finally:
+        scene.frame_set(original_frame, subframe=original_subframe)
+        context.view_layer.update()
+    return points
+
+
+def _sample_action_frames(action, current_frame):
+    try:
+        start, end = (float(value) for value in action.frame_range)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ClipError(f"Action '{action.name}' has no usable frame range") from error
+    if not (math.isfinite(start) and math.isfinite(end)):
+        raise ClipError(f"Action '{action.name}' has an invalid frame range")
+    if end < start:
+        start, end = end, start
+    span = end - start
+    if span <= 1.0e-6:
+        return [start]
+    count = min(MAX_CAMERA_ACTION_SAMPLES, max(2, int(math.ceil(span)) + 1))
+    frames = [start + span * index / (count - 1) for index in range(count)]
+    if start <= current_frame <= end:
+        frames.append(float(current_frame))
+    return sorted({round(frame, 6) for frame in frames})
+
+
+def _camera_is_safe_to_fit(camera):
+    return (
+        camera is not None
+        and camera.type == "CAMERA"
+        and camera.data is not None
+        and camera.data.type == "PERSP"
+        and len(camera.constraints) == 0
+    )
+
+
+def _render_camera(scene):
+    current = scene.camera
+    if _camera_is_safe_to_fit(current):
+        return current
+    tagged = sorted(
+        (
+            obj for obj in scene.objects
+            if obj.type == "CAMERA"
+            and obj.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_CAMERA_COMPONENT
+            and _camera_is_safe_to_fit(obj)
+        ),
+        key=lambda obj: obj.name.casefold(),
+    )
+    if tagged:
+        return tagged[0]
+    if current is not None and current.type == "CAMERA":
+        if current.data.type != "PERSP":
+            raise ClipError("The active camera is not perspective, and no XivBlend studio camera was found")
+        if current.constraints:
+            raise ClipError("The active camera is constrained, and no free XivBlend studio camera was found")
+    raise ClipError("No portrait camera was found in this scene")
+
+
+def _camera_frame_slopes(scene, camera):
+    try:
+        frame = camera.data.view_frame(scene=scene)
+        projected = [
+            (float(corner.x) / -float(corner.z), float(corner.y) / -float(corner.z))
+            for corner in frame
+            if -float(corner.z) > 1.0e-8
+        ]
+    except (AttributeError, RuntimeError, TypeError, ZeroDivisionError) as error:
+        raise ClipError(f"Could not read camera '{camera.name}' framing: {error}") from error
+    if not projected:
+        raise ClipError(f"Camera '{camera.name}' has no usable perspective frame")
+    left = min(point[0] for point in projected)
+    right = max(point[0] for point in projected)
+    bottom = min(point[1] for point in projected)
+    top = max(point[1] for point in projected)
+    if not (left < 0.0 < right and bottom < 0.0 < top):
+        raise ClipError(f"Camera '{camera.name}' has an unsupported lens shift")
+    return max(min(-left, right), 1.0e-4), max(min(-bottom, top), 1.0e-4)
+
+
+def _fit_camera_to_points(scene, camera, points, margin=1.12):
+    if not points:
+        raise ClipError("No character bounds were supplied to the camera fitter")
+    minimum = Vector(tuple(min(point[axis] for point in points) for axis in range(3)))
+    maximum = Vector(tuple(max(point[axis] for point in points) for axis in range(3)))
+    size = maximum - minimum
+    target = (minimum + maximum) * 0.5 + Vector((0.0, 0.0, size.z * 0.02))
+    tan_half_x, tan_half_y = _camera_frame_slopes(scene, camera)
+    distance = max(
+        max(
+            abs(point.x - target.x) * margin / tan_half_x - (point.y - target.y),
+            abs(point.z - target.z) * margin / tan_half_y - (point.y - target.y),
+        )
+        for point in points
+    )
+    extent = max(max(size), 0.1)
+    distance = max(distance, extent * 0.75, 0.1)
+    position = target + Vector((0.0, -distance, 0.0))
+    rotation = (target - position).to_track_quat("-Z", "Y")
+    scale = camera.matrix_world.to_scale()
+    camera.matrix_world = Matrix.LocRotScale(position, rotation, scale)
+
+    depths = [distance + (point.y - target.y) for point in points]
+    closest = max(min(depths), 1.0e-3)
+    farthest = max(depths)
+    camera.data.clip_start = max(min(closest * 0.05, distance / 100.0), 0.001)
+    camera.data.clip_end = max(farthest + extent * 10.0, 100.0)
+    scene.camera = camera
+    return distance
+
+
+def _fit_character_camera(context, sample_action):
+    target = _target_armature(context)
+    if target is None:
+        raise ClipError("No character armature was found in this scene")
+    camera = _render_camera(context.scene)
+    meshes = _character_meshes(context, target)
+    if not meshes:
+        raise ClipError("No visible character meshes were found to frame")
+
+    if not sample_action:
+        points = _evaluated_bound_points(context, meshes)
+        sample_count = 1
+        action_name = "current pose"
+    else:
+        animation_data = target.animation_data
+        action = animation_data.action if animation_data is not None else None
+        if action is None:
+            raise ClipError(f"Armature '{target.name}' has no active Action")
+        current_frame = float(context.scene.frame_current) + float(context.scene.frame_subframe)
+        frames = _sample_action_frames(action, current_frame)
+        points = _points_across_frames(context, meshes, frames)
+        sample_count = len(frames)
+        action_name = action.name
+
+    lens = float(camera.data.lens)
+    _fit_camera_to_points(context.scene, camera, points)
+    # Camera fitting changes only world transform and clipping distances. Keep
+    # the portrait lens exactly as the artist/exporter configured it.
+    camera.data.lens = lens
+    return camera, action_name, sample_count
+
+
 def _reset_page(_self, context):
     try:
         context.scene.xivblend_animation_page = 0
@@ -1126,6 +1443,87 @@ class XIVBLEND_OT_restore_captured_pose(Operator):
         return {"FINISHED"}
 
 
+def _execute_camera_fit(operator, context, sample_action):
+    was_playing = _is_playback_running()
+    if was_playing:
+        _stop_playback()
+    try:
+        camera, subject, sample_count = _fit_character_camera(context, sample_action)
+    except Exception as error:
+        message = str(error)
+        _set_render_status(message)
+        operator.report({"ERROR"}, message)
+        return {"CANCELLED"}
+    finally:
+        if was_playing:
+            _start_playback()
+
+    if sample_action:
+        message = f"Camera fitted to {sample_count} samples of {subject}"
+    else:
+        message = f"Camera fitted to the current pose at frame {context.scene.frame_current}"
+    _set_render_status(message)
+    operator.report({"INFO"}, f"{message}; {camera.data.lens:g} mm lens preserved")
+    return {"FINISHED"}
+
+
+class XIVBLEND_OT_fit_camera_current_pose(Operator):
+    bl_idname = "xivblend.fit_camera_current_pose"
+    bl_label = "Fit Camera to Current Pose"
+    bl_description = (
+        "Reposition the portrait camera around the character's evaluated pose at the current frame; "
+        "the camera lens and current frame are preserved"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        return _execute_camera_fit(self, context, sample_action=False)
+
+
+class XIVBLEND_OT_fit_camera_active_action(Operator):
+    bl_idname = "xivblend.fit_camera_active_action"
+    bl_label = "Fit Camera to Whole Animation"
+    bl_description = (
+        "Sample the active character Action and fit every sampled pose inside the portrait frame; "
+        "the camera lens, current frame, and playback state are preserved"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        return _execute_camera_fit(self, context, sample_action=True)
+
+
+class XIVBLEND_OT_render_portrait(Operator):
+    bl_idname = "xivblend.render_portrait"
+    bl_label = "Render Portrait"
+    bl_description = "Render the current frame without saving the image or the .blend file automatically"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        try:
+            camera = _render_camera(context.scene)
+            context.scene.camera = camera
+            _set_render_status(f"Opening render for frame {context.scene.frame_current} with {camera.name}…")
+            result = bpy.ops.render.render(
+                "INVOKE_DEFAULT",
+                animation=False,
+                write_still=False,
+                use_viewport=False,
+            )
+            if "CANCELLED" in result:
+                _set_render_status("Render canceled")
+                return {"CANCELLED"}
+            _set_render_status(
+                f"Render opened for frame {context.scene.frame_current} with {camera.name}"
+            )
+            return {"FINISHED"}
+        except Exception as error:
+            message = str(error)
+            _set_render_status(message)
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+
 class XIVBLEND_PT_animation_browser(Panel):
     bl_idname = "XIVBLEND_PT_animation_browser"
     bl_label = "Player Emotes"
@@ -1192,6 +1590,64 @@ class XIVBLEND_PT_animation_browser(Panel):
             status_box.label(text=line)
 
 
+class XIVBLEND_PT_render_studio(Panel):
+    bl_idname = "XIVBLEND_PT_render_studio"
+    bl_label = "Render Studio"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "XivBlend"
+
+    def draw(self, context):
+        layout = self.layout
+        target = _target_armature(context)
+        try:
+            camera = _render_camera(context.scene)
+            camera_error = ""
+        except Exception as error:
+            camera = None
+            camera_error = str(error)
+
+        header = layout.row()
+        header.label(
+            text=f"Camera: {camera.name}" if camera else "No usable portrait camera",
+            icon="CAMERA_DATA" if camera else "ERROR",
+        )
+
+        pose_row = layout.row()
+        pose_row.enabled = target is not None and camera is not None
+        pose_row.operator(XIVBLEND_OT_fit_camera_current_pose.bl_idname, icon="CAMERA_DATA")
+
+        action = target.animation_data.action if target and target.animation_data else None
+        action_row = layout.row()
+        action_row.enabled = target is not None and camera is not None and action is not None
+        action_row.operator(XIVBLEND_OT_fit_camera_active_action.bl_idname, icon="ACTION")
+
+        render_row = layout.row()
+        render_row.enabled = camera is not None
+        render_row.scale_y = 1.35
+        render_row.operator(XIVBLEND_OT_render_portrait.bl_idname, icon="RENDER_STILL")
+
+        aspect = (
+            context.scene.render.resolution_x * context.scene.render.pixel_aspect_x
+            / max(context.scene.render.resolution_y * context.scene.render.pixel_aspect_y, 1.0e-6)
+        )
+        if abs(aspect - 0.8) <= 0.01:
+            layout.label(text="4:5 portrait output • lens stays unchanged", icon="INFO")
+        else:
+            layout.label(
+                text=(
+                    f"Output: {context.scene.render.resolution_x} × "
+                    f"{context.scene.render.resolution_y} • lens stays unchanged"
+                ),
+                icon="INFO",
+            )
+
+        status = camera_error or getattr(context.window_manager, "xivblend_render_status", "") or _render_status
+        status_box = layout.box()
+        for line in _wrap_lines(status):
+            status_box.label(text=line)
+
+
 @persistent
 def _save_pre_handler(_filepath):
     global _save_sessions
@@ -1252,6 +1708,7 @@ def _load_post_handler(_filepath):
     _catalog_signature = None
     _close_previews()
     _set_status("Ready")
+    _set_render_status("Fit the camera to the current pose or the whole active animation.")
 
 
 _CLASSES = (
@@ -1261,7 +1718,11 @@ _CLASSES = (
     XIVBLEND_OT_change_animation_page,
     XIVBLEND_OT_play_emote,
     XIVBLEND_OT_restore_captured_pose,
+    XIVBLEND_OT_fit_camera_current_pose,
+    XIVBLEND_OT_fit_camera_active_action,
+    XIVBLEND_OT_render_portrait,
     XIVBLEND_PT_animation_browser,
+    XIVBLEND_PT_render_studio,
 )
 
 
@@ -1289,6 +1750,11 @@ def register():
     bpy.types.WindowManager.xivblend_animation_status = StringProperty(
         name="XivBlend animation status",
         default="Ready",
+        options={"SKIP_SAVE"},
+    )
+    bpy.types.WindowManager.xivblend_render_status = StringProperty(
+        name="XivBlend render status",
+        default="Fit the camera to the current pose or the whole active animation.",
         options={"SKIP_SAVE"},
     )
     for handlers, callback in (
@@ -1332,6 +1798,7 @@ def unregister():
         (bpy.types.Scene, "xivblend_animation_category"),
         (bpy.types.Scene, "xivblend_animation_page"),
         (bpy.types.WindowManager, "xivblend_animation_status"),
+        (bpy.types.WindowManager, "xivblend_render_status"),
     ):
         if hasattr(owner, name):
             delattr(owner, name)

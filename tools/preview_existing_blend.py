@@ -36,6 +36,15 @@ def load_builder(path: Path):
 def main() -> None:
     options = arguments()
     builder = load_builder(Path(options.builder).resolve())
+
+    # Replace the generated studio in memory so this tool can preview the
+    # current builder against an older XivBlend file without double-counting
+    # its backdrop in character bounds or stacking duplicate lights/cameras.
+    for obj in list(bpy.data.objects):
+        if obj.get("xivblend_component") in {
+            "studio_camera", "studio_light", "studio_backdrop",
+        }:
+            bpy.data.objects.remove(obj, do_unlink=True)
     objects = list(bpy.data.objects)
 
     hidden = {name.casefold() for name in options.hide}

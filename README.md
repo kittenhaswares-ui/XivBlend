@@ -4,7 +4,7 @@ XivBlend is an experimental Dalamud plugin that exports **your own currently dis
 
 The one-button prototype reads the final live draw object after Glamourer and Penumbra have applied the character's appearance. It exports the body, face, hair, visible equipment and weapons, materials, textures, morphs, skin weights, and deformation rig. Blender is then launched headlessly to build and save the `.blend`.
 
-> **Prototype status:** version 0.0.8 completes the first working live emote path by fixing Blender 5's layered-Action slot binding; version 0.0.7 fixed the preceding PAP signature rejection. The optional browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. Live extraction, GLB generation, Action assignment, animated evaluation, and captured-pose restoration have now been verified on the current c0801 export; broader race, face-rig, and emote coverage remains prototype work.
+> **Prototype status:** version 0.0.9 upgrades every new export with a grounded portrait studio, softer professional lighting, captured-pose framing, and beginner-friendly camera/render controls. The optional browser covers 279 vanilla player emotes and facial expressions in the current validated game data and keeps decoded clips in a shared local cache rather than bloating each `.blend`. Live extraction, GLB generation, Action assignment, animated evaluation, and captured-pose restoration have been verified on the current c0801 export; broader race, face-rig, and emote coverage remains prototype work.
 
 ## What it exports
 
@@ -13,7 +13,7 @@ The one-button prototype reads the final live draw object after Glamourer and Pe
 - Final Penumbra-resolved model, material, and texture data from the live draw object.
 - Glamourer state and Penumbra resource-path diagnostics when their IPC APIs are available.
 - Skeleton, skin weights, morphs, material colorsets, custom character colors, and textures.
-- A Blender 5.x scene with a clean stick rig, organized collections, a portrait camera, removable studio backdrop, three-point lighting, mapped FFXIV materials, packed images, redacted provenance, an embedded build report, and a script-free A-pose/captured-pose Timeline slider.
+- A Blender 5.x scene with a clean stick rig, organized collections, a 1440×1800 portrait camera, grounded seamless backdrop, softbox-style three-point lighting, mapped FFXIV materials, packed images, redacted provenance, an embedded build report, and a script-free A-pose/captured-pose Timeline slider.
 - When explicitly set up, an asset-free Blender sidebar that shows locally extracted game emote icons and requests only the selected vanilla skeletal animation. Combat, weapons, VFX, props, and modded animations are excluded.
 
 XivBlend rejects an export as incomplete when a visible model or material fails, or when Blender cannot verify a mesh bound to the imported armature.
@@ -81,17 +81,19 @@ See [Animation browser workflow, scope, and limitations](docs/ANIMATION_LIBRARY.
 ## Using the generated Blender file
 
 - The file opens on Timeline frame 100, labeled `CAPTURED POSE`. Drag the ordinary Blender Timeline to frame 0, labeled `XIV A-POSE`, for the rig's standard rest A-pose; frames between them blend linearly. This control is stored as normal keyframes and requires no add-on, embedded script, or trusted-script permission.
+- New exports open with the portrait camera fitted to the actual captured pose rather than artificial frames between the A-pose and capture. The character stands on the sweep instead of floating above it, and the dense navy backdrop, warm rectangular key, broad cool fill, restrained cool rim, 96-sample Eevee preset, and 16-bit PNG output are ready for a clean still render.
+- With animation-browser version 0.2.0 installed, open the 3D View's `N` sidebar and expand **XivBlend** → **Render Studio**. **Fit Camera to Current Pose** gives the strongest composition for one frame; **Fit Camera to Whole Animation** measures up to 96 evenly spaced poses across the active clip to keep its motion inside the shot; **Render Portrait** opens Blender's ordinary render view. Camera fitting does not change the lens, animation, or current frame.
 - The apparent blocky rig in earlier exports was caused by glTF-imported Icosphere custom bone shapes overriding Blender's `STICK` display. New files disable those widgets and show the clean stick armature by default.
 - Viewport grid, coordinate axes, relationship lines, camera, and light helpers are hidden by default. The camera and three studio lights remain active for F12 renders.
 - Native glTF rest matrices, bind transforms, and bone axes are preserved; the pose slider does not remap the rig. For an FBX round trip, use Primary Bone Axis `X` and Secondary Bone Axis `Y` at the FBX export/import boundary only.
-- Existing `.blend` files are not retroactively changed. Export again with 0.0.6 or newer to receive the rig metadata required by the animation browser.
+- Existing `.blend` files are not retroactively relit. Export again with 0.0.9 or newer to receive the upgraded studio. The 0.2.0 camera/render controls also work on compatible older XivBlend files after reinstalling the Blender panel.
 
 ## Verified so far
 
 - The Dalamud API 15 / .NET 10 release build completes with zero warnings and errors.
 - The Blender worker and pinned MeddleTools assets are embedded inside the plugin DLL and extract without path traversal or embedded Python bytecode/cache artifacts.
 - Blender 5.0 imports and reopens a rigged body-and-clothing fixture.
-- The reopened scene retains its armature, bound body/clothes meshes, mapped materials, packed textures, portrait camera, render-active studio lights/backdrop, redacted provenance, embedded build report, clean viewport defaults, and the frame 0-to-100 pose slider.
+- The reopened scene retains its armature, bound body/clothes meshes, mapped materials, packed textures, captured-pose portrait camera, render-active grounded studio lights/backdrop, redacted provenance, embedded build report, clean viewport defaults, and the frame 0-to-100 pose slider.
 - The strict current-game catalog filter resolves 279 primary player-emote/expression entries (150 General, 100 Special, and 29 Expressions) while excluding weapon timelines, non-player timelines, and commandless internal/event variants.
 - The animation catalog, icons, request queue, and decoded clips are versioned outside character files; the plugin and Blender add-on contain no bundled FFXIV assets.
 - The Windows x64 release package carries the plugin dependencies and visible AGPL license/notice files.

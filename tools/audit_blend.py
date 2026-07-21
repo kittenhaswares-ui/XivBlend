@@ -41,8 +41,9 @@ STUDIO_BACKDROP_TAG = "studio_backdrop"
 COMPONENT_PROPERTY = "xivblend_component"
 
 EXPECTED_STUDIO_LIGHTS = 3
-EXPECTED_RESOLUTION = (1080, 1350, 100)
+EXPECTED_RESOLUTION = (1440, 1800, 100)
 EXPECTED_POSE_FRAMES = (0, 25, 50, 75, 100)
+EXPECTED_CAMERA_FRAMING_FRAMES = (100,)
 EXPECTED_FRAME_RANGE = (0, 100)
 EXPECTED_TIMELINE_MARKERS = (
     ("XIV A-POSE", 0),
@@ -652,13 +653,13 @@ def audit_studio(
         },
         "color_mode": {
             "actual": image_settings.color_mode,
-            "expected": "RGBA",
-            "valid": image_settings.color_mode == "RGBA",
+            "expected": "RGB",
+            "valid": image_settings.color_mode == "RGB",
         },
         "color_depth": {
             "actual": image_settings.color_depth,
-            "expected": "8",
-            "valid": image_settings.color_depth == "8",
+            "expected": "16",
+            "valid": image_settings.color_depth == "16",
         },
         "film_transparent": {
             "actual": render.film_transparent,
@@ -677,8 +678,8 @@ def audit_studio(
         },
         "exposure": {
             "actual": scene.view_settings.exposure,
-            "expected": -0.35,
-            "valid": abs(scene.view_settings.exposure - (-0.35)) <= FLOAT_EPSILON,
+            "expected": -0.55,
+            "valid": abs(scene.view_settings.exposure - (-0.55)) <= FLOAT_EPSILON,
         },
         "gamma": {
             "actual": scene.view_settings.gamma,
@@ -732,6 +733,9 @@ def audit_studio(
                 "in_setup_collection": obj in setup_objects,
                 "enabled": not obj.hide_render,
                 "energy": obj.data.energy if obj.type == "LIGHT" else None,
+                "shape": obj.data.shape if obj.type == "LIGHT" else None,
+                "size": obj.data.size if obj.type == "LIGHT" else None,
+                "size_y": obj.data.size_y if obj.type == "LIGHT" else None,
             }
             for obj in tagged_lights
         ],
@@ -743,6 +747,7 @@ def audit_studio(
                 "in_setup_collection": obj in setup_objects,
                 "enabled": not obj.hide_render,
                 "material_slots": len(obj.material_slots) if obj.type == "MESH" else 0,
+                "polygons": len(obj.data.polygons) if obj.type == "MESH" else 0,
             }
             for obj in tagged_backdrops
         ],
@@ -1038,6 +1043,11 @@ def main() -> int:
             or not light["enabled"]
             or light["energy"] is None
             or light["energy"] <= 0
+            or light["shape"] != "RECTANGLE"
+            or light["size"] is None
+            or light["size"] <= 0
+            or light["size_y"] is None
+            or light["size_y"] <= 0
         ],
     )
     tagged_light_names = {light["name"] for light in tagged_lights}
@@ -1059,6 +1069,7 @@ def main() -> int:
         append_issue(issues, "studio_backdrop_not_in_setup_collection", not backdrop["in_setup_collection"])
         append_issue(issues, "studio_backdrop_disabled", not backdrop["enabled"])
         append_issue(issues, "studio_backdrop_has_no_material", backdrop["material_slots"] == 0)
+        append_issue(issues, "studio_backdrop_too_coarse", backdrop["polygons"] < 500)
 
     append_issue(
         issues,
@@ -1076,11 +1087,12 @@ def main() -> int:
     )
     append_issue(
         issues,
-        "character_outside_camera_frame_at_pose_frames",
+        "character_outside_camera_frame_at_default_frames",
         {
             frame: framing
             for frame, framing in studio["framing_by_frame"].items()
-            if not framing.get("all_bounds_in_frame", False)
+            if int(frame) in EXPECTED_CAMERA_FRAMING_FRAMES
+            and not framing.get("all_bounds_in_frame", False)
         },
     )
 
