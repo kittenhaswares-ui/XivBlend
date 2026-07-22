@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.14 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
+XivBlend 0.0.15 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
 
 ## Scope
 
@@ -49,7 +49,7 @@ The filter is data-driven, so a future game update can change the count without 
 
 ## Set up and use
 
-1. Install XivBlend 0.0.14 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.15 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both status messages to finish.
 4. Export a character with race and face-skeleton metadata, then restart Blender if it was already open.
@@ -76,15 +76,17 @@ The importer has conservative PAP size, cumulative-import, animation-count, dura
 
 ## Render Studio controls
 
-Animation-browser 0.6.0 also provides **XivBlend** → **Render Studio**:
+Animation-browser 0.7.0 also provides **XivBlend** → **Render Studio**:
 
-- **Smooth Animation** temporarily presents the active View Layer through one restrained shared material for responsive posing and motion review.
-- **Full Detail** restores the original materials and viewport settings exactly.
+- **Animate** switches the 3D View to Blender's lightweight Solid shading without replacing any character material.
+- **Preview** uses Eevee, the real materials, and the exported studio lights for quick shaded checks.
+- **Beauty** uses Cycles with adaptive sampling, denoising, and the user's configured Cycles device for final stills.
+- Background presets provide the repeatable charcoal sweep, neutral gray, or transparency. Color presets provide AgX beauty color or Khronos PBR Neutral for more literal mod colors.
 - **Fit Camera to Current Pose** frames the current Timeline frame.
 - **Fit Camera to Whole Animation** measures up to 96 evenly spaced poses across the active bundle.
 - **Render Portrait** opens Blender's normal render view with the scene's existing output settings.
 
-Rendering or saving while Smooth Animation is active first restores Full Detail. The preview resumes afterward, while the lightweight material and runtime animation/effect data remain absent from the saved `.blend`.
+The retired clay material override is removed automatically if an older file or session still contains it. Runtime animation, prop, and effect data are still removed before saving and restored afterward, so a preview does not silently bloat the character `.blend`.
 
 ## Cache and updates
 
@@ -96,7 +98,7 @@ The shared cache is stored under:
 
 Catalog builds are separated by game version, client language, and converter version. Body cache paths also include the captured face key, and custom cards include a content-derived identity. `current.json` points Blender to the active build. Icons are prepared during setup; bundles and GLBs are generated only when clicked.
 
-The 0.0.14 compatibility line is animation browser 0.6.0, character builder 0.9.0, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
+The 0.0.15 compatibility line is animation browser 0.7.0, character builder 0.10.0, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
 
 - Run **Refresh Game Catalog** after a game update, language change, or custom-source import.
 - Use **Reinstall Blender Panel** when only the add-on needs an update.

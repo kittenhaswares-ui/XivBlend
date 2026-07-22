@@ -26,7 +26,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.9.0"
+BUILDER_VERSION = "0.10.0"
 ANIMATION_CATALOG_SCHEMA = 2
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -915,6 +915,62 @@ def apply_meddle_materials(
             pass
 
 
+def bind_optional_texture_fallbacks(
+    imported: Iterable[bpy.types.Object],
+) -> dict[str, int]:
+    """Bind a transparent pixel to missing optional decal samplers.
+
+    MeddleTools deliberately leaves absent FFXIV decal samplers unassigned.
+    Eevee treats those optional inputs as empty, while Cycles evaluates an
+    unassigned Image Texture as missing/magenta. A transparent fallback keeps
+    both engines visually equivalent without inventing a decal.
+    """
+    materials = {
+        slot.material
+        for obj in imported
+        if obj.type == "MESH"
+        for slot in obj.material_slots
+        if slot.material is not None and slot.material.node_tree is not None
+    }
+    missing = [
+        node
+        for material in materials
+        for node in material.node_tree.nodes
+        if node.type == "TEX_IMAGE"
+        and node.image is None
+        and "decal" in str(node.label).casefold()
+        and any(output.is_linked for output in node.outputs)
+    ]
+    if not missing:
+        report = {"materials": len(materials), "optional_decal_fallbacks": 0}
+        log("optional_texture_fallbacks_bound", **report)
+        return report
+
+    fallback = bpy.data.images.get("XivBlend Transparent Optional Texture")
+    if fallback is None:
+        fallback = bpy.data.images.new(
+            "XivBlend Transparent Optional Texture",
+            width=1,
+            height=1,
+            alpha=True,
+        )
+        fallback.generated_color = (0.0, 0.0, 0.0, 0.0)
+        try:
+            fallback.colorspace_settings.name = "Non-Color"
+        except TypeError:
+            pass
+        fallback["xivblend_component"] = "optional_texture_fallback"
+    for node in missing:
+        node.image = fallback
+
+    report = {
+        "materials": len(materials),
+        "optional_decal_fallbacks": len(missing),
+    }
+    log("optional_texture_fallbacks_bound", **report)
+    return report
+
+
 def source_material_is_known_opaque(material: bpy.types.Material) -> bool:
     """Use Meddle's copied FFXIV flags to identify surfaces that cannot be translucent."""
     return (
@@ -1533,6 +1589,7 @@ def add_area_light(
     size_y: float | None = None,
     spread: float = math.pi,
     use_shadow: bool = True,
+    receiver_collection: bpy.types.Collection | None = None,
 ) -> bpy.types.Object:
     light_data = bpy.data.lights.new(name, type="AREA")
     light_data.energy = energy
@@ -1549,6 +1606,14 @@ def add_area_light(
     point_at(light, target)
     light["xivblend_component"] = "studio_light"
     light["xivblend_studio_role"] = role
+    light_linking = getattr(light, "light_linking", None)
+    if light_linking is not None and receiver_collection is not None:
+        try:
+            light_linking.receiver_collection = receiver_collection
+        except (AttributeError, RuntimeError, TypeError):
+            # Light Linking is a quality improvement, never a reason to reject
+            # an otherwise valid character on an older Blender build.
+            pass
     return light
 
 
@@ -1631,6 +1696,8 @@ def create_studio_backdrop(
         coordinates = nodes.new("ShaderNodeTexCoord")
         separate = nodes.new("ShaderNodeSeparateXYZ")
         color_ramp = nodes.new("ShaderNodeValToRGB")
+        color_ramp.name = "XivBlend Background Gradient"
+        color_ramp.label = "Background Preset Colors"
         color_ramp.color_ramp.interpolation = "EASE"
         color_ramp.color_ramp.elements[0].position = 0.0
         color_ramp.color_ramp.elements[0].color = (0.012, 0.022, 0.048, 1.0)
@@ -1646,13 +1713,19 @@ def create_studio_backdrop(
         transition.inputs["To Max"].default_value = 1.0
         emission = nodes.new("ShaderNodeEmission")
         emission.inputs["Strength"].default_value = 1.0
+        light_path = nodes.new("ShaderNodeLightPath")
+        camera_only = nodes.new("ShaderNodeMath")
+        camera_only.operation = "MULTIPLY"
+        camera_only.label = "Camera-only backdrop glow"
         mix = nodes.new("ShaderNodeMixShader")
         links.new(coordinates.outputs["Generated"], separate.inputs["Vector"])
         links.new(separate.outputs["Z"], color_ramp.inputs["Fac"])
         links.new(separate.outputs["Z"], transition.inputs["Value"])
         links.new(color_ramp.outputs["Color"], principled.inputs["Base Color"])
         links.new(color_ramp.outputs["Color"], emission.inputs["Color"])
-        links.new(transition.outputs["Result"], mix.inputs[0])
+        links.new(transition.outputs["Result"], camera_only.inputs[0])
+        links.new(light_path.outputs["Is Camera Ray"], camera_only.inputs[1])
+        links.new(camera_only.outputs["Value"], mix.inputs[0])
         links.new(principled.outputs["BSDF"], mix.inputs[1])
         links.new(emission.outputs["Emission"], mix.inputs[2])
         if output is not None:
@@ -1671,6 +1744,7 @@ def configure_scene_setup(
     scene: bpy.types.Scene,
     imported: list[bpy.types.Object],
     setup: bpy.types.Collection,
+    character: bpy.types.Collection,
 ) -> None:
     scene.render.engine = "BLENDER_EEVEE"
     scene.render.resolution_x = 1440
@@ -1680,6 +1754,7 @@ def configure_scene_setup(
     scene.render.image_settings.color_mode = "RGB"
     scene.render.image_settings.color_depth = "16"
     scene.render.film_transparent = False
+    scene.render.use_persistent_data = False
     if hasattr(scene, "eevee"):
         scene.eevee.taa_samples = 16
         scene.eevee.taa_render_samples = 96
@@ -1700,6 +1775,34 @@ def configure_scene_setup(
         pass
     scene.view_settings.exposure = -0.40
     scene.view_settings.gamma = 1.0
+    cycles = getattr(scene, "cycles", None)
+    for name, value in (
+        ("samples", 256),
+        ("preview_samples", 32),
+        ("use_denoising", True),
+        ("denoiser", "OPENIMAGEDENOISE"),
+        ("use_preview_denoising", True),
+        ("preview_denoiser", "AUTO"),
+        ("use_adaptive_sampling", True),
+        ("adaptive_threshold", 0.01),
+        ("adaptive_min_samples", 16),
+        ("use_light_tree", True),
+        ("texture_limit", "2048"),
+        ("texture_limit_render", "OFF"),
+        ("max_bounces", 8),
+        ("diffuse_bounces", 4),
+        ("glossy_bounces", 4),
+        ("transmission_bounces", 8),
+        ("transparent_max_bounces", 8),
+        ("volume_bounces", 2),
+        ("caustics_reflective", False),
+        ("caustics_refractive", False),
+    ):
+        if cycles is not None and hasattr(cycles, name):
+            try:
+                setattr(cycles, name, value)
+            except (AttributeError, TypeError, ValueError):
+                pass
 
     world = bpy.data.worlds.new("Neutral World")
     with warnings.catch_warnings():
@@ -1790,9 +1893,9 @@ def configure_scene_setup(
         captured_center
         + Vector((-largest * 1.125, -largest * 1.358, largest * 1.242)),
         light_target,
-        129.0 * largest * largest,
+        116.0 * largest * largest,
         largest * 0.736,
-        (1.0, 0.955, 0.92),
+        (1.0, 0.975, 0.955),
         role="key",
         size_y=largest * 1.056,
         spread=math.radians(115.0),
@@ -1802,7 +1905,7 @@ def configure_scene_setup(
         "Fill Light (Cool Softbox)",
         captured_center + Vector((largest * 1.35, -largest * 0.95, largest * 0.73)),
         light_target,
-        8.2 * largest * largest,
+        7.5 * largest * largest,
         largest * 1.50,
         (0.76, 0.86, 1.0),
         role="fill",
@@ -1815,15 +1918,20 @@ def configure_scene_setup(
         "Rim Light (Cool Strip)",
         captured_center + Vector((largest * 0.846, largest * 0.946, largest * 1.28)),
         captured_center + Vector((0.0, 0.0, captured_size.z * 0.29)),
-        27.8 * largest * largest,
+        24.5 * largest * largest,
         largest * 0.282,
         (0.66, 0.80, 1.0),
         role="rim",
         size_y=largest * 1.248,
         spread=math.radians(85.0),
         use_shadow=False,
+        receiver_collection=character,
     )
     create_studio_backdrop(setup, center, size, largest, ground_plane_z)
+    scene["xivblend_render_quality"] = "PREVIEW"
+    scene["xivblend_background_preset"] = "CHARCOAL"
+    scene["xivblend_color_preset"] = "BEAUTY"
+    scene["xivblend_output_preset"] = "HQ"
     bpy.context.view_layer.update()
 
 
@@ -2038,9 +2146,11 @@ def write_embedded_readme() -> None:
         "XivBlend Blender add-on installed, open the N sidebar and use XivBlend > "
         "Render Studio to fit the camera to the current pose or whole animation, then "
         "press Render Portrait.\n"
-        "- Render Studio > Smooth Animation uses a temporary clay View Layer override "
-        "for responsive playback. Full Detail restores the exact materials; F12 renders "
-        "and saving always remove the preview override automatically.\n"
+        "- Render Studio has three simple modes: Animate uses Blender's fast Solid viewport, "
+        "Preview uses Eevee with the real materials, and Beauty uses Cycles with adaptive "
+        "sampling and denoising. None of these modes replaces character materials.\n"
+        "- Charcoal, neutral gray and transparent background presets make repeatable preview "
+        "images. Beauty Color uses AgX; Accurate Mod Colors uses neutral lights and Khronos PBR.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
         "Scene Setup collection and can be hidden or replaced without touching the character.\n"
         "- Native glTF rest/bind axes are preserved. For an FBX round trip, choose Primary "
@@ -2490,15 +2600,15 @@ def validate_scene_setup(
         problems.append(f"expected 3 studio lights, found {len(studio_lights)}")
     expected_lights = {
         "key": (
-            129.0,
+            116.0,
             0.736,
             1.056,
-            (1.0, 0.955, 0.92),
+            (1.0, 0.975, 0.955),
             math.radians(115.0),
             True,
         ),
         "fill": (
-            8.2,
+            7.5,
             1.50,
             1.855,
             (0.76, 0.86, 1.0),
@@ -2506,7 +2616,7 @@ def validate_scene_setup(
             False,
         ),
         "rim": (
-            27.8,
+            24.5,
             0.282,
             1.248,
             (0.66, 0.80, 1.0),
@@ -2543,6 +2653,15 @@ def validate_scene_setup(
                 )
                 and light.data.normalize
                 and light.data.use_shadow == use_shadow
+                and (
+                    role != "rim"
+                    or getattr(
+                        getattr(light, "light_linking", None),
+                        "receiver_collection",
+                        None,
+                    )
+                    is collections["root"]
+                )
             )
         if (
             light.type != "LIGHT"
@@ -2586,6 +2705,8 @@ def validate_scene_setup(
             "SEPXYZ",
             "VALTORGB",
             "MAP_RANGE",
+            "LIGHT_PATH",
+            "MATH",
         }
         has_surface_output = bool(
             material is not None
@@ -2618,6 +2739,7 @@ def validate_scene_setup(
         and scene.render.image_settings.color_mode == "RGB"
         and scene.render.image_settings.color_depth == "16"
         and not scene.render.film_transparent
+        and not scene.render.use_persistent_data
         and scene.view_settings.view_transform == "AgX"
         and scene.view_settings.look == "AgX - Medium High Contrast"
         and approximately_equal(scene.view_settings.exposure, -0.40)
@@ -2636,6 +2758,24 @@ def validate_scene_setup(
             scene.eevee.fast_gi_distance,
             max(validation_largest * 0.10, 0.05),
         )
+        and scene.cycles.samples == 256
+        and scene.cycles.preview_samples == 32
+        and scene.cycles.use_denoising
+        and scene.cycles.use_preview_denoising
+        and scene.cycles.use_adaptive_sampling
+        and approximately_equal(scene.cycles.adaptive_threshold, 0.01)
+        and scene.cycles.adaptive_min_samples == 16
+        and scene.cycles.use_light_tree
+        and scene.cycles.texture_limit == "2048"
+        and scene.cycles.texture_limit_render == "OFF"
+        and scene.cycles.max_bounces == 8
+        and scene.cycles.diffuse_bounces == 4
+        and scene.cycles.glossy_bounces == 4
+        and scene.cycles.transmission_bounces == 8
+        and scene.cycles.transparent_max_bounces == 8
+        and scene.cycles.volume_bounces == 2
+        and not scene.cycles.caustics_reflective
+        and not scene.cycles.caustics_refractive
     )
     if not expected_render_settings:
         problems.append("portrait render or AgX color-management settings changed")
@@ -2831,6 +2971,39 @@ def validate_output(
         )
     if bad_materials:
         raise BuildError("Final character meshes contain placeholder materials: " + ", ".join(bad_materials))
+
+    used_materials = {
+        slot.material
+        for obj in meshes
+        for slot in obj.material_slots
+        if slot.material is not None and slot.material.node_tree is not None
+    }
+    linked_optional_decals = [
+        node
+        for material in used_materials
+        for node in material.node_tree.nodes
+        if node.type == "TEX_IMAGE"
+        and "decal" in str(node.label).casefold()
+        and any(output.is_linked for output in node.outputs)
+    ]
+    unbound_optional_decals = [
+        node.name for node in linked_optional_decals if node.image is None
+    ]
+    fallback_image = bpy.data.images.get("XivBlend Transparent Optional Texture")
+    fallback_nodes = [
+        node for node in linked_optional_decals if node.image is fallback_image
+    ]
+    if unbound_optional_decals:
+        raise BuildError(
+            "Optional decal samplers remain unbound for Cycles: "
+            + ", ".join(sorted(unbound_optional_decals))
+        )
+    if len(fallback_nodes) != material_optimization["optional_decal_fallbacks"]:
+        raise BuildError(
+            "Optional decal fallback count changed before save: "
+            f"expected {material_optimization['optional_decal_fallbacks']}, "
+            f"found {len(fallback_nodes)}"
+        )
 
     optimized_materials = {
         slot.material
@@ -3035,9 +3208,16 @@ def main() -> None:
     removed_vertex_groups = remove_empty_vertex_groups(character_meshes)
     captured_pose, pose_configuration = configure_armatures(scene, armatures)
     material_mapping = apply_meddle_materials(source, imported, meddle_location)
+    optional_texture_fallbacks = bind_optional_texture_fallbacks(imported)
     material_optimization = optimize_character_materials(imported)
+    material_optimization.update(optional_texture_fallbacks)
     collections = organize_objects(scene, imported, document)
-    configure_scene_setup(scene, imported, collections["setup"])
+    configure_scene_setup(
+        scene,
+        imported,
+        collections["setup"],
+        collections["root"],
+    )
     viewport_configuration = configure_viewport_defaults()
     embed_manifest(scene, manifest_path, document, canonical, digest, source)
     write_embedded_readme()

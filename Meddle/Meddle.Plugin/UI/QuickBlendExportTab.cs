@@ -2,7 +2,6 @@ using System.Diagnostics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.ImGuiFileDialog;
-using Meddle.Plugin.Models;
 using Meddle.Plugin.Services;
 
 namespace Meddle.Plugin.UI;
@@ -26,8 +25,6 @@ public sealed class QuickBlendExportTab : ITab
     }
 
     public string Name => "Export My Character";
-    public int Order => -100;
-    public MenuType MenuType => MenuType.Default;
 
     public void Draw()
     {
@@ -126,7 +123,4 @@ public sealed class QuickBlendExportTab : ITab
         }
     }
 
-    public void Dispose()
-    {
-    }
 }

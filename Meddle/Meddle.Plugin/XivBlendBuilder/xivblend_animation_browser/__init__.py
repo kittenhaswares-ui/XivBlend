@@ -9,8 +9,8 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 6, 0),
-    "blender": (4, 2, 0),
+    "version": (0, 7, 0),
+    "blender": (5, 0, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
     "category": "Animation",
@@ -29,7 +29,7 @@ import uuid
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import IntProperty, StringProperty
+from bpy.props import EnumProperty, IntProperty, StringProperty
 from bpy.types import Menu, Operator, Panel
 from mathutils import Euler, Matrix, Vector
 
@@ -70,8 +70,11 @@ MAX_AVFX_BYTES = 32 * 1024 * 1024
 PROP_CACHE_MANIFEST = "prop-cache-v1.json"
 MAX_PROP_CACHE_FILE_BYTES = 512 * 1024 * 1024
 MAX_PROP_CACHE_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
-FAST_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
-FAST_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
+STUDIO_BACKDROP_COMPONENT = "studio_backdrop"
+STUDIO_LIGHT_COMPONENT = "studio_light"
+STUDIO_BACKGROUND_RAMP = "XivBlend Background Gradient"
+LEGACY_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
+LEGACY_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
 RUNTIME_EFFECT_COLLECTION_PREFIX = "XivBlend Runtime Effects |"
 MATERIAL_RUNTIME_MODULE = "_xivblend_meddle_material_runtime"
 SYNC_CONTROL_VFX = "vfx/common/eff/syncactiontimelineclip01t.avfx"
@@ -86,11 +89,8 @@ _scene_settings = {}
 _action_settings = {}
 _runtime_sessions = {}
 _save_sessions = []
-_fast_preview_session = None
-_resume_fast_preview_after_save = False
-_resume_fast_preview_after_render = False
 _status = "Ready"
-_render_status = "Fit the camera to the current pose or the whole active animation."
+_render_status = "Choose a render mode, fit the camera, then render the current frame."
 
 
 class CatalogError(RuntimeError):
@@ -2446,151 +2446,6 @@ def _character_meshes(context, target):
     return associated if associated else candidates
 
 
-def _new_fast_preview_material():
-    for material in bpy.data.materials:
-        if bool(material.get(FAST_PREVIEW_MATERIAL_PROPERTY, False)):
-            return material
-    material = bpy.data.materials.new(FAST_PREVIEW_MATERIAL_NAME)
-    material.use_nodes = True
-    material.diffuse_color = (0.30, 0.24, 0.20, 1.0)
-    material[FAST_PREVIEW_MATERIAL_PROPERTY] = True
-    if hasattr(material, "use_transparent_shadow"):
-        material.use_transparent_shadow = False
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-    nodes.clear()
-    output = nodes.new("ShaderNodeOutputMaterial")
-    output.location = (320.0, 0.0)
-    shader = nodes.new("ShaderNodeBsdfPrincipled")
-    shader.location = (20.0, 0.0)
-    links.new(shader.outputs["BSDF"], output.inputs["Surface"])
-    shader.inputs["Base Color"].default_value = material.diffuse_color
-    shader.inputs["Roughness"].default_value = 0.58
-    specular = shader.inputs.get("Specular IOR Level")
-    if specular is not None:
-        specular.default_value = 0.30
-    alpha = shader.inputs.get("Alpha")
-    if alpha is not None:
-        alpha.default_value = 1.0
-    return material
-
-
-def _remove_unused_fast_preview_materials():
-    for material in list(bpy.data.materials):
-        if bool(material.get(FAST_PREVIEW_MATERIAL_PROPERTY, False)) and material.users == 0:
-            try:
-                bpy.data.materials.remove(material)
-            except (ReferenceError, RuntimeError):
-                pass
-
-
-def _preview_override_layers():
-    return [
-        view_layer
-        for scene in bpy.data.scenes
-        for view_layer in scene.view_layers
-        if view_layer.material_override is not None
-        and bool(
-            view_layer.material_override.get(
-                FAST_PREVIEW_MATERIAL_PROPERTY,
-                False,
-            )
-        )
-    ]
-
-
-def _fast_preview_is_active():
-    return bool(_preview_override_layers())
-
-
-def _enable_fast_preview(context=None, update_status=True):
-    """Use a non-destructive View Layer material override for smooth playback."""
-    global _fast_preview_session
-    if _fast_preview_is_active():
-        if update_status:
-            _set_render_status("Smooth Animation is already active")
-        return True
-    if _fast_preview_session is not None:
-        _restore_full_detail(update_status=False)
-    context = context or bpy.context
-    scene = getattr(context, "scene", None)
-    if scene is None:
-        raise ClipError("No active scene is available for Smooth Animation")
-    target = _target_armature(context)
-    if target is None:
-        raise ClipError("No character armature was found in this scene")
-    meshes = [obj for obj in _character_meshes(context, target) if len(obj.material_slots)]
-    if not meshes:
-        raise ClipError("No character materials were found for Smooth Animation")
-
-    session = {
-        "view_layer": context.view_layer,
-        "original_override": context.view_layer.material_override,
-    }
-    _fast_preview_session = session
-    try:
-        preview_material = _new_fast_preview_material()
-        session["material"] = preview_material
-        context.view_layer.material_override = preview_material
-        context.view_layer.update()
-    except Exception:
-        _restore_full_detail(update_status=False)
-        raise
-
-    if update_status:
-        _set_render_status(
-            "Smooth Animation active: lightweight clay preview; renders and saves use Full Detail"
-        )
-    return True
-
-
-def _restore_full_detail(update_status=True):
-    global _fast_preview_session
-    session, _fast_preview_session = _fast_preview_session, None
-    restored = False
-    if session is not None:
-        try:
-            session["view_layer"].material_override = session["original_override"]
-            restored = True
-        except (KeyError, ReferenceError, RuntimeError):
-            pass
-
-    # Undo/redo can resurrect a material override without restoring Python
-    # globals. Scan every View Layer so render/save can never serialize it.
-    for view_layer in _preview_override_layers():
-        try:
-            view_layer.material_override = None
-            restored = True
-        except (ReferenceError, RuntimeError):
-            continue
-
-    _remove_unused_fast_preview_materials()
-    try:
-        bpy.context.view_layer.update()
-    except (AttributeError, RuntimeError):
-        pass
-    if update_status:
-        _set_render_status(
-            "Full Detail active: exact FFXIV materials and studio lighting"
-            if restored
-            else "Full Detail is already active"
-        )
-    return restored
-
-
-def _resume_fast_preview():
-    global _resume_fast_preview_after_render
-    should_resume = _resume_fast_preview_after_render
-    _resume_fast_preview_after_render = False
-    if should_resume:
-        try:
-            _enable_fast_preview(bpy.context, update_status=False)
-            _set_render_status("Render finished; Smooth Animation preview restored")
-        except Exception as error:
-            _set_render_status(f"Render finished, but Smooth Animation could not resume: {error}")
-    return None
-
-
 def _evaluated_bound_points(context, meshes):
     context.view_layer.update()
     depsgraph = context.evaluated_depsgraph_get()
@@ -2901,43 +2756,313 @@ class XIVBLEND_OT_restore_captured_pose(Operator):
         return {"FINISHED"}
 
 
-class XIVBLEND_OT_enable_smooth_preview(Operator):
-    bl_idname = "xivblend.enable_smooth_preview"
-    bl_label = "Smooth Animation"
-    bl_description = (
-        "Temporarily replace the expensive FFXIV shaders with one lightweight clay shader "
-        "for smoother playback; F12 renders and saved files automatically use Full Detail"
-    )
-    bl_options = {"REGISTER"}
-
-    @classmethod
-    def poll(cls, context):
-        return not _fast_preview_is_active() and _target_armature(context) is not None
-
-    def execute(self, context):
+def _set_if_present(owner, name, value):
+    if owner is not None and hasattr(owner, name):
         try:
-            _enable_fast_preview(context)
-            return {"FINISHED"}
-        except Exception as error:
-            message = str(error)
-            _set_render_status(message)
-            self.report({"ERROR"}, message)
-            return {"CANCELLED"}
+            setattr(owner, name, value)
+            return True
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return False
 
 
-class XIVBLEND_OT_disable_smooth_preview(Operator):
-    bl_idname = "xivblend.disable_smooth_preview"
-    bl_label = "Full Detail"
-    bl_description = "Restore the exact exported FFXIV materials and full viewport quality"
-    bl_options = {"REGISTER"}
+def _clear_legacy_preview_overrides():
+    """Remove only XivBlend's retired clay override from older files/sessions."""
+    cleared = 0
+    for scene in bpy.data.scenes:
+        for view_layer in scene.view_layers:
+            material = view_layer.material_override
+            if material is None or not (
+                bool(material.get(LEGACY_PREVIEW_MATERIAL_PROPERTY, False))
+                or material.name.startswith(LEGACY_PREVIEW_MATERIAL_NAME)
+            ):
+                continue
+            view_layer.material_override = None
+            cleared += 1
+    for material in list(bpy.data.materials):
+        if material.users != 0 or not (
+            bool(material.get(LEGACY_PREVIEW_MATERIAL_PROPERTY, False))
+            or material.name.startswith(LEGACY_PREVIEW_MATERIAL_NAME)
+        ):
+            continue
+        try:
+            bpy.data.materials.remove(material)
+        except (ReferenceError, RuntimeError):
+            pass
+    return cleared
 
-    @classmethod
-    def poll(cls, _context):
-        return _fast_preview_is_active()
 
-    def execute(self, _context):
-        _restore_full_detail()
-        return {"FINISHED"}
+def _view_3d_spaces():
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            for space in area.spaces:
+                if space.type == "VIEW_3D":
+                    yield space
+
+
+def _set_viewport_mode(mode):
+    spaces = list(_view_3d_spaces())
+    for space in spaces:
+        shading = space.shading
+        if mode == "ANIMATE":
+            shading.type = "SOLID"
+            _set_if_present(shading, "light", "STUDIO")
+            _set_if_present(shading, "color_type", "MATERIAL")
+            _set_if_present(shading, "show_shadows", True)
+            _set_if_present(shading, "show_cavity", True)
+            _set_if_present(shading, "cavity_type", "BOTH")
+            _set_if_present(shading, "curvature_ridge_factor", 0.65)
+            _set_if_present(shading, "curvature_valley_factor", 0.45)
+            _set_if_present(shading, "show_specular_highlight", True)
+            _set_if_present(shading, "background_type", "THEME")
+        else:
+            shading.type = "RENDERED"
+            _set_if_present(shading, "use_scene_lights", True)
+            _set_if_present(shading, "use_scene_world", True)
+            _set_if_present(shading, "render_pass", "COMBINED")
+    return len(spaces)
+
+
+def _studio_lights(scene):
+    return [
+        obj
+        for obj in scene.objects
+        if obj.type == "LIGHT"
+        and (
+            obj.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_LIGHT_COMPONENT
+            or str(obj.name).startswith(("Key Light", "Fill Light", "Rim Light"))
+        )
+    ]
+
+
+def _studio_backdrops(scene):
+    return [
+        obj
+        for obj in scene.objects
+        if obj.type == "MESH"
+        and (
+            obj.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_BACKDROP_COMPONENT
+            or obj.name == "XivBlend Studio Backdrop"
+        )
+    ]
+
+
+def _set_studio_shadow_quality(scene, beauty):
+    for light in _studio_lights(scene):
+        role = str(light.get("xivblend_studio_role", ""))
+        light.data.use_shadow = role == "key" or bool(beauty)
+
+
+def _cycles_device(scene):
+    """Use the user's configured Cycles GPU without changing global preferences."""
+    addon = bpy.context.preferences.addons.get("cycles")
+    if addon is None:
+        scene.cycles.device = "CPU"
+        return "Cycles CPU (Cycles preferences unavailable)"
+    preferences = addon.preferences
+    try:
+        preferences.get_devices()
+    except Exception:
+        pass
+    backend = str(getattr(preferences, "compute_device_type", "NONE") or "NONE")
+    devices = [
+        device
+        for device in getattr(preferences, "devices", ())
+        if bool(getattr(device, "use", False))
+        and str(getattr(device, "type", "CPU")) != "CPU"
+        and (backend == "NONE" or str(getattr(device, "type", "")) == backend)
+    ]
+    if backend != "NONE" and devices:
+        scene.cycles.device = "GPU"
+        names = ", ".join(str(device.name) for device in devices[:2])
+        return f"{backend} GPU: {names}"
+    scene.cycles.device = "CPU"
+    return "Cycles CPU • choose OptiX in Preferences > System for RTX"
+
+
+def _configure_eevee(scene):
+    scene.render.engine = "BLENDER_EEVEE"
+    scene.render.use_persistent_data = False
+    eevee = getattr(scene, "eevee", None)
+    for name, value in (
+        ("taa_samples", 16),
+        ("taa_render_samples", 96),
+        ("use_taa_reprojection", True),
+        ("use_shadow_jitter_viewport", False),
+        ("shadow_pool_size", "512"),
+        ("shadow_ray_count", 3),
+        ("use_raytracing", False),
+        ("use_fast_gi", True),
+        ("fast_gi_method", "AMBIENT_OCCLUSION_ONLY"),
+        ("fast_gi_quality", 0.75),
+    ):
+        _set_if_present(eevee, name, value)
+    _set_studio_shadow_quality(scene, beauty=False)
+
+
+def _configure_cycles(scene):
+    scene.render.engine = "CYCLES"
+    scene.render.use_persistent_data = True
+    cycles = scene.cycles
+    for name, value in (
+        ("samples", 256),
+        ("preview_samples", 32),
+        ("use_denoising", True),
+        ("denoiser", "OPENIMAGEDENOISE"),
+        ("use_preview_denoising", True),
+        ("preview_denoiser", "AUTO"),
+        ("use_adaptive_sampling", True),
+        ("adaptive_threshold", 0.01),
+        ("adaptive_min_samples", 16),
+        ("use_light_tree", True),
+        ("texture_limit", "2048"),
+        ("texture_limit_render", "OFF"),
+        ("max_bounces", 8),
+        ("diffuse_bounces", 4),
+        ("glossy_bounces", 4),
+        ("transmission_bounces", 8),
+        ("transparent_max_bounces", 8),
+        ("volume_bounces", 2),
+        ("caustics_reflective", False),
+        ("caustics_refractive", False),
+        ("sample_clamp_direct", 0.0),
+        ("sample_clamp_indirect", 10.0),
+    ):
+        _set_if_present(cycles, name, value)
+    _set_studio_shadow_quality(scene, beauty=True)
+    return _cycles_device(scene)
+
+
+def _apply_render_quality(context, mode, *, switch_viewport=True):
+    scene = context.scene
+    _clear_legacy_preview_overrides()
+    if mode == "ANIMATE":
+        _configure_eevee(scene)
+        count = _set_viewport_mode("ANIMATE") if switch_viewport else 0
+        message = f"Fast Animation: Solid viewport in {count} view(s); materials stay untouched"
+    elif mode == "PREVIEW":
+        _configure_eevee(scene)
+        count = _set_viewport_mode("PREVIEW") if switch_viewport else 0
+        message = f"Fast Preview: Eevee + full materials in {count} view(s)"
+    elif mode == "BEAUTY":
+        device = _configure_cycles(scene)
+        scene["xivblend_cycles_device"] = device
+        count = _set_viewport_mode("BEAUTY") if switch_viewport else 0
+        message = f"Beauty Photo: Cycles, adaptive 256 samples, denoise • {device}"
+    else:
+        raise ClipError(f"Unknown render quality preset: {mode}")
+    scene["xivblend_render_quality"] = mode
+    _set_render_status(message)
+    return message
+
+
+def _background_ramp(material):
+    if material is None or not material.use_nodes or material.node_tree is None:
+        return None
+    named = material.node_tree.nodes.get(STUDIO_BACKGROUND_RAMP)
+    if named is not None and named.type == "VALTORGB":
+        return named
+    return next(
+        (node for node in material.node_tree.nodes if node.type == "VALTORGB"),
+        None,
+    )
+
+
+def _apply_background_preset(scene, preset):
+    colors = {
+        "CHARCOAL": ((0.012, 0.022, 0.048, 1.0), (0.002, 0.006, 0.016, 1.0)),
+        "NEUTRAL": ((0.075, 0.075, 0.075, 1.0), (0.018, 0.018, 0.018, 1.0)),
+    }
+    transparent = preset == "TRANSPARENT"
+    scene.render.film_transparent = transparent
+    for backdrop in _studio_backdrops(scene):
+        backdrop.hide_render = transparent
+        if transparent or not backdrop.data.materials:
+            continue
+        material = backdrop.data.materials[0]
+        ramp = _background_ramp(material)
+        if ramp is not None:
+            lower, upper = colors.get(preset, colors["CHARCOAL"])
+            ramp.color_ramp.elements[0].color = lower
+            ramp.color_ramp.elements[-1].color = upper
+            material.diffuse_color = lower
+    scene["xivblend_background_preset"] = preset
+    _apply_output_preset(scene, getattr(scene, "xivblend_output_preset", "HQ"))
+
+
+def _apply_color_preset(scene, preset):
+    if preset == "ACCURATE":
+        scene.view_settings.view_transform = "Khronos PBR Neutral"
+        scene.view_settings.look = "None"
+        light_colors = {"key": (1.0, 1.0, 1.0), "fill": (1.0, 1.0, 1.0), "rim": (1.0, 1.0, 1.0)}
+    else:
+        scene.view_settings.view_transform = "AgX"
+        try:
+            scene.view_settings.look = "AgX - Medium High Contrast"
+        except TypeError:
+            scene.view_settings.look = "Medium High Contrast"
+        light_colors = {
+            "key": (1.0, 0.975, 0.955),
+            "fill": (0.76, 0.86, 1.0),
+            "rim": (0.66, 0.80, 1.0),
+        }
+    scene.view_settings.exposure = -0.40
+    scene.view_settings.gamma = 1.0
+    for light in _studio_lights(scene):
+        role = str(light.get("xivblend_studio_role", ""))
+        if role in light_colors:
+            light.data.color = light_colors[role]
+    scene["xivblend_color_preset"] = preset
+
+
+def _apply_output_preset(scene, preset):
+    settings = scene.render.image_settings
+    if preset == "WEB":
+        settings.file_format = "PNG"
+        settings.color_depth = "8"
+        settings.color_mode = "RGBA" if scene.render.film_transparent else "RGB"
+        _set_if_present(settings, "compression", 25)
+    elif preset == "EXR":
+        settings.file_format = "OPEN_EXR"
+        settings.color_depth = "16"
+        settings.color_mode = "RGBA"
+        _set_if_present(settings, "exr_codec", "PIZ")
+    else:
+        settings.file_format = "PNG"
+        settings.color_depth = "16"
+        settings.color_mode = "RGBA" if scene.render.film_transparent else "RGB"
+        _set_if_present(settings, "compression", 35)
+    scene["xivblend_output_preset"] = preset
+
+
+def _update_render_quality(scene, context):
+    try:
+        _apply_render_quality(context, scene.xivblend_render_quality)
+    except Exception as error:
+        _set_render_status(str(error))
+
+
+def _update_background_preset(scene, _context):
+    try:
+        _apply_background_preset(scene, scene.xivblend_background_preset)
+    except Exception as error:
+        _set_render_status(str(error))
+
+
+def _update_color_preset(scene, _context):
+    try:
+        _apply_color_preset(scene, scene.xivblend_color_preset)
+    except Exception as error:
+        _set_render_status(str(error))
+
+
+def _update_output_preset(scene, _context):
+    try:
+        _apply_output_preset(scene, scene.xivblend_output_preset)
+    except Exception as error:
+        _set_render_status(str(error))
 
 
 def _execute_camera_fit(operator, context, sample_action):
@@ -3000,6 +3125,11 @@ class XIVBLEND_OT_render_portrait(Operator):
         try:
             camera = _render_camera(context.scene)
             context.scene.camera = camera
+            _apply_render_quality(
+                context,
+                context.scene.xivblend_render_quality,
+                switch_viewport=False,
+            )
             _set_render_status(f"Opening render for frame {context.scene.frame_current} with {camera.name}…")
             result = bpy.ops.render.render(
                 "INVOKE_DEFAULT",
@@ -3292,20 +3422,25 @@ class XIVBLEND_PT_render_studio(Panel):
             camera = None
             camera_error = str(error)
 
-        performance = layout.box()
-        performance.label(text="Viewport Quality", icon="SHADING_RENDERED")
-        buttons = performance.row(align=True)
-        smooth = buttons.row(align=True)
-        smooth.enabled = not _fast_preview_is_active() and target is not None
-        smooth.operator(XIVBLEND_OT_enable_smooth_preview.bl_idname, icon="PLAY")
-        detail = buttons.row(align=True)
-        detail.enabled = _fast_preview_is_active()
-        detail.operator(XIVBLEND_OT_disable_smooth_preview.bl_idname, icon="MATERIAL")
-        if _fast_preview_is_active():
-            performance.label(text="Smooth clay preview active", icon="CHECKMARK")
-        else:
-            performance.label(text="Full FFXIV materials active", icon="CHECKMARK")
-        performance.label(text="F12 renders and saves use Full Detail", icon="LOCKED")
+        scene = context.scene
+        quality = layout.box()
+        quality.label(text="Quality", icon="SHADING_RENDERED")
+        quality.prop(scene, "xivblend_render_quality", expand=True)
+        descriptions = {
+            "ANIMATE": "Solid viewport • fastest posing • no shader changes",
+            "PREVIEW": "Eevee • real materials • quick preview",
+            "BEAUTY": "Cycles • adaptive samples • denoised final image",
+        }
+        quality.label(text=descriptions.get(scene.xivblend_render_quality, ""), icon="INFO")
+
+        appearance = layout.box()
+        appearance.label(text="Look", icon="MATERIAL")
+        appearance.prop(scene, "xivblend_background_preset", text="Background")
+        appearance.prop(scene, "xivblend_color_preset", text="Color")
+        appearance.prop(scene, "xivblend_output_preset", text="File")
+        if scene.xivblend_render_quality == "BEAUTY":
+            device = str(scene.get("xivblend_cycles_device", "Select Beauty to check the Cycles device"))
+            appearance.label(text=device[:92], icon="PREFERENCES")
 
         header = layout.row()
         header.label(
@@ -3328,16 +3463,16 @@ class XIVBLEND_PT_render_studio(Panel):
         render_row.operator(XIVBLEND_OT_render_portrait.bl_idname, icon="RENDER_STILL")
 
         aspect = (
-            context.scene.render.resolution_x * context.scene.render.pixel_aspect_x
-            / max(context.scene.render.resolution_y * context.scene.render.pixel_aspect_y, 1.0e-6)
+            scene.render.resolution_x * scene.render.pixel_aspect_x
+            / max(scene.render.resolution_y * scene.render.pixel_aspect_y, 1.0e-6)
         )
         if abs(aspect - 0.8) <= 0.01:
             layout.label(text="4:5 portrait output • lens stays unchanged", icon="INFO")
         else:
             layout.label(
                 text=(
-                    f"Output: {context.scene.render.resolution_x} × "
-                    f"{context.scene.render.resolution_y} • lens stays unchanged"
+                    f"Output: {scene.render.resolution_x} × "
+                    f"{scene.render.resolution_y} • lens stays unchanged"
                 ),
                 icon="INFO",
             )
@@ -3350,13 +3485,8 @@ class XIVBLEND_PT_render_studio(Panel):
 
 @persistent
 def _save_pre_handler(_filepath):
-    global _save_sessions, _resume_fast_preview_after_save
+    global _save_sessions
     _save_sessions = []
-    _resume_fast_preview_after_save = (
-        _resume_fast_preview_after_save or _fast_preview_is_active()
-    )
-    if _resume_fast_preview_after_save:
-        _restore_full_detail(update_status=False)
     _stop_playback()
     for target_name, session in list(_runtime_sessions.items()):
         target = bpy.data.objects.get(target_name)
@@ -3373,7 +3503,7 @@ def _save_pre_handler(_filepath):
 
 
 def _resume_after_save():
-    global _save_sessions, _resume_fast_preview_after_save
+    global _save_sessions
     sessions, _save_sessions = _save_sessions, []
     for session in sessions:
         target = bpy.data.objects.get(session["target"])
@@ -3396,50 +3526,19 @@ def _resume_after_save():
             ))
         except Exception as error:
             _set_status(f"Saved safely, but could not resume the preview: {error}")
-    resume_preview = _resume_fast_preview_after_save
-    _resume_fast_preview_after_save = False
-    if resume_preview:
-        try:
-            _enable_fast_preview(bpy.context, update_status=False)
-            _set_render_status("Saved in Full Detail; Smooth Animation preview restored")
-        except Exception as error:
-            _set_render_status(f"Saved safely, but Smooth Animation could not resume: {error}")
     return None
 
 
 @persistent
 def _save_post_handler(_filepath):
-    if _save_sessions or _resume_fast_preview_after_save:
+    if _save_sessions:
         if not bpy.app.timers.is_registered(_resume_after_save):
             bpy.app.timers.register(_resume_after_save, first_interval=0.1)
 
 
 @persistent
-def _render_pre_handler(_scene, *_args):
-    global _resume_fast_preview_after_render
-    if not _fast_preview_is_active():
-        return
-    _resume_fast_preview_after_render = True
-    _restore_full_detail(update_status=False)
-    _set_render_status("Rendering with Full Detail materials and studio lighting…")
-
-
-@persistent
-def _render_finished_handler(_scene, *_args):
-    if not _resume_fast_preview_after_render:
-        return
-    try:
-        if not bpy.app.timers.is_registered(_resume_fast_preview):
-            bpy.app.timers.register(_resume_fast_preview, first_interval=0.1)
-    except Exception:
-        _resume_fast_preview()
-
-
-@persistent
 def _load_post_handler(_filepath):
     global _catalog, _catalog_signature, _save_sessions
-    global _fast_preview_session, _resume_fast_preview_after_save
-    global _resume_fast_preview_after_render
     _stop_playback()
     _purge_transient_actions(restore=True)
     _remove_runtime_visuals()
@@ -3449,15 +3548,12 @@ def _load_post_handler(_filepath):
     _action_settings.clear()
     _runtime_sessions.clear()
     _save_sessions = []
-    _fast_preview_session = None
-    _resume_fast_preview_after_save = False
-    _resume_fast_preview_after_render = False
-    _restore_full_detail(update_status=False)
     _catalog = None
     _catalog_signature = None
     _close_previews()
+    _clear_legacy_preview_overrides()
     _set_status("Ready")
-    _set_render_status("Fit the camera to the current pose or the whole active animation.")
+    _set_render_status("Choose a render mode, fit the camera, then render the current frame.")
 
 
 _CLASSES = (
@@ -3467,8 +3563,6 @@ _CLASSES = (
     XIVBLEND_OT_change_animation_page,
     XIVBLEND_OT_play_emote,
     XIVBLEND_OT_restore_captured_pose,
-    XIVBLEND_OT_enable_smooth_preview,
-    XIVBLEND_OT_disable_smooth_preview,
     XIVBLEND_OT_fit_camera_current_pose,
     XIVBLEND_OT_fit_camera_active_action,
     XIVBLEND_OT_render_portrait,
@@ -3499,6 +3593,49 @@ def register():
         min=0,
         options={"SKIP_SAVE"},
     )
+    bpy.types.Scene.xivblend_render_quality = EnumProperty(
+        name="Render quality",
+        description="Choose a lightweight viewport, a fast Eevee preview, or a Cycles final render",
+        items=(
+            ("ANIMATE", "Animate", "Fast Solid viewport; keeps every material untouched", "PLAY", 0),
+            ("PREVIEW", "Preview", "Fast Eevee render with the real materials", "SHADING_RENDERED", 1),
+            ("BEAUTY", "Beauty", "Cycles final render with adaptive sampling and denoising", "RENDER_STILL", 2),
+        ),
+        default="PREVIEW",
+        update=_update_render_quality,
+    )
+    bpy.types.Scene.xivblend_background_preset = EnumProperty(
+        name="Background",
+        description="Use a repeatable branded, neutral, or transparent background",
+        items=(
+            ("CHARCOAL", "Charcoal Brand", "XivBlend's dark blue-charcoal studio sweep"),
+            ("NEUTRAL", "Neutral Gray", "Neutral gray sweep for judging very dark and light mods"),
+            ("TRANSPARENT", "Transparent", "Hide the sweep and render a transparent background"),
+        ),
+        default="CHARCOAL",
+        update=_update_background_preset,
+    )
+    bpy.types.Scene.xivblend_color_preset = EnumProperty(
+        name="Color",
+        description="Choose an attractive highlight roll-off or neutral product-style colors",
+        items=(
+            ("BEAUTY", "Beauty (AgX)", "Cinematic highlight roll-off with subtly colored studio lights"),
+            ("ACCURATE", "Accurate Mod Colors", "Khronos PBR Neutral with white studio lights"),
+        ),
+        default="BEAUTY",
+        update=_update_color_preset,
+    )
+    bpy.types.Scene.xivblend_output_preset = EnumProperty(
+        name="File",
+        description="Choose a normal web image, high-quality PNG, or editing master",
+        items=(
+            ("WEB", "Web PNG (8-bit)", "Smaller display-ready PNG"),
+            ("HQ", "High Quality PNG (16-bit)", "High-quality display-ready PNG"),
+            ("EXR", "Editing Master (EXR)", "Half-float OpenEXR with preserved scene-linear range"),
+        ),
+        default="HQ",
+        update=_update_output_preset,
+    )
     bpy.types.WindowManager.xivblend_animation_status = StringProperty(
         name="XivBlend animation status",
         default="Ready",
@@ -3506,25 +3643,21 @@ def register():
     )
     bpy.types.WindowManager.xivblend_render_status = StringProperty(
         name="XivBlend render status",
-        default="Fit the camera to the current pose or the whole active animation.",
+        default="Choose a render mode, fit the camera, then render the current frame.",
         options={"SKIP_SAVE"},
     )
     for handlers, callback in (
         (bpy.app.handlers.save_pre, _save_pre_handler),
         (bpy.app.handlers.save_post, _save_post_handler),
-        (bpy.app.handlers.render_pre, _render_pre_handler),
-        (bpy.app.handlers.render_complete, _render_finished_handler),
-        (bpy.app.handlers.render_cancel, _render_finished_handler),
         (bpy.app.handlers.load_post, _load_post_handler),
     ):
         if callback not in handlers:
             handlers.append(callback)
+    _clear_legacy_preview_overrides()
 
 
 def unregister():
-    global _save_sessions, _resume_fast_preview_after_save
-    global _resume_fast_preview_after_render
-    _restore_full_detail(update_status=False)
+    global _save_sessions
     _stop_playback()
     for target_name in list(_runtime_sessions):
         target = bpy.data.objects.get(target_name)
@@ -3544,20 +3677,10 @@ def unregister():
             bpy.app.timers.unregister(_resume_after_save)
     except Exception:
         pass
-    try:
-        if bpy.app.timers.is_registered(_resume_fast_preview):
-            bpy.app.timers.unregister(_resume_fast_preview)
-    except Exception:
-        pass
     _save_sessions = []
-    _resume_fast_preview_after_save = False
-    _resume_fast_preview_after_render = False
     for handlers, callback in (
         (bpy.app.handlers.save_pre, _save_pre_handler),
         (bpy.app.handlers.save_post, _save_post_handler),
-        (bpy.app.handlers.render_pre, _render_pre_handler),
-        (bpy.app.handlers.render_complete, _render_finished_handler),
-        (bpy.app.handlers.render_cancel, _render_finished_handler),
         (bpy.app.handlers.load_post, _load_post_handler),
     ):
         if callback in handlers:
@@ -3566,6 +3689,10 @@ def unregister():
         (bpy.types.Scene, "xivblend_animation_search"),
         (bpy.types.Scene, "xivblend_animation_category"),
         (bpy.types.Scene, "xivblend_animation_page"),
+        (bpy.types.Scene, "xivblend_render_quality"),
+        (bpy.types.Scene, "xivblend_background_preset"),
+        (bpy.types.Scene, "xivblend_color_preset"),
+        (bpy.types.Scene, "xivblend_output_preset"),
         (bpy.types.WindowManager, "xivblend_animation_status"),
         (bpy.types.WindowManager, "xivblend_render_status"),
     ):

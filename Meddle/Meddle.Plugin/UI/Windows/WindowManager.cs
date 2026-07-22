@@ -45,7 +45,6 @@ public class WindowManager : IHostedService, IDisposable
             pluginInterface.UiBuilder.Draw -= windowSystem.Draw;
             pluginInterface.UiBuilder.OpenConfigUi -= OpenMainUi;
             pluginInterface.UiBuilder.OpenMainUi -= OpenMainUi;
-            mainWindow.Dispose();
             windowSystem.RemoveAllWindows();
             disposed = true;
         }

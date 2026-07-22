@@ -1,5 +1,4 @@
 using Dalamud.Plugin;
-using Dalamud.Plugin.Services;
 using Meddle.Plugin.Services;
 using Meddle.Plugin.Utils;
 using Meddle.Utils.Files.SqPack;
@@ -16,7 +15,6 @@ public sealed class Plugin : IDalamudPlugin
     private readonly IHost? app;
     private readonly ILogger pluginLog;
     public static ILogger<Plugin> Logger { get; private set; } = NullLogger<Plugin>.Instance;
-    public static INotificationManager NotificationManager { get; private set; } = null!;
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
@@ -55,7 +53,7 @@ public sealed class Plugin : IDalamudPlugin
                 services.Configure<ConsoleLifetimeOptions>(options => options.SuppressStatusMessages = true);
                 service.RegisterServices(services);
                 services
-                    .AddServices(pluginInterface)    
+                    .AddServices()
                     .AddSingleton(config)
                     .AddUi()
                     .AddSingleton(new SqPack(Environment.CurrentDirectory));
@@ -63,7 +61,6 @@ public sealed class Plugin : IDalamudPlugin
 
             app = host.Build();
             Logger = app.Services.GetRequiredService<ILogger<Plugin>>();
-            NotificationManager = app.Services.GetRequiredService<INotificationManager>();
             Meddle.Utils.Global.Logger = app.Services.GetRequiredService<ILogger<Meddle.Utils.Global>>();
             NativeDll.Initialize(app.Services.GetRequiredService<IDalamudPluginInterface>().AssemblyLocation.DirectoryName);
             var pack = app.Services.GetRequiredService<SqPack>();

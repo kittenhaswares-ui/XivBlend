@@ -14,7 +14,7 @@ namespace Meddle.Plugin.Services;
 /// </summary>
 public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
 {
-    public const string BrowserVersion = "0.6.0";
+    public const string BrowserVersion = XivBlendCompanionVersions.AnimationBrowser;
 
     private const string ResourcePrefix = "XivBlendBuilder/";
     private const string InstallerResource = ResourcePrefix + "install_animation_browser.py";
@@ -67,10 +67,11 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
     {
         try
         {
-            var blenderPath = FindBlenderExecutable()
+            var blenderPath = BlenderExecutableDiscovery.Find(configuration)
                 ?? throw new FileNotFoundException(
                     "Blender was not found. Select Blender 5.x in the Export tab first.");
-            var installerPath = ExtractReviewedAssets();
+            using var reviewedAssets = ExtractReviewedAssets();
+            var installerPath = reviewedAssets.ResolveInside("install_animation_browser.py");
             cancellationToken.ThrowIfCancellationRequested();
 
             var output = new StringBuilder();
@@ -178,14 +179,9 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
         }
     }
 
-    private string ExtractReviewedAssets()
+    private TemporaryAssetExtraction ExtractReviewedAssets()
     {
         var assembly = Assembly.GetExecutingAssembly();
-        var destinationRoot = Path.GetFullPath(Path.Combine(
-            pluginInterface.ConfigDirectory.FullName,
-            $"XivBlendAnimationBrowser-{BrowserVersion}"));
-        Directory.CreateDirectory(destinationRoot);
-
         var availableResources = assembly.GetManifestResourceNames()
             .ToDictionary(
                 name => name.Replace('\\', '/'),
@@ -209,81 +205,45 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
                 "The plugin package is missing one or more reviewed Blender companion assets.");
         }
 
-        foreach (var normalizedResourceName in reviewedResources)
+        var extraction = TemporaryAssetExtraction.Create(
+            pluginInterface.ConfigDirectory,
+            "XivBlendAnimationBrowser",
+            BrowserVersion);
+
+        try
         {
-            if (!availableResources.TryGetValue(normalizedResourceName, out var resourceName))
+            foreach (var normalizedResourceName in reviewedResources)
             {
-                throw new InvalidOperationException($"The plugin package is missing {normalizedResourceName}.");
-            }
-
-            var relativePath = normalizedResourceName[ResourcePrefix.Length..]
-                .Replace('/', Path.DirectorySeparatorChar)
-                .Replace('\\', Path.DirectorySeparatorChar);
-            var destination = ResolveInside(destinationRoot, relativePath);
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-
-            using var input = assembly.GetManifestResourceStream(resourceName)
-                ?? throw new InvalidOperationException($"The plugin package could not open {normalizedResourceName}.");
-            var temporary = destination + $".{Guid.NewGuid():N}.tmp";
-            try
-            {
-                using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                if (!availableResources.TryGetValue(normalizedResourceName, out var resourceName))
                 {
-                    input.CopyTo(output);
-                    output.Flush(true);
+                    throw new InvalidOperationException($"The plugin package is missing {normalizedResourceName}.");
                 }
 
-                File.Move(temporary, destination, true);
+                var relativePath = normalizedResourceName[ResourcePrefix.Length..]
+                    .Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar);
+                var destination = extraction.ResolveInside(relativePath);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+
+                using var input = assembly.GetManifestResourceStream(resourceName)
+                    ?? throw new InvalidOperationException($"The plugin package could not open {normalizedResourceName}.");
+                using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
             }
-            finally
+
+            var installerPath = extraction.ResolveInside("install_animation_browser.py");
+            if (!File.Exists(installerPath))
             {
-                TryDelete(temporary);
+                throw new FileNotFoundException("The bundled Blender animation browser installer is missing.", installerPath);
             }
-        }
 
-        var installerPath = ResolveInside(destinationRoot, "install_animation_browser.py");
-        if (!File.Exists(installerPath))
+            return extraction;
+        }
+        catch
         {
-            throw new FileNotFoundException("The bundled Blender animation browser installer is missing.", installerPath);
+            extraction.Dispose();
+            throw;
         }
-
-        return installerPath;
-    }
-
-    private string? FindBlenderExecutable()
-    {
-        if (!string.IsNullOrWhiteSpace(configuration.BlenderExecutablePath)
-            && File.Exists(configuration.BlenderExecutablePath))
-        {
-            return Path.GetFullPath(configuration.BlenderExecutablePath);
-        }
-
-        var environmentPath = Environment.GetEnvironmentVariable("XIVBLEND_BLENDER");
-        if (!string.IsNullOrWhiteSpace(environmentPath) && File.Exists(environmentPath))
-        {
-            return Path.GetFullPath(environmentPath);
-        }
-
-        var blenderRoot = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            "Blender Foundation");
-        return Directory.Exists(blenderRoot)
-            ? Directory.EnumerateFiles(blenderRoot, "blender.exe", SearchOption.AllDirectories)
-                .OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault()
-            : null;
-    }
-
-    private static string ResolveInside(string root, string relativePath)
-    {
-        var fullRoot = Path.GetFullPath(root);
-        var resolved = Path.GetFullPath(Path.Combine(fullRoot, relativePath));
-        if (!resolved.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException("A Blender browser asset resolved outside its private directory.");
-        }
-
-        return resolved;
     }
 
     private static string? LastUsefulLine(string value) => value
@@ -303,22 +263,6 @@ public sealed class BlenderAnimationBrowserInstaller : IService, IDisposable
         catch
         {
             // Cancellation still wins if Blender cannot be stopped cleanly.
-        }
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch (IOException)
-        {
-            // Private temporary cleanup is best effort.
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // Private temporary cleanup is best effort.
         }
     }
 

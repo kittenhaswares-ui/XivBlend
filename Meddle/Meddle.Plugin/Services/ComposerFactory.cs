@@ -12,15 +12,6 @@ public class ComposerFactory : IService
         this.pack = pack;
     }
     
-    public InstanceComposer CreateComposer(string outDir,
-                                           Configuration.ExportConfiguration exportConfig,
-                                           CancellationToken cancellationToken = default)
-    {
-        return new InstanceComposer(pack, exportConfig,
-                                    outDir, cancellationToken);
-
-    }
-    
     public CharacterComposer CreateCharacterComposer(string outDir,
                                                      Configuration.ExportConfiguration exportConfig,
                                                      CancellationToken cancellationToken = default)

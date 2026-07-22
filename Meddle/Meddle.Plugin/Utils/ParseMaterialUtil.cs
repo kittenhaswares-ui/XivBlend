@@ -30,7 +30,10 @@ public record struct ParsedHumanInfo
 
 public static class ParseMaterialUtil
 {
-    public static unsafe ParsedCharacterInfo? ParseDrawObject(Pointer<DrawObject> drawObjectPtr, PbdHooks pbdHooks)
+    public static unsafe ParsedCharacterInfo? ParseDrawObject(
+        Pointer<DrawObject> drawObjectPtr,
+        PbdHooks pbdHooks,
+        StainProvider stainProvider)
     {
         if (drawObjectPtr == null || drawObjectPtr.Value == null)
         {
@@ -64,8 +67,8 @@ public static class ParseMaterialUtil
             if (modelType == CharacterBase.ModelType.Human)
             {
                 var equipId = GetEquipmentModelId(characterBase, (HumanEquipmentSlotIndex)model->SlotIndex);
-                stain0 = equipId != null ? StainProvider.GetStain(equipId.Value.Stain0) : null;
-                stain1 = equipId != null ? StainProvider.GetStain(equipId.Value.Stain1) : null;
+                stain0 = equipId != null ? stainProvider.GetStain(equipId.Value.Stain0) : null;
+                stain1 = equipId != null ? stainProvider.GetStain(equipId.Value.Stain1) : null;
             }
             
             for (int materialIndex = 0; materialIndex < model->MaterialsSpan.Length; materialIndex++)

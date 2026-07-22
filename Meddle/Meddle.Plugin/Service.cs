@@ -1,4 +1,3 @@
-using Dalamud.Game;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -35,16 +34,7 @@ public class Service
     private IGameInteropProvider GameInteropProvider { get; set; } = null!;
 
     [PluginService]
-    private ITextureProvider TextureProvider { get; set; } = null!;
-
-    [PluginService]
     private IDataManager DataManager { get; set; } = null!;
-
-    [PluginService]
-    private INotificationManager NotificationManager { get; set; } = null!;
-    
-    [PluginService]
-    private IGameGui GameGui { get; set; } = null!;
 
     public void RegisterServices(IServiceCollection services)
     {
@@ -57,8 +47,5 @@ public class Service
         services.AddSingleton(SigScanner);
         services.AddSingleton(GameInteropProvider);
         services.AddSingleton(DataManager);
-        services.AddSingleton(TextureProvider);
-        services.AddSingleton(NotificationManager);
-        services.AddSingleton(GameGui);
     }
 }

@@ -9,7 +9,6 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using Meddle.Plugin.Models;
 using Meddle.Plugin.Models.Composer;
-using Meddle.Plugin.UI.Layout;
 using Meddle.Plugin.Utils;
 using Microsoft.Extensions.Logging;
 using SharpGLTF.Scenes;
@@ -440,15 +439,15 @@ public sealed class QuickBlendExportService : IService, IDisposable
         string blendPath,
         CancellationToken cancellationToken)
     {
-        var blenderPath = FindBlenderExecutable();
+        var blenderPath = BlenderExecutableDiscovery.Find(configuration);
         if (blenderPath is null)
         {
             throw new FileNotFoundException(
                 "Blender was not found. Set its path in the plugin configuration or install Blender 5.x.");
         }
 
-        var builderDirectory = ExtractBuilderAssets();
-        var builderScript = Path.Combine(builderDirectory, "build_blend.py");
+        using var builderAssets = ExtractBuilderAssets();
+        var builderScript = builderAssets.ResolveInside("build_blend.py");
         if (!File.Exists(builderScript))
         {
             throw new FileNotFoundException("The bundled Blender builder script is missing.", builderScript);
@@ -475,7 +474,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         processInfo.ArgumentList.Add(manifestPath);
         processInfo.ArgumentList.Add("--output");
         processInfo.ArgumentList.Add(blendPath);
-        var meddleToolsDirectory = Path.Combine(builderDirectory, "MeddleTools");
+        var meddleToolsDirectory = builderAssets.ResolveInside("MeddleTools");
         if (Directory.Exists(meddleToolsDirectory))
         {
             processInfo.ArgumentList.Add("--meddle-tools");
@@ -539,33 +538,7 @@ public sealed class QuickBlendExportService : IService, IDisposable
         }
     }
 
-    private string? FindBlenderExecutable()
-    {
-        if (!string.IsNullOrWhiteSpace(configuration.BlenderExecutablePath)
-            && File.Exists(configuration.BlenderExecutablePath))
-        {
-            return configuration.BlenderExecutablePath;
-        }
-
-        var environmentPath = Environment.GetEnvironmentVariable("XIVBLEND_BLENDER");
-        if (!string.IsNullOrWhiteSpace(environmentPath) && File.Exists(environmentPath))
-        {
-            return environmentPath;
-        }
-
-        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-        var blenderRoot = Path.Combine(programFiles, "Blender Foundation");
-        if (!Directory.Exists(blenderRoot))
-        {
-            return null;
-        }
-
-        return Directory.EnumerateFiles(blenderRoot, "blender.exe", SearchOption.AllDirectories)
-            .OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-    }
-
-    private string ExtractBuilderAssets()
+    private TemporaryAssetExtraction ExtractBuilderAssets()
     {
         const string resourcePrefix = "XivBlendBuilder/";
         var assembly = Assembly.GetExecutingAssembly();
@@ -577,33 +550,36 @@ public sealed class QuickBlendExportService : IService, IDisposable
             throw new InvalidOperationException("The plugin contains no embedded Blender builder assets.");
         }
 
-        var builderRoot = Path.GetFullPath(Path.Combine(
-            pluginInterface.ConfigDirectory.FullName,
-            "XivBlendBuilder-0.9.0"));
-        Directory.CreateDirectory(builderRoot);
-        var requiredPrefix = builderRoot + Path.DirectorySeparatorChar;
+        var extraction = TemporaryAssetExtraction.Create(
+            pluginInterface.ConfigDirectory,
+            "XivBlendBuilder",
+            XivBlendCompanionVersions.Builder);
 
-        foreach (var resourceName in resourceNames)
+        try
         {
-            var relativePath = resourceName[resourcePrefix.Length..]
-                .Replace('/', Path.DirectorySeparatorChar)
-                .Replace('\\', Path.DirectorySeparatorChar);
-            var destination = Path.GetFullPath(Path.Combine(builderRoot, relativePath));
-            if (!destination.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase))
+            foreach (var resourceName in resourceNames)
             {
-                throw new InvalidOperationException("An embedded builder asset resolved outside its extraction directory.");
+                var relativePath = resourceName[resourcePrefix.Length..]
+                    .Replace('/', Path.DirectorySeparatorChar)
+                    .Replace('\\', Path.DirectorySeparatorChar);
+                var destination = extraction.ResolveInside(relativePath);
+
+                var parentDirectory = Path.GetDirectoryName(destination)
+                    ?? throw new InvalidOperationException("An embedded builder asset has no parent directory.");
+                Directory.CreateDirectory(parentDirectory);
+                using var input = assembly.GetManifestResourceStream(resourceName)
+                    ?? throw new InvalidOperationException($"Could not open embedded asset {resourceName}.");
+                using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
             }
 
-            var parentDirectory = Path.GetDirectoryName(destination)
-                ?? throw new InvalidOperationException("An embedded builder asset has no parent directory.");
-            Directory.CreateDirectory(parentDirectory);
-            using var input = assembly.GetManifestResourceStream(resourceName)
-                ?? throw new InvalidOperationException($"Could not open embedded asset {resourceName}.");
-            using var output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None);
-            input.CopyTo(output);
+            return extraction;
         }
-
-        return builderRoot;
+        catch
+        {
+            extraction.Dispose();
+            throw;
+        }
     }
 
     public void Dispose()

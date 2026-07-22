@@ -14,6 +14,9 @@ using FFXIVClientStructs.Havok.Common.Serialize.Util;
 using Meddle.Utils.Files;
 using Microsoft.Extensions.Logging;
 using SharpGLTF.Animations;
+using SharpGLTF.Geometry;
+using SharpGLTF.Geometry.VertexTypes;
+using SharpGLTF.Materials;
 using SharpGLTF.Scenes;
 using SharpGLTF.Schema2;
 using SharpGLTF.Transforms;
@@ -165,7 +168,7 @@ public sealed class VanillaPapAnimationExporter : IService
         }
 
         scene.AddSkinnedMesh(
-            AnimationExportService.GetDummyMesh("XIVBLEND_ANIMATION_BINDER"),
+            CreateAnimationBinderMesh(),
             Matrix4x4.Identity,
             nodes.ToArray());
         var armature = new NodeBuilder("Armature");
@@ -219,6 +222,21 @@ public sealed class VanillaPapAnimationExporter : IService
             sampled.FrameCount,
             sampled.AnimatedBoneCount,
             outputPath);
+    }
+
+    // Adapted from VFXEditor's GltfSkeleton helper. The tiny triangle gives
+    // glTF a skinned primitive to bind to the otherwise animation-only rig.
+    private static MeshBuilder<VertexPosition, VertexEmpty, VertexJoints4> CreateAnimationBinderMesh()
+    {
+        var mesh = new MeshBuilder<VertexPosition, VertexEmpty, VertexJoints4>("XIVBLEND_ANIMATION_BINDER");
+        var material = new MaterialBuilder("material");
+
+        mesh.UsePrimitive(material).AddTriangle(
+            (new VertexPosition(0.000001f, 0, 0), new VertexEmpty(), new VertexJoints4(0)),
+            (new VertexPosition(0, 0.000001f, 0), new VertexEmpty(), new VertexJoints4(0)),
+            (new VertexPosition(0, 0, 0.000001f), new VertexEmpty(), new VertexJoints4(0)));
+
+        return mesh;
     }
 
     private static SelectedPapAnimation SelectAnimation(

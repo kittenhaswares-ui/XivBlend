@@ -2,13 +2,6 @@
 
 namespace Meddle.Plugin.Models;
 
-public enum MenuType
-{
-    Default = 0,
-    Debug = 1,
-    Testing = 2,
-}
-
 [Flags]
 public enum ExportType
 {
@@ -17,12 +10,6 @@ public enum ExportType
     GLB = 2,
     OBJ = 4
     // ReSharper restore InconsistentNaming
-}
-
-public enum TextureMode
-{
-    Bake,
-    Raw
 }
 
 [Flags]
@@ -73,13 +60,4 @@ public enum HumanEquipmentSlotIndex
     LFinger = 9,
     Glasses = 10,
     Extra = 11,
-}
-
-public enum HumanSkinSlotIndex
-{
-    Head = 0,
-    Body = 1,
-    Hands = 2,
-    Legs = 3,
-    Feet = 4,
 }

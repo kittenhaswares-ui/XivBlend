@@ -25,11 +25,4 @@ public sealed class MainWindow : MeddleWindowBase
         return tabs;
     }
 
-    public void Dispose()
-    {
-        foreach (var tab in tabs)
-        {
-            tab.Dispose();
-        }
-    }
 }

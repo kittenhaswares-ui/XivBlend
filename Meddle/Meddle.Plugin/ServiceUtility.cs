@@ -1,6 +1,4 @@
-using System.Reflection;
 using Dalamud.Interface.Windowing;
-using Dalamud.Plugin;
 using Meddle.Plugin.Services;
 using Meddle.Plugin.UI;
 using Meddle.Plugin.UI.Windows;
@@ -20,15 +18,21 @@ public static class ServiceUtility
                .AddHostedService<WindowManager>();
     }
 
-    public static IServiceCollection AddServices(this IServiceCollection services, IDalamudPluginInterface pluginInterface)
+    public static IServiceCollection AddServices(this IServiceCollection services)
     {
-        var serviceTypes = Assembly.GetExecutingAssembly().GetTypes()
-                                   .Where(t => t is {IsClass: true, IsAbstract: false} && typeof(IService).IsAssignableFrom(t));
-        foreach (var serviceType in serviceTypes)
-        {
-            services.AddSingleton(serviceType);
-        }
-        
-        return services;
+        return services
+               .AddSingleton<AnimationPropAssetExporter>()
+               .AddSingleton<AnimationVfxAssetExporter>()
+               .AddSingleton<AnimationLibraryService>()
+               .AddSingleton<BlenderAnimationBrowserInstaller>()
+               .AddSingleton<CharacterPartProvenanceService>()
+               .AddSingleton<ComposerFactory>()
+               .AddSingleton<PenumbraAnimationModService>()
+               .AddSingleton<PbdHooks>()
+               .AddSingleton<QuickBlendExportService>()
+               .AddSingleton<ResolverService>()
+               .AddSingleton<RsfWatcher>()
+               .AddSingleton<StainProvider>()
+               .AddSingleton<VanillaPapAnimationExporter>();
     }
 }

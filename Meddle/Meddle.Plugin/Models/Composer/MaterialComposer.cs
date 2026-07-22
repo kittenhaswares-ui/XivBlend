@@ -55,15 +55,6 @@ public class MaterialComposer
         }
     }
 
-    public void SetPropertiesFromInstance(IStainableInstance instance)
-    {
-        if (instance is {Stain: not null} stainInstance && stainInstance.Stain.RowId != 0)
-        {
-            SetProperty("StainColor", stainInstance.Stain.Color.AsFloatArray());
-            SetProperty("StainId", stainInstance.Stain.RowId);
-        }
-    }
-    
     public void SetPropertiesFromColorTable(IColorTableSet colorTableSet)
     {
         if (colorTableSet is ColorTableSet colorTable)

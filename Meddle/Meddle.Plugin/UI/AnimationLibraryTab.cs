@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Colors;
-using Meddle.Plugin.Models;
 using Meddle.Plugin.Services;
 
 namespace Meddle.Plugin.UI;
@@ -30,8 +29,6 @@ public sealed class AnimationLibraryTab : ITab
     }
 
     public string Name => "Animations";
-    public int Order => -90;
-    public MenuType MenuType => MenuType.Default;
 
     public void Draw()
     {
@@ -222,7 +219,4 @@ public sealed class AnimationLibraryTab : ITab
         }
     }
 
-    public void Dispose()
-    {
-    }
 }

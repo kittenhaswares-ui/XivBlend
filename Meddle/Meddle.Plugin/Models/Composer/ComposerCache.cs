@@ -382,19 +382,14 @@ public class ComposerCache
         return TrackCacheFile(pngCachePath);
     }
     
-    public MaterialBuilder ComposeMaterial(string mtrlPath, 
+    public MaterialBuilder ComposeMaterial(string mtrlPath,
                                            ParsedMaterialInfo? materialInfo = null,
-                                           IStainableInstance? stainInstance = null, 
                                            ParsedCharacterInfo? characterInfo = null)
     {
         var mtrlFile = GetMtrlFile(mtrlPath, out var mtrlCachePath);
         var shaderPackage = GetShaderPackage(mtrlFile.GetShaderPackageName());
         var material = new MaterialComposer(mtrlFile, mtrlPath, shaderPackage);
-        if (stainInstance != null)
-        {
-            material.SetPropertiesFromInstance(stainInstance);
-        }
-        
+
         if (mtrlCachePath != null)
         {
             material.SetProperty("MtrlCachePath", Path.GetRelativePath(cacheDir, mtrlCachePath));

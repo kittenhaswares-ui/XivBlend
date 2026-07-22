@@ -5,14 +5,6 @@ using Meddle.Utils.Files.Structs.Model;
 
 namespace Meddle.Plugin.Models.Structs;
 
-[StructLayout(LayoutKind.Explicit, Size = 0x2A0)]
-public unsafe struct MeddleModelResourceHandle
-{
-    [FieldOffset(0x0)] public FFXIVClientStructs.FFXIV.Client.System.Resource.Handle.ModelResourceHandle* Base;
-    [FieldOffset(0xC8)] public byte* ModelData; // StringTable, ModelHeader ...
-    public ModelResourceHandleData GetData() => new(Base->ModelData);
-} 
-
 [StructLayout(LayoutKind.Explicit, Size = 0x158)]
 public unsafe struct MeddleModel
 {
