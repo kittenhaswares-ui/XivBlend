@@ -106,6 +106,27 @@ def verify_fresh_export_render_settings() -> None:
                 close(stored, getattr(light.data, attribute)),
                 f"fresh export stored the wrong Beauty {attribute} baseline",
             )
+        for attribute, actual in (
+            ("location", light.location),
+            ("rotation_euler", light.rotation_euler),
+            ("color", light.data.color),
+        ):
+            stored = light.get(f"xivblend_beauty_{attribute}")
+            require(stored is not None, f"fresh export omitted Beauty {attribute} baseline")
+            require(
+                len(stored) == 3
+                and all(close(value, wanted) for value, wanted in zip(stored, actual)),
+                f"fresh export stored the wrong Beauty {attribute} baseline",
+            )
+        require(
+            "xivblend_beauty_use_shadow" in light
+            and
+            bool(light.get("xivblend_beauty_use_shadow"))
+            == bool(light.data.use_shadow),
+            "fresh export stored the wrong Beauty shadow baseline",
+        )
+    require(len(scene.get("xivblend_studio_center", ())) == 3, "studio center is missing")
+    require(scene.get("xivblend_studio_scale", 0.0) > 0.0, "studio scale is missing")
     require(scene.world.get("xivblend_component") == "studio_world", "studio world is untagged")
     require(
         close(scene.world.get("xivblend_beauty_strength"), 0.045),
@@ -125,6 +146,12 @@ def create_legacy_studio(scene):
         "fill": (20.0, 4.0, 5.0, 1.2),
         "rim": (40.0, 1.0, 4.5, 1.0),
     }
+    colors = {
+        "key": (0.91, 0.67, 0.43),
+        "fill": (0.31, 0.58, 0.88),
+        "rim": (0.72, 0.28, 0.91),
+    }
+    shadows = {"key": True, "fill": False, "rim": True}
     lights = {}
     for role, (energy, size, size_y, spread) in values.items():
         data = bpy.data.lights.new(f"{role.title()} Light Test Data", "AREA")
@@ -133,6 +160,8 @@ def create_legacy_studio(scene):
         data.size = size
         data.size_y = size_y
         data.spread = spread
+        data.color = colors[role]
+        data.use_shadow = shadows[role]
         obj = bpy.data.objects.new(f"{role.title()} Light Test", data)
         scene.collection.objects.link(obj)
         obj["xivblend_component"] = "studio_light"
@@ -145,7 +174,34 @@ def create_legacy_studio(scene):
     # fallback must remain limited to XivBlend's old AREA lights.
     user_light = bpy.data.objects.new("Key Light User Point", user_data)
     scene.collection.objects.link(user_light)
-    return lights, values, user_light
+    user_area_data = bpy.data.lights.new("Key Light User Area Data", "AREA")
+    user_area_data.energy = 654.0
+    user_area = bpy.data.objects.new("Key Light User Area", user_area_data)
+    user_area.location = (7.0, 8.0, 9.0)
+    scene.collection.objects.link(user_area)
+    return lights, values, user_light, user_area
+
+
+def create_material_fixture(scene, name, shader, value, subsurface, *, linked=False):
+    material = bpy.data.materials.new(name)
+    material.use_nodes = True
+    material["ShaderPackage"] = shader
+    material["GetMaterialValue"] = value
+    principled = material.node_tree.nodes.get("Principled BSDF")
+    socket = principled.inputs["Subsurface Weight"]
+    socket.default_value = subsurface
+    upstream = None
+    if linked:
+        upstream = material.node_tree.nodes.new("ShaderNodeValue")
+        upstream.outputs[0].default_value = subsurface
+        material.node_tree.links.new(upstream.outputs[0], socket)
+
+    mesh_data = bpy.data.meshes.new(f"{name} Mesh")
+    mesh_data.from_pydata([(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.0, 0.1, 0.0)], [], [(0, 1, 2)])
+    mesh = bpy.data.objects.new(f"{name} Object", mesh_data)
+    mesh_data.materials.append(material)
+    scene.collection.objects.link(mesh)
+    return material, principled, upstream
 
 
 class _RestrictedData:
@@ -231,8 +287,36 @@ def main() -> None:
         require(scene.render.engine == "CYCLES", "load_post changed an unrelated file's engine")
         require(close(scene.view_settings.exposure, 1.25), "load_post changed unrelated exposure")
 
-        lights, beauty_values, user_light = create_legacy_studio(scene)
+        lights, beauty_values, user_light, user_area = create_legacy_studio(scene)
         user_energy = float(user_light.data.energy)
+        user_area_state = (float(user_area.data.energy), tuple(user_area.location))
+        scene["xivblend_studio_center"] = (0.25, -0.50, 1.00)
+        scene["xivblend_studio_scale"] = 2.0
+        face, face_principled, _ = create_material_fixture(
+            scene, "Eligible Face", "skin.shpk", "GetMaterialValueFace", 0.27
+        )
+        body, body_principled, _ = create_material_fixture(
+            scene, "Body Skin", "skin.shpk", "GetMaterialValueBody", 0.33
+        )
+        linked_face, linked_principled, linked_value = create_material_fixture(
+            scene,
+            "Linked Face",
+            "skin.shpk",
+            "GetMaterialValueFace",
+            0.41,
+            linked=True,
+        )
+        low_sss_face, low_sss_principled, _ = create_material_fixture(
+            scene, "Low SSS Face", "skin.shpk", "GetMaterialValueFace", 0.04
+        )
+        orphan = bpy.data.materials.new("Orphan Face")
+        orphan.use_nodes = True
+        orphan["ShaderPackage"] = "skin.shpk"
+        orphan["GetMaterialValue"] = "GetMaterialValueFace"
+        orphan_socket = orphan.node_tree.nodes["Principled BSDF"].inputs[
+            "Subsurface Weight"
+        ]
+        orphan_socket.default_value = 0.29
 
         scene.xivblend_render_quality = "ANIMATE"
         require(scene.render.engine == "BLENDER_EEVEE", "Animate did not retain Eevee renders")
@@ -247,6 +331,36 @@ def main() -> None:
             scene.cycles.transparent_max_bounces == 128,
             "Beauty does not preserve deeply layered alpha-card hair or fur",
         )
+        require(
+            close(
+                face_principled.inputs["Subsurface Weight"].default_value,
+                addon.FACE_SKIN_RENDER_SSS_WEIGHT,
+            ),
+            "Beauty did not reduce broad face subsurface wash",
+        )
+        require(
+            close(low_sss_principled.inputs["Subsurface Weight"].default_value, 0.04),
+            "Beauty increased an intentionally low face subsurface value",
+        )
+        require(
+            close(body_principled.inputs["Subsurface Weight"].default_value, 0.33),
+            "Beauty changed body skin",
+        )
+        require(
+            linked_principled.inputs["Subsurface Weight"].is_linked
+            and close(linked_value.outputs[0].default_value, 0.41),
+            "Beauty changed a linked face-skin input",
+        )
+        require(close(orphan_socket.default_value, 0.29), "Beauty changed an orphan material")
+        beauty_transforms = {
+            role: {
+                "location": tuple(light.location),
+                "rotation": tuple(light.rotation_euler),
+                "color": tuple(light.data.color),
+                "shadow": bool(light.data.use_shadow),
+            }
+            for role, light in lights.items()
+        }
         for role, expected in beauty_values.items():
             light = lights[role]
             actual = (light.data.energy, light.data.size, light.data.size_y, light.data.spread)
@@ -282,12 +396,82 @@ def main() -> None:
         require(close(scene.view_settings.exposure, -0.55), "Dramatic Detail exposure changed")
         require(close(user_light.data.energy, user_energy), "Dramatic Detail changed a user light")
 
+        scene.xivblend_render_quality = "MOOD"
+        require(scene.render.engine == "CYCLES", "Mood did not select Cycles")
+        center = addon.Vector((0.25, -0.50, 1.00))
+        scale = 2.0
+        target = center + addon.Vector((0.0, 0.0, 0.34 * scale))
+        for role, light in lights.items():
+            profile = addon.MOOD_LIGHT_PROFILE[role]
+            expected_location = center + addon.Vector(profile["offset"]) * scale
+            require(
+                all(close(value, wanted) for value, wanted in zip(light.location, expected_location)),
+                f"Mood placed the {role} light incorrectly",
+            )
+            require(
+                close(light.data.energy, profile["energy"] * scale * scale)
+                and close(light.data.size, profile["size"] * scale)
+                and close(light.data.size_y, profile["size_y"] * scale)
+                and close(light.data.spread, profile["spread"]),
+                f"Mood configured the {role} softbox incorrectly",
+            )
+            require(
+                bool(light.data.use_shadow) == bool(profile["use_shadow"]),
+                f"Mood configured the {role} shadow incorrectly",
+            )
+            forward = light.rotation_euler.to_quaternion() @ addon.Vector((0.0, 0.0, -1.0))
+            require(
+                forward.normalized().dot((target - light.location).normalized()) > 0.99999,
+                f"Mood did not aim the {role} light at the portrait",
+            )
+            require(
+                all(
+                    close(value, wanted)
+                    for value, wanted in zip(light.data.color, addon.MOOD_LIGHT_COLORS[role])
+                ),
+                f"Mood configured the {role} color incorrectly",
+            )
+        require(
+            close(
+                scene.world.node_tree.nodes["Background"].inputs["Strength"].default_value,
+                addon.MOOD_WORLD_STRENGTH,
+            ),
+            "Mood world fill changed",
+        )
+        require(
+            close(scene.view_settings.exposure, addon.MOOD_EXPOSURE),
+            "Mood exposure changed",
+        )
+        require(close(user_light.data.energy, user_energy), "Mood changed a user light")
+        require(
+            close(user_area.data.energy, user_area_state[0])
+            and tuple(user_area.location) == user_area_state[1],
+            "Mood changed an unrelated user area light",
+        )
+        require(
+            close(
+                face_principled.inputs["Subsurface Weight"].default_value,
+                addon.FACE_SKIN_RENDER_SSS_WEIGHT,
+            ),
+            "Mood recaptured the already-active face baseline",
+        )
+
         scene.xivblend_color_preset = "ACCURATE"
         require(
             scene.view_settings.view_transform == "Khronos PBR Neutral",
             "accurate-color transform changed",
         )
-        require(close(scene.view_settings.exposure, -0.55), "color preset erased Dramatic exposure")
+        require(
+            close(scene.view_settings.exposure, addon.MOOD_EXPOSURE),
+            "color preset erased Mood exposure",
+        )
+        require(
+            all(all(close(channel, 1.0) for channel in light.data.color) for light in lights.values()),
+            "accurate-color Mood lights are not neutral",
+        )
+
+        scene.xivblend_render_quality = "DRAMATIC"
+        require(close(scene.view_settings.exposure, -0.55), "Detail-after-Mood exposure changed")
         require(
             all(
                 all(
@@ -308,12 +492,21 @@ def main() -> None:
         )
 
         scene.xivblend_render_quality = "BEAUTY"
+        scene.xivblend_color_preset = "BEAUTY"
         for role, expected in beauty_values.items():
             light = lights[role]
             actual = (light.data.energy, light.data.size, light.data.size_y, light.data.spread)
             require(
                 all(close(value, wanted) for value, wanted in zip(actual, expected)),
                 f"Beauty did not restore the {role} light exactly",
+            )
+            restored = beauty_transforms[role]
+            require(
+                all(close(value, wanted) for value, wanted in zip(light.location, restored["location"]))
+                and all(close(value, wanted) for value, wanted in zip(light.rotation_euler, restored["rotation"]))
+                and all(close(value, wanted) for value, wanted in zip(light.data.color, restored["color"]))
+                and bool(light.data.use_shadow) == restored["shadow"],
+                f"Beauty did not restore the {role} transform, color and shadow",
             )
         require(close(scene.world.node_tree.nodes["Background"].inputs["Strength"].default_value, 0.045), "Beauty did not restore world fill")
 
@@ -336,6 +529,77 @@ def main() -> None:
                 f"Preview did not restore the {role} Beauty light",
             )
         require(close(scene.world.node_tree.nodes["Background"].inputs["Strength"].default_value, 0.045), "Preview did not restore world fill")
+        require(
+            close(face_principled.inputs["Subsurface Weight"].default_value, 0.27),
+            "Preview did not restore the original face subsurface value",
+        )
+        require(
+            close(low_sss_principled.inputs["Subsurface Weight"].default_value, 0.04),
+            "Preview did not restore the low-SSS face baseline",
+        )
+        face_principled.inputs["Subsurface Weight"].default_value = 0.19
+        scene.xivblend_render_quality = "MOOD"
+        scene.xivblend_render_quality = "PREVIEW"
+        require(
+            close(face_principled.inputs["Subsurface Weight"].default_value, 0.19),
+            "face baseline did not refresh after a user edit in Preview",
+        )
+
+        # A material artist may rewire the active output while a final preset
+        # is selected. Preview must still restore the exact Principled node
+        # XivBlend changed, even when that node is no longer the active shader.
+        scene.xivblend_render_quality = "MOOD"
+        face_tree = face.node_tree
+        face_output = next(
+            node
+            for node in face_tree.nodes
+            if node.type == "OUTPUT_MATERIAL" and node.is_active_output
+        )
+        face_tree.links.remove(face_output.inputs["Surface"].links[0])
+        replacement = face_tree.nodes.new("ShaderNodeBsdfDiffuse")
+        face_tree.links.new(replacement.outputs["BSDF"], face_output.inputs["Surface"])
+        scene.xivblend_render_quality = "PREVIEW"
+        require(
+            close(face_principled.inputs["Subsurface Weight"].default_value, 0.19)
+            and not bool(face.get(addon.FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False)),
+            "Preview did not restore a face Principled node after output rewiring",
+        )
+        face_tree.links.remove(face_output.inputs["Surface"].links[0])
+        face_tree.links.new(face_principled.outputs["BSDF"], face_output.inputs["Surface"])
+        face_tree.nodes.remove(replacement)
+
+        scene.xivblend_render_quality = "MOOD"
+        unrelated_scene = bpy.data.scenes.new("Unrelated Save Scene")
+        bpy.context.window.scene = unrelated_scene
+        addon._save_pre_handler(None)
+        require(
+            close(face_principled.inputs["Subsurface Weight"].default_value, 0.19)
+            and not bool(face.get(addon.FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False)),
+            "save_pre did not restore active face skin from another scene",
+        )
+        addon._resume_after_save()
+        require(
+            close(
+                face_principled.inputs["Subsurface Weight"].default_value,
+                addon.FACE_SKIN_RENDER_SSS_WEIGHT,
+            )
+            and bool(face.get(addon.FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False)),
+            "save_post did not resume the exact face profile from another scene",
+        )
+        bpy.context.window.scene = scene
+        scene.xivblend_render_quality = "PREVIEW"
+
+        # The save callback is delayed briefly by Blender. If the user changes
+        # back to Preview in that gap, it must not resurrect final-mode SSS.
+        scene.xivblend_render_quality = "MOOD"
+        addon._save_pre_handler(None)
+        scene.xivblend_render_quality = "PREVIEW"
+        addon._resume_after_save()
+        require(
+            close(face_principled.inputs["Subsurface Weight"].default_value, 0.19)
+            and not bool(face.get(addon.FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False)),
+            "delayed save resume reapplied face tuning after switching to Preview",
+        )
 
         scene.xivblend_background_preset = "TRANSPARENT"
         require(scene.render.film_transparent, "transparent background did not enable film alpha")
@@ -344,22 +608,38 @@ def main() -> None:
         require(scene.render.image_settings.file_format == "OPEN_EXR", "EXR output changed")
         require(scene.render.image_settings.color_depth == "16", "EXR depth changed")
 
-        # Simulate reopening a file saved by browser 0.7.1: the enum already
-        # says Beauty, so no UI update callback fires, but Cycles still has the
-        # old eight-layer transparency cutoff. load_post must migrate it.
-        scene.xivblend_render_quality = "BEAUTY"
+        # Simulate reopening a final-mode file: no enum callback fires, so the
+        # load handler must migrate Cycles, rebuild Mood without drift and
+        # reapply temporary face detail after saving the untouched baseline.
+        scene.xivblend_render_quality = "MOOD"
         scene.cycles.transparent_max_bounces = 8
         with tempfile.TemporaryDirectory(prefix="xivblend-render-studio-") as folder:
-            blend_path = str(Path(folder) / "legacy-beauty.blend")
+            blend_path = str(Path(folder) / "saved-mood.blend")
             bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False)
             bpy.ops.wm.open_mainfile(filepath=blend_path)
             scene = bpy.context.scene
-            require(scene.xivblend_render_quality == "BEAUTY", "saved Beauty mode was lost")
+            require(scene.xivblend_render_quality == "MOOD", "saved Mood mode was lost")
             require(
                 scene.cycles.transparent_max_bounces == 128,
-                "load_post did not migrate an already-selected Beauty file",
+                "load_post did not migrate an already-selected Mood file",
             )
             require(scene.cycles.max_bounces == 8, "load_post changed ordinary max bounces")
+            reopened_face = bpy.data.materials["Eligible Face"]
+            reopened_socket = reopened_face.node_tree.nodes["Principled BSDF"].inputs[
+                "Subsurface Weight"
+            ]
+            require(
+                close(
+                    reopened_socket.default_value,
+                    addon.FACE_SKIN_RENDER_SSS_WEIGHT,
+                ),
+                "Mood reload lost face detail",
+            )
+            scene.xivblend_render_quality = "PREVIEW"
+            require(
+                close(reopened_socket.default_value, 0.19),
+                "Preview after Mood reload did not restore the saved face baseline",
+            )
     finally:
         addon.unregister()
 

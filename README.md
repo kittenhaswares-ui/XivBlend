@@ -74,6 +74,9 @@ The exported file already contains a portrait camera, a studio sweep, lights, pa
 - **Preview** uses Eevee with the real materials for quick visual checks.
 - **Beauty** uses softly filled Cycles studio lighting, adaptive sampling, denoising, and enough transparent ray depth for dense layered hair and fur cards.
 - **Detail** uses the same clean Cycles renderer with a tighter key light, much less fill, and deeper shadows to reveal face, hair, normal-map, and clothing-fold detail.
+- **Mood** uses a photographer-style warm side key, near-black ambient fill, and a cool rear edge for strong Rembrandt shadows and localized highlights.
+
+The three final Cycles modes also reduce only the broad subsurface wash on materials explicitly marked as FFXIV face skin. This makes facial planes a little firmer while preserving the exported diffuse, normal, pore-detail, roughness, specular, makeup, and mod texture links. Preview, Animate, saving, and disabling the Blender panel restore the material's exact original subsurface value.
 
 You can choose a charcoal, neutral gray, or transparent background; attractive AgX color or more neutral mod-accurate color; and Web PNG, 16-bit PNG, or EXR output. **Fit Camera to Current Pose** frames one pose. **Fit Camera to Whole Animation** leaves room for the full movement. **Render Portrait** renders the current frame.
 
@@ -86,7 +89,7 @@ The normal Timeline also contains an A-pose at frame 0 and the captured game pos
 - **Animation-browser setup is red:** the previous Blender panel is still active because the update did not install. Update XivBlend, run **Set Up / Update Animation Browser** again, and restart Blender before testing emotes. You can reopen the same `.blend`; click the emote again so XivBlend rebuilds any older cached bundle.
 - **An emote does nothing:** keep FFXIV and XivBlend open, refresh the game catalog, and click again after extraction finishes.
 - **Animation playback is slow:** use **Animate**. Eevee and especially Cycles calculate materials, lighting, and shadows and are intended for previews or final stills.
-- **Dense hair or fur has black blocks in Beauty:** update XivBlend, reinstall the Blender panel, and restart Blender. Browser 0.8.0 migrates the saved render preset when the existing `.blend` reopens; no character re-export is needed.
+- **Dense hair or fur has black blocks in Beauty:** update XivBlend, reinstall the Blender panel, and restart Blender. Browser 0.9.0 migrates the saved render preset when the existing `.blend` reopens; no character re-export is needed.
 - **Setup reports modified game files:** restore TexTools index changes. Normal Penumbra mods do not need to be disabled.
 - **Disk use keeps growing:** repeated exports are separate by design; remove old timestamped folders manually.
 

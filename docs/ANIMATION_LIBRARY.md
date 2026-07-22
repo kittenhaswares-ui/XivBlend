@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.17 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
+XivBlend 0.0.18 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
 
 ## Scope
 
@@ -49,7 +49,7 @@ The filter is data-driven, so a future game update can change the count without 
 
 ## Set up and use
 
-1. Install XivBlend 0.0.17 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.18 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both status messages to finish.
 4. Export a character with race and face-skeleton metadata, then restart Blender if it was already open.
@@ -76,12 +76,14 @@ The importer has conservative PAP size, cumulative-import, animation-count, dura
 
 ## Render Studio controls
 
-Animation-browser 0.8.0 also provides **XivBlend** → **Render Studio**:
+Animation-browser 0.9.0 also provides **XivBlend** → **Render Studio**:
 
 - **Animate** switches the 3D View to Blender's lightweight Solid shading without replacing any character material.
 - **Preview** uses Eevee, the real materials, and the exported studio lights for quick shaded checks.
 - **Beauty** uses softly filled Cycles studio lighting, adaptive sampling, denoising, conservative ordinary light paths, 128 transparent bounces for dense layered alpha-card hair and fur, and the user's configured Cycles device for final stills.
 - **Detail** keeps the same materials, Cycles sample budget, denoising, and transparent depth while tightening the key, reducing fill and ambient world light, and adding deeper surface-defining shadows. Switching away restores the exact Beauty light rig.
+- **Mood** moves the same three lights into a photographer-style warm side-key/cool-kicker arrangement with almost no ambient fill, producing strong facial and body shadow without adding volumes or more render lights.
+- Final Cycles modes temporarily reduce only broad subsurface wash on positively identified FFXIV face-skin materials. Original values are restored for Animate, Preview, saving, and add-on removal; linked inputs and all texture/normal/roughness/specular graphs remain untouched.
 - Background presets provide the repeatable charcoal sweep, neutral gray, or transparency. Color presets provide AgX beauty color or Khronos PBR Neutral for more literal mod colors.
 - **Fit Camera to Current Pose** frames the current Timeline frame.
 - **Fit Camera to Whole Animation** measures up to 96 evenly spaced poses across the active bundle.
@@ -89,7 +91,7 @@ Animation-browser 0.8.0 also provides **XivBlend** → **Render Studio**:
 
 The retired clay material override is removed automatically if an older file or session still contains it. Runtime animation, prop, and effect data are still removed before saving and restored afterward, so a preview does not silently bloat the character `.blend`.
 
-When an existing file opens, browser 0.8.0 safely reapplies its saved Render Studio preset without changing the saved viewport shading. This also migrates old Beauty files from the former eight-layer transparent-ray cutoff.
+When an existing file opens, browser 0.9.0 safely reapplies its saved Render Studio preset without changing the saved viewport shading. This also migrates old Beauty files from the former eight-layer transparent-ray cutoff and reconstructs a saved Mood setup from stored Beauty baselines without cumulative drift.
 
 ## Cache and updates
 
@@ -101,7 +103,7 @@ The shared cache is stored under:
 
 Catalog builds are separated by game version, client language, and converter version. Body cache paths also include the captured face key, and custom cards include a content-derived identity. `current.json` points Blender to the active build. Icons are prepared during setup; bundles and GLBs are generated only when clicked.
 
-The 0.0.17 compatibility line is animation browser 0.8.0, character builder 0.10.1, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
+The 0.0.18 compatibility line is animation browser 0.9.0, character builder 0.10.2, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
 
 - Run **Refresh Game Catalog** after a game update, language change, or custom-source import.
 - Use **Reinstall Blender Panel** when only the add-on needs an update.
