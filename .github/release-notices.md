@@ -1,20 +1,24 @@
-# XivBlend Prototype 0.0.16
+# XivBlend Prototype 0.0.17
 
-This maintenance update fixes the failed Blender-panel upgrade that left an older browser active, and repairs black food props without replacing their real FFXIV textures.
+This update fixes dark opaque patches in densely layered modded hair and fur and adds an optional shadowed Cycles portrait look.
 
 ## What changed
 
-- Defers old Render Studio cleanup until Blender has finished enabling the add-on. Blender 5.2 no longer rejects the browser with `_RestrictData` and rolls back to an older copy.
-- Uses one transparent neutral texture when a temporary game prop has a linked but absent optional decal. Real diffuse, normal, mask, index, tile, and decal textures remain untouched.
-- Installs animation browser 0.7.1, so the saved original hand-socket basis is actually used for supported consumable props instead of the old skyward orientation.
-- Adds Blender 5.0 and 5.2 regression coverage for restricted add-on registration and Pizza/Apple runtime materials.
+- Raises only Cycles' transparent-ray depth from 8 to 128. Ordinary light-path depth remains 8, so opaque scenes do not pay for extra diffuse, glossy, or transmission bounces.
+- Applies the correction to new exports and automatically migrates the saved Render Studio preset when an existing `.blend` opens; **Beauty**, **Detail**, and **Render Portrait** also reassert it.
+- Adds **Render Studio** → **Detail**: the same materials and 256-sample adaptive Cycles setup as Beauty, but with a tighter key, much less fill and ambient light, and deeper shadows for face, hair, normal-map, and clothing-fold detail.
+- Restores the exact soft Beauty rig when switching back to Beauty, Preview, or Animate; repeated switching cannot accumulate light changes.
+- Keeps source textures and alpha masks unchanged; there is no texture conversion or quality loss.
+- Adds Blender 5.0 and 5.2 regression coverage for both configuration paths.
+
+The failing Wheel tail contains up to 96 overlapping transparent fur cards along a tested camera ray. The previous limit stopped those rays early and rendered the remaining layers black; 128 safely clears the measured stack.
 
 ## Install and test
 
-1. Update or reload XivBlend 0.0.16.
+1. Update or reload XivBlend 0.0.17.
 2. In **Animations**, press **Set Up / Update Animation Browser** and wait for setup to finish without red text.
-3. Close and restart Blender so the running session loads browser 0.7.1.
+3. Close and restart Blender so the running session loads browser 0.8.0.
 4. Reopen the same character `.blend`; no character re-export is required.
-5. Click Apple Eating or Pizza Eating again. An older schema-2 bundle is rebuilt automatically by the current plugin.
+5. In the XivBlend sidebar, select **Render Studio** → **Beauty** again for the soft look, or **Detail** for deeper shadows, and render.
 
-The plugin and Blender panel still ship without FFXIV assets. Exact props and AVFX sources are extracted locally only when a selected emote needs them, remain in the user's shared cache, and must not be redistributed.
+Dense transparent hair or fur can take somewhat longer to render because Cycles now follows those rays until the actual cards are cleared. **Animate** and Eevee **Preview** are unchanged.

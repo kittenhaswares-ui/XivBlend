@@ -26,7 +26,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.10.0"
+BUILDER_VERSION = "0.10.1"
 ANIMATION_CATALOG_SCHEMA = 2
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -69,6 +69,9 @@ STUDIO_CAMERA_SAMPLE_FRAMES = (POSE_CAPTURED_FRAME,)
 POSE_REST_MARKER = "XIV A-POSE"
 POSE_CAPTURED_MARKER = "CAPTURED POSE"
 POSE_MATRIX_TOLERANCE = 1.0e-5
+# Dense modded fur can place dozens of transparent cards along one camera ray.
+# Keep normal light-path depth modest, but allow those cutouts to pass cleanly.
+BEAUTY_TRANSPARENT_MAX_BOUNCES = 128
 
 
 class BuildError(RuntimeError):
@@ -1606,6 +1609,12 @@ def add_area_light(
     point_at(light, target)
     light["xivblend_component"] = "studio_light"
     light["xivblend_studio_role"] = role
+    # Render Studio can temporarily reshape these lights for its dramatic
+    # profile, then restore the exported Beauty setup without cumulative drift.
+    light["xivblend_beauty_energy"] = float(energy)
+    light["xivblend_beauty_size"] = float(size)
+    light["xivblend_beauty_size_y"] = float(light_data.size_y)
+    light["xivblend_beauty_spread"] = float(spread)
     light_linking = getattr(light, "light_linking", None)
     if light_linking is not None and receiver_collection is not None:
         try:
@@ -1793,7 +1802,7 @@ def configure_scene_setup(
         ("diffuse_bounces", 4),
         ("glossy_bounces", 4),
         ("transmission_bounces", 8),
-        ("transparent_max_bounces", 8),
+        ("transparent_max_bounces", BEAUTY_TRANSPARENT_MAX_BOUNCES),
         ("volume_bounces", 2),
         ("caustics_reflective", False),
         ("caustics_refractive", False),
@@ -1812,6 +1821,8 @@ def configure_scene_setup(
     if background is not None:
         background.inputs["Color"].default_value = (0.004, 0.007, 0.014, 1.0)
         background.inputs["Strength"].default_value = 0.045
+    world["xivblend_component"] = "studio_world"
+    world["xivblend_beauty_strength"] = 0.045
     scene.world = world
 
     center, size, _ = character_bounds_across_frames(scene, imported)
@@ -2146,9 +2157,10 @@ def write_embedded_readme() -> None:
         "XivBlend Blender add-on installed, open the N sidebar and use XivBlend > "
         "Render Studio to fit the camera to the current pose or whole animation, then "
         "press Render Portrait.\n"
-        "- Render Studio has three simple modes: Animate uses Blender's fast Solid viewport, "
-        "Preview uses Eevee with the real materials, and Beauty uses Cycles with adaptive "
-        "sampling and denoising. None of these modes replaces character materials.\n"
+        "- Render Studio has four simple modes: Animate uses Blender's fast Solid viewport, "
+        "Preview uses Eevee with the real materials, Beauty uses soft Cycles studio light, and "
+        "Dramatic Detail uses more directional Cycles light and deeper shadows. None of these "
+        "modes replaces character materials.\n"
         "- Charcoal, neutral gray and transparent background presets make repeatable preview "
         "images. Beauty Color uses AgX; Accurate Mod Colors uses neutral lights and Khronos PBR.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
@@ -2772,7 +2784,7 @@ def validate_scene_setup(
         and scene.cycles.diffuse_bounces == 4
         and scene.cycles.glossy_bounces == 4
         and scene.cycles.transmission_bounces == 8
-        and scene.cycles.transparent_max_bounces == 8
+        and scene.cycles.transparent_max_bounces == BEAUTY_TRANSPARENT_MAX_BOUNCES
         and scene.cycles.volume_bounces == 2
         and not scene.cycles.caustics_reflective
         and not scene.cycles.caustics_refractive

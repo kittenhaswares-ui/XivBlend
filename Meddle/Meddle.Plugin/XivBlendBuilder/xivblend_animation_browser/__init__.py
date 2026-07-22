@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 7, 1),
+    "version": (0, 8, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -72,12 +72,33 @@ MAX_PROP_CACHE_FILE_BYTES = 512 * 1024 * 1024
 MAX_PROP_CACHE_TOTAL_BYTES = 8 * 1024 * 1024 * 1024
 STUDIO_BACKDROP_COMPONENT = "studio_backdrop"
 STUDIO_LIGHT_COMPONENT = "studio_light"
+STUDIO_WORLD_COMPONENT = "studio_world"
 STUDIO_BACKGROUND_RAMP = "XivBlend Background Gradient"
+BEAUTY_LIGHT_PROPERTIES = {
+    "energy": "xivblend_beauty_energy",
+    "size": "xivblend_beauty_size",
+    "size_y": "xivblend_beauty_size_y",
+    "spread": "xivblend_beauty_spread",
+}
+BEAUTY_WORLD_STRENGTH_PROPERTY = "xivblend_beauty_strength"
+# Multipliers are relative to the exported soft Beauty rig. The tighter key
+# and much weaker fill reveal normals and folds without changing any material.
+DRAMATIC_LIGHT_PROFILE = {
+    "key": {"energy": 0.70, "size": 0.60, "size_y": 0.58, "spread": 0.72},
+    "fill": {"energy": 0.25, "size": 0.85, "size_y": 0.85, "spread": 0.90},
+    "rim": {"energy": 1.15, "size": 0.65, "size_y": 0.75, "spread": 0.75},
+}
+DRAMATIC_WORLD_STRENGTH_SCALE = 0.40
+BEAUTY_EXPOSURE = -0.40
+DRAMATIC_EXPOSURE = -0.55
 LEGACY_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
 LEGACY_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
 RUNTIME_EFFECT_COLLECTION_PREFIX = "XivBlend Runtime Effects |"
 MATERIAL_RUNTIME_MODULE = "_xivblend_meddle_material_runtime"
 SYNC_CONTROL_VFX = "vfx/common/eff/syncactiontimelineclip01t.avfx"
+# Dense modded fur can exceed 96 overlapping alpha cards. This is independent
+# of ordinary glossy/diffuse bounce depth and only costs rays that cross them.
+BEAUTY_TRANSPARENT_MAX_BOUNCES = 128
 
 _catalog = None
 _catalog_signature = None
@@ -2897,7 +2918,10 @@ def _studio_lights(scene):
         if obj.type == "LIGHT"
         and (
             obj.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_LIGHT_COMPONENT
-            or str(obj.name).startswith(("Key Light", "Fill Light", "Rim Light"))
+            or (
+                obj.data.type == "AREA"
+                and str(obj.name).startswith(("Key Light", "Fill Light", "Rim Light"))
+            )
         )
     ]
 
@@ -2914,9 +2938,84 @@ def _studio_backdrops(scene):
     ]
 
 
+def _studio_light_role(light):
+    role = str(light.get("xivblend_studio_role", "")).casefold()
+    if role in DRAMATIC_LIGHT_PROFILE:
+        return role
+    name = str(light.name).casefold()
+    return next(
+        (
+            candidate
+            for candidate in DRAMATIC_LIGHT_PROFILE
+            if name.startswith(candidate)
+        ),
+        "",
+    )
+
+
+def _stored_float(owner, name, fallback):
+    try:
+        return float(owner.get(name, fallback))
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _beauty_light_baseline(light):
+    if light.data.type != "AREA" or any(
+        not hasattr(light.data, attribute) for attribute in BEAUTY_LIGHT_PROPERTIES
+    ):
+        return None
+    baseline = {}
+    for attribute, property_name in BEAUTY_LIGHT_PROPERTIES.items():
+        current = float(getattr(light.data, attribute))
+        if property_name not in light:
+            light[property_name] = current
+        baseline[attribute] = _stored_float(light, property_name, current)
+    return baseline
+
+
+def _managed_world_background(scene):
+    world = scene.world
+    if world is None or world.node_tree is None:
+        return None, None
+    if not (
+        world.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_WORLD_COMPONENT
+        or world.name == "Neutral World"
+    ):
+        return None, None
+    return world, world.node_tree.nodes.get("Background")
+
+
+def _apply_studio_light_profile(scene, mode):
+    dramatic = mode == "DRAMATIC"
+    for light in _studio_lights(scene):
+        role = _studio_light_role(light)
+        if role not in DRAMATIC_LIGHT_PROFILE:
+            continue
+        baseline = _beauty_light_baseline(light)
+        if baseline is None:
+            continue
+        factors = DRAMATIC_LIGHT_PROFILE[role] if dramatic else None
+        for attribute, value in baseline.items():
+            factor = factors[attribute] if factors is not None else 1.0
+            _set_if_present(light.data, attribute, value * factor)
+
+    world, background = _managed_world_background(scene)
+    if world is not None and background is not None:
+        current = float(background.inputs["Strength"].default_value)
+        if BEAUTY_WORLD_STRENGTH_PROPERTY not in world:
+            world[BEAUTY_WORLD_STRENGTH_PROPERTY] = current
+        baseline = _stored_float(world, BEAUTY_WORLD_STRENGTH_PROPERTY, current)
+        background.inputs["Strength"].default_value = (
+            baseline * DRAMATIC_WORLD_STRENGTH_SCALE if dramatic else baseline
+        )
+
+    scene.view_settings.exposure = DRAMATIC_EXPOSURE if dramatic else BEAUTY_EXPOSURE
+
+
 def _set_studio_shadow_quality(scene, beauty):
     for light in _studio_lights(scene):
-        role = str(light.get("xivblend_studio_role", ""))
+        role = _studio_light_role(light)
         light.data.use_shadow = role == "key" or bool(beauty)
 
 
@@ -2988,7 +3087,7 @@ def _configure_cycles(scene):
         ("diffuse_bounces", 4),
         ("glossy_bounces", 4),
         ("transmission_bounces", 8),
-        ("transparent_max_bounces", 8),
+        ("transparent_max_bounces", BEAUTY_TRANSPARENT_MAX_BOUNCES),
         ("volume_bounces", 2),
         ("caustics_reflective", False),
         ("caustics_refractive", False),
@@ -3005,17 +3104,26 @@ def _apply_render_quality(context, mode, *, switch_viewport=True):
     _clear_legacy_preview_overrides()
     if mode == "ANIMATE":
         _configure_eevee(scene)
+        _apply_studio_light_profile(scene, mode)
         count = _set_viewport_mode("ANIMATE") if switch_viewport else 0
         message = f"Fast Animation: Solid viewport in {count} view(s); materials stay untouched"
     elif mode == "PREVIEW":
         _configure_eevee(scene)
+        _apply_studio_light_profile(scene, mode)
         count = _set_viewport_mode("PREVIEW") if switch_viewport else 0
         message = f"Fast Preview: Eevee + full materials in {count} view(s)"
     elif mode == "BEAUTY":
         device = _configure_cycles(scene)
+        _apply_studio_light_profile(scene, mode)
         scene["xivblend_cycles_device"] = device
         count = _set_viewport_mode("BEAUTY") if switch_viewport else 0
         message = f"Beauty Photo: Cycles, adaptive 256 samples, denoise • {device}"
+    elif mode == "DRAMATIC":
+        device = _configure_cycles(scene)
+        _apply_studio_light_profile(scene, mode)
+        scene["xivblend_cycles_device"] = device
+        count = _set_viewport_mode("DRAMATIC") if switch_viewport else 0
+        message = f"Dramatic Detail: sculpted Cycles light, adaptive 256 samples • {device}"
     else:
         raise ClipError(f"Unknown render quality preset: {mode}")
     scene["xivblend_render_quality"] = mode
@@ -3073,10 +3181,19 @@ def _apply_color_preset(scene, preset):
             "fill": (0.76, 0.86, 1.0),
             "rim": (0.66, 0.80, 1.0),
         }
-    scene.view_settings.exposure = -0.40
+    mode = str(
+        getattr(
+            scene,
+            "xivblend_render_quality",
+            scene.get("xivblend_render_quality", "PREVIEW"),
+        )
+    )
+    scene.view_settings.exposure = (
+        DRAMATIC_EXPOSURE if mode == "DRAMATIC" else BEAUTY_EXPOSURE
+    )
     scene.view_settings.gamma = 1.0
     for light in _studio_lights(scene):
-        role = str(light.get("xivblend_studio_role", ""))
+        role = _studio_light_role(light)
         if role in light_colors:
             light.data.color = light_colors[role]
     scene["xivblend_color_preset"] = preset
@@ -3495,6 +3612,7 @@ class XIVBLEND_PT_render_studio(Panel):
             "ANIMATE": "Solid viewport • fastest posing • no shader changes",
             "PREVIEW": "Eevee • real materials • quick preview",
             "BEAUTY": "Cycles • adaptive samples • denoised final image",
+            "DRAMATIC": "Cycles • deeper shadows • stronger surface detail",
         }
         quality.label(text=descriptions.get(scene.xivblend_render_quality, ""), icon="INFO")
 
@@ -3503,8 +3621,13 @@ class XIVBLEND_PT_render_studio(Panel):
         appearance.prop(scene, "xivblend_background_preset", text="Background")
         appearance.prop(scene, "xivblend_color_preset", text="Color")
         appearance.prop(scene, "xivblend_output_preset", text="File")
-        if scene.xivblend_render_quality == "BEAUTY":
-            device = str(scene.get("xivblend_cycles_device", "Select Beauty to check the Cycles device"))
+        if scene.xivblend_render_quality in {"BEAUTY", "DRAMATIC"}:
+            device = str(
+                scene.get(
+                    "xivblend_cycles_device",
+                    "Select a Cycles mode to check the device",
+                )
+            )
             appearance.label(text=device[:92], icon="PREFERENCES")
 
         header = layout.row()
@@ -3618,7 +3741,28 @@ def _load_post_handler(_filepath):
     _close_previews()
     _clear_legacy_preview_overrides()
     _set_status("Ready")
-    _set_render_status("Choose a render mode, fit the camera, then render the current frame.")
+    try:
+        scene = bpy.context.scene
+        if scene is None or "xivblend_render_quality" not in scene:
+            _set_render_status(
+                "Choose a render mode, fit the camera, then render the current frame."
+            )
+            return
+        mode = str(
+            getattr(
+                scene,
+                "xivblend_render_quality",
+                scene.get("xivblend_render_quality", "PREVIEW"),
+            )
+        )
+        if mode not in {"ANIMATE", "PREVIEW", "BEAUTY", "DRAMATIC"}:
+            mode = "PREVIEW"
+        # Realize the saved preset after every file load. This migrates old
+        # Beauty files from eight transparent bounces without forcing their
+        # viewport into a more expensive shading mode during startup.
+        _apply_render_quality(bpy.context, mode, switch_viewport=False)
+    except Exception as error:
+        _set_render_status(f"Could not restore the saved Render Studio preset: {error}")
 
 
 _CLASSES = (
@@ -3660,11 +3804,18 @@ def register():
     )
     bpy.types.Scene.xivblend_render_quality = EnumProperty(
         name="Render quality",
-        description="Choose a lightweight viewport, a fast Eevee preview, or a Cycles final render",
+        description="Choose a lightweight viewport, fast Eevee, soft Cycles Beauty, or shadowed Cycles detail",
         items=(
             ("ANIMATE", "Animate", "Fast Solid viewport; keeps every material untouched", "PLAY", 0),
             ("PREVIEW", "Preview", "Fast Eevee render with the real materials", "SHADING_RENDERED", 1),
             ("BEAUTY", "Beauty", "Cycles final render with adaptive sampling and denoising", "RENDER_STILL", 2),
+            (
+                "DRAMATIC",
+                "Detail",
+                "Dramatic Cycles final render with a tighter key, deeper shadows, and reduced fill",
+                "LIGHT_AREA",
+                3,
+            ),
         ),
         default="PREVIEW",
         update=_update_render_quality,

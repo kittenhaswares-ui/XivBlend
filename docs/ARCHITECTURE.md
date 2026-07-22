@@ -61,11 +61,12 @@ The current render rig therefore remains glTF-native. A future optional **NFLB/M
 
 ## Blender scene and render presets
 
-Builder **0.10.0** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.7.1** exposes three direct Blender workflows:
+Builder **0.10.1** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.8.0** exposes four direct Blender workflows:
 
 - **Animate:** Solid viewport for responsive posing. It does not replace or edit character materials.
 - **Preview:** Eevee with real materials for fast shaded checks.
-- **Beauty:** Cycles with adaptive sampling, denoising, conservative light paths, and the user's available Cycles device.
+- **Beauty:** Cycles with adaptive sampling, denoising, conservative ordinary light paths, 128 transparent bounces for deeply layered alpha-card hair and fur, and the user's available Cycles device.
+- **Detail:** the same Cycles quality and materials with a tighter key, reduced fill and world light, a controlled rim, and deeper surface-defining shadows.
 
 The background choices are Charcoal Brand, Neutral Gray, and Transparent. The color choices are Beauty (AgX) and Accurate Mod Colors (Khronos PBR Neutral with neutral lights). Output choices are Web PNG (8-bit), High Quality PNG (16-bit), and a half-float EXR editing master.
 
@@ -84,8 +85,8 @@ Current format layers are:
 | Animation request queue | Schema 2 |
 | Animation bundle | Schema 3 |
 | Stored glTF bone-axis correction | Schema 1 |
-| Blender character builder | 0.10.0 |
-| Blender animation browser | 0.7.1 |
+| Blender character builder | 0.10.1 |
+| Blender animation browser | 0.8.0 |
 
 These versions are intentionally independent of the Dalamud plugin release number. A plugin update can change the builder or browser without changing every data schema, and a schema can change when compatibility requires it. Code should validate the layer it consumes instead of treating the plugin version as a universal format version.
 
