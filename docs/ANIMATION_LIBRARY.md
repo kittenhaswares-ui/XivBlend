@@ -1,6 +1,6 @@
 # XivBlend animation browser
 
-XivBlend 0.0.15 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
+XivBlend 0.0.16 provides an on-demand Blender browser for a deliberately narrow set of player emotes. A click builds one synchronized local bundle: the primary skeletal PAP, the facial clips scheduled by its TMB, real spawned prop assets, and native AVFX metadata all use FFXIV's 30 fps timeline. The browser can also add active overrides and standalone player pose/loop PAPs from one explicitly selected Penumbra mod. It is not a bulk game-asset extractor, and generated game/mod data stays in a shared local cache rather than inside character `.blend` files.
 
 ## Scope
 
@@ -49,7 +49,7 @@ The filter is data-driven, so a future game update can change the count without 
 
 ## Set up and use
 
-1. Install XivBlend 0.0.15 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
+1. Install XivBlend 0.0.16 or newer and select Blender 5.x in the **Export** tab if it was not detected automatically.
 2. Open XivBlend's **Animations** tab in FFXIV.
 3. Click **Set Up / Update Animation Browser** and wait for both status messages to finish.
 4. Export a character with race and face-skeleton metadata, then restart Blender if it was already open.
@@ -76,7 +76,7 @@ The importer has conservative PAP size, cumulative-import, animation-count, dura
 
 ## Render Studio controls
 
-Animation-browser 0.7.0 also provides **XivBlend** → **Render Studio**:
+Animation-browser 0.7.1 also provides **XivBlend** → **Render Studio**:
 
 - **Animate** switches the 3D View to Blender's lightweight Solid shading without replacing any character material.
 - **Preview** uses Eevee, the real materials, and the exported studio lights for quick shaded checks.
@@ -98,10 +98,11 @@ The shared cache is stored under:
 
 Catalog builds are separated by game version, client language, and converter version. Body cache paths also include the captured face key, and custom cards include a content-derived identity. `current.json` points Blender to the active build. Icons are prepared during setup; bundles and GLBs are generated only when clicked.
 
-The 0.0.15 compatibility line is animation browser 0.7.0, character builder 0.10.0, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
+The 0.0.16 compatibility line is animation browser 0.7.1, character builder 0.10.0, catalog/request schema 2, and bundle schema 3. Static AVFX inspection meshes use cache format v2; an older v1 preview is not reused and is regenerated when the relevant emote bundle rebuilds.
 
 - Run **Refresh Game Catalog** after a game update, language change, or custom-source import.
 - Use **Reinstall Blender Panel** when only the add-on needs an update.
+- If browser setup reports an error in red, update XivBlend, rerun setup, and restart Blender. The existing character `.blend` remains usable; clicking the emote again rebuilds an obsolete cached bundle on demand.
 - Use **Open Local Animation Cache** to inspect storage.
 - Old versioned builds are retained; XivBlend never silently deletes them.
 - Deleting the cache is recoverable: run setup again, then replay cards as needed.

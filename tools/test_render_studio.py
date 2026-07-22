@@ -40,12 +40,37 @@ def load_addon():
     return module
 
 
+class _RestrictedData:
+    """Fail loudly if add-on registration tries to inspect the open file."""
+
+    def __init__(self, accesses: list[str]):
+        self._accesses = accesses
+
+    def __getattr__(self, name: str):
+        self._accesses.append(name)
+        raise AssertionError(
+            f"register() accessed bpy.data.{name} while Blender data was restricted"
+        )
+
+
+class _RestrictedBpy:
+    """Delegate Blender's registration API but expose _RestrictData semantics."""
+
+    def __init__(self, wrapped, accesses: list[str]):
+        self._wrapped = wrapped
+        self.data = _RestrictedData(accesses)
+
+    def __getattr__(self, name: str):
+        return getattr(self._wrapped, name)
+
+
 def main() -> None:
     if not bpy.app.background or getattr(bpy.app, "factory_startup", False) is False:
         raise RuntimeError("Run this test with --background --factory-startup")
 
-    # Simulate a file saved by the retired clay-preview implementation. The
-    # current add-on must remove only its own tagged override on registration.
+    # Simulate a file saved by the retired clay-preview implementation. Blender
+    # exposes bpy.data as _RestrictData while enabling an add-on, so register()
+    # must defer this file migration until load_post.
     legacy = bpy.data.materials.new("XivBlend Smooth Animation Preview")
     legacy["xivblend_runtime_preview_material"] = True
     legacy_name = legacy.name
@@ -53,9 +78,40 @@ def main() -> None:
 
     sys.dont_write_bytecode = True
     addon = load_addon()
-    addon.register()
+    restricted_accesses: list[str] = []
+    addon.bpy = _RestrictedBpy(bpy, restricted_accesses)
+    registration_error = None
+    try:
+        addon.register()
+    except Exception as error:
+        registration_error = error
+    finally:
+        addon.bpy = bpy
+
+    if registration_error is not None:
+        # register() adds classes before its final setup steps. Make a failed
+        # test repeatable in the same Blender process by undoing partial state.
+        try:
+            addon.unregister()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"add-on registration failed in _RestrictData context: {registration_error}"
+        ) from registration_error
+
     try:
         scene = bpy.context.scene
+        require(not restricted_accesses, f"register inspected bpy.data: {restricted_accesses}")
+        require(
+            scene.view_layers[0].material_override is legacy,
+            "legacy file migration ran during restricted registration",
+        )
+        require(
+            bpy.data.materials.get(legacy_name) is legacy,
+            "legacy material was removed during restricted registration",
+        )
+
+        addon._load_post_handler(None)
         require(scene.view_layers[0].material_override is None, "legacy clay override survived")
         require(bpy.data.materials.get(legacy_name) is None, "legacy clay material survived")
 

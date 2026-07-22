@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -1652,6 +1652,7 @@ def _map_runtime_prop_materials(imported_objects, cache_directory, snapshot):
             failures.append(
                 f"{source_material.name} ({source_material.get('ShaderPackage')})"
             )
+    _bind_runtime_optional_texture_fallbacks(imported_objects)
     _tag_transient_data(snapshot)
     _remove_zero_user_new_data(snapshot)
     if failures:
@@ -1659,6 +1660,63 @@ def _map_runtime_prop_materials(imported_objects, cache_directory, snapshot):
             "The exact FFXIV material mapper could not map " + ", ".join(failures)
         )
     return len(expected)
+
+
+def _bind_runtime_optional_texture_fallbacks(imported_objects):
+    """Keep absent optional decals transparent on temporary game props.
+
+    MeddleTools leaves an Image Texture unassigned when an FFXIV material has
+    no decal. Blender evaluates that node's alpha as opaque, so the final decal
+    mix selects its black color in both Cycles and some Eevee paths. The
+    character builder already supplies this neutral input; runtime props need
+    the same treatment because they are mapped only after an emote is clicked.
+    """
+    materials = {
+        slot.material
+        for obj in imported_objects
+        if obj.type == "MESH"
+        for slot in obj.material_slots
+        if slot.material is not None and slot.material.node_tree is not None
+    }
+    missing_decals = [
+        node
+        for material in materials
+        for node in material.node_tree.nodes
+        if node.type == "TEX_IMAGE"
+        and node.image is None
+        and "decal" in str(node.label).casefold()
+        and any(output.is_linked for output in node.outputs)
+    ]
+    if not missing_decals:
+        return 0
+
+    fallback = next(
+        (
+            image
+            for image in bpy.data.images
+            if image.get("xivblend_component") == "runtime_optional_texture_fallback"
+            and image.source == "GENERATED"
+            and tuple(image.size) == (1, 1)
+        ),
+        None,
+    )
+    if fallback is None:
+        fallback = bpy.data.images.new(
+            "XivBlend Runtime Transparent Optional Texture",
+            width=1,
+            height=1,
+            alpha=True,
+        )
+    fallback.generated_color = (0.0, 0.0, 0.0, 0.0)
+    try:
+        fallback.colorspace_settings.name = "Non-Color"
+    except (TypeError, ValueError, RuntimeError):
+        pass
+    fallback[TRANSIENT_PROPERTY] = True
+    fallback["xivblend_component"] = "runtime_optional_texture_fallback"
+    for node in missing_decals:
+        node.image = fallback
+    return len(missing_decals)
 
 
 def _resolve_prop_asset(catalog, event):
@@ -2769,7 +2827,12 @@ def _set_if_present(owner, name, value):
 def _clear_legacy_preview_overrides():
     """Remove only XivBlend's retired clay override from older files/sessions."""
     cleared = 0
-    for scene in bpy.data.scenes:
+    # Blender deliberately exposes ``bpy.data`` as _RestrictData while an
+    # add-on is being enabled during startup. Registration must not inspect the
+    # open file in that phase; load_post will perform the migration afterwards.
+    scenes = getattr(bpy.data, "scenes", ())
+    materials = getattr(bpy.data, "materials", None)
+    for scene in scenes:
         for view_layer in scene.view_layers:
             material = view_layer.material_override
             if material is None or not (
@@ -2779,14 +2842,16 @@ def _clear_legacy_preview_overrides():
                 continue
             view_layer.material_override = None
             cleared += 1
-    for material in list(bpy.data.materials):
+    if materials is None:
+        return cleared
+    for material in list(materials):
         if material.users != 0 or not (
             bool(material.get(LEGACY_PREVIEW_MATERIAL_PROPERTY, False))
             or material.name.startswith(LEGACY_PREVIEW_MATERIAL_NAME)
         ):
             continue
         try:
-            bpy.data.materials.remove(material)
+            materials.remove(material)
         except (ReferenceError, RuntimeError):
             pass
     return cleared
@@ -3653,7 +3718,6 @@ def register():
     ):
         if callback not in handlers:
             handlers.append(callback)
-    _clear_legacy_preview_overrides()
 
 
 def unregister():

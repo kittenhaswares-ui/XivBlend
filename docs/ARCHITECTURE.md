@@ -61,7 +61,7 @@ The current render rig therefore remains glTF-native. A future optional **NFLB/M
 
 ## Blender scene and render presets
 
-Builder **0.10.0** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.7.0** exposes three direct Blender workflows:
+Builder **0.10.0** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.7.1** exposes three direct Blender workflows:
 
 - **Animate:** Solid viewport for responsive posing. It does not replace or edit character materials.
 - **Preview:** Eevee with real materials for fast shaded checks.
@@ -85,7 +85,7 @@ Current format layers are:
 | Animation bundle | Schema 3 |
 | Stored glTF bone-axis correction | Schema 1 |
 | Blender character builder | 0.10.0 |
-| Blender animation browser | 0.7.0 |
+| Blender animation browser | 0.7.1 |
 
 These versions are intentionally independent of the Dalamud plugin release number. A plugin update can change the builder or browser without changing every data schema, and a schema can change when compatibility requires it. Code should validate the layer it consumes instead of treating the plugin version as a universal format version.
 

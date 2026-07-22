@@ -7,7 +7,7 @@ namespace Meddle.Plugin.Services;
 internal static class XivBlendCompanionVersions
 {
     public const string Builder = "0.10.0";
-    public const string AnimationBrowser = "0.7.0";
+    public const string AnimationBrowser = "0.7.1";
 }
 
 internal static class BlenderExecutableDiscovery

@@ -82,6 +82,7 @@ The normal Timeline also contains an A-pose at frame 0 and the captured game pos
 
 - **Export does not start:** confirm Blender 5.x is selected and the original Meddle plugin is disabled.
 - **The Blender panel is missing:** run **Set Up / Update Animation Browser** again, then restart Blender and press `N` in the 3D View.
+- **Animation-browser setup is red:** the previous Blender panel is still active because the update did not install. Update XivBlend, run **Set Up / Update Animation Browser** again, and restart Blender before testing emotes. You can reopen the same `.blend`; click the emote again so XivBlend rebuilds any older cached bundle.
 - **An emote does nothing:** keep FFXIV and XivBlend open, refresh the game catalog, and click again after extraction finishes.
 - **Animation playback is slow:** use **Animate**. Eevee and especially Cycles calculate materials, lighting, and shadows and are intended for previews or final stills.
 - **Setup reports modified game files:** restore TexTools index changes. Normal Penumbra mods do not need to be disabled.
