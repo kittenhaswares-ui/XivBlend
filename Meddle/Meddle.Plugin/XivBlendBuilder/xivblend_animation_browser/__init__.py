@@ -9,7 +9,7 @@ pose and remove those Actions before Blender writes a .blend file.
 bl_info = {
     "name": "XivBlend Animation Browser",
     "author": "XivBlend contributors",
-    "version": (0, 8, 0),
+    "version": (0, 9, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > XivBlend",
     "description": "Browse FFXIV player emotes and frame portrait renders",
@@ -74,11 +74,24 @@ STUDIO_BACKDROP_COMPONENT = "studio_backdrop"
 STUDIO_LIGHT_COMPONENT = "studio_light"
 STUDIO_WORLD_COMPONENT = "studio_world"
 STUDIO_BACKGROUND_RAMP = "XivBlend Background Gradient"
+STUDIO_CENTER_PROPERTY = "xivblend_studio_center"
+STUDIO_SCALE_PROPERTY = "xivblend_studio_scale"
+LEGACY_STUDIO_LIGHT_PREFIXES = (
+    "Key Light (Warm Softbox)",
+    "Fill Light (Cool Softbox)",
+    "Rim Light (Cool Strip)",
+)
 BEAUTY_LIGHT_PROPERTIES = {
     "energy": "xivblend_beauty_energy",
     "size": "xivblend_beauty_size",
     "size_y": "xivblend_beauty_size_y",
     "spread": "xivblend_beauty_spread",
+}
+BEAUTY_LIGHT_TRANSFORM_PROPERTIES = {
+    "location": "xivblend_beauty_location",
+    "rotation_euler": "xivblend_beauty_rotation_euler",
+    "color": "xivblend_beauty_color",
+    "use_shadow": "xivblend_beauty_use_shadow",
 }
 BEAUTY_WORLD_STRENGTH_PROPERTY = "xivblend_beauty_strength"
 # Multipliers are relative to the exported soft Beauty rig. The tighter key
@@ -89,8 +102,56 @@ DRAMATIC_LIGHT_PROFILE = {
     "rim": {"energy": 1.15, "size": 0.65, "size_y": 0.75, "spread": 0.75},
 }
 DRAMATIC_WORLD_STRENGTH_SCALE = 0.40
+# A deliberately photographic three-light setup: a small raking side key,
+# almost no frontal fill, and a narrow rear kicker. Values are absolute per
+# character scale, so every race and body size gets the same light falloff.
+MOOD_LIGHT_PROFILE = {
+    "key": {
+        "offset": (-1.52, -0.18, 0.98),
+        "energy": 55.0,
+        "size": 0.22,
+        "size_y": 0.58,
+        "spread": math.radians(47.0),
+        "use_shadow": True,
+    },
+    "fill": {
+        "offset": (0.08, -1.18, 0.32),
+        "energy": 0.35,
+        "size": 0.18,
+        "size_y": 0.18,
+        "spread": math.radians(40.0),
+        "use_shadow": False,
+    },
+    "rim": {
+        "offset": (1.10, 0.62, 1.04),
+        "energy": 34.0,
+        "size": 0.12,
+        "size_y": 0.68,
+        "spread": math.radians(48.0),
+        "use_shadow": False,
+    },
+}
+BEAUTY_LIGHT_COLORS = {
+    "key": (1.0, 0.975, 0.955),
+    "fill": (0.76, 0.86, 1.0),
+    "rim": (0.66, 0.80, 1.0),
+}
+MOOD_LIGHT_COLORS = {
+    "key": (1.0, 0.83, 0.66),
+    "fill": (0.62, 0.76, 1.0),
+    "rim": (0.40, 0.60, 1.0),
+}
+MOOD_WORLD_STRENGTH = 0.0015
 BEAUTY_EXPOSURE = -0.40
 DRAMATIC_EXPOSURE = -0.55
+MOOD_EXPOSURE = -0.65
+FACE_SKIN_BASELINE_SSS_PROPERTY = "xivblend_face_skin_beauty_sss_weight"
+FACE_SKIN_PROFILE_ACTIVE_PROPERTY = "xivblend_face_skin_profile_active"
+FACE_SKIN_NODE_PROPERTY = "xivblend_face_skin_principled_node"
+# FFXIV's face graph already contains the authored normal, roughness and
+# specular maps. Only reduce the broad SSS wash for final Cycles images; the
+# raking light then reveals the real data instead of layering fake pores on it.
+FACE_SKIN_RENDER_SSS_WEIGHT = 0.08
 LEGACY_PREVIEW_MATERIAL_NAME = "XivBlend Smooth Animation Preview"
 LEGACY_PREVIEW_MATERIAL_PROPERTY = "xivblend_runtime_preview_material"
 RUNTIME_EFFECT_COLLECTION_PREFIX = "XivBlend Runtime Effects |"
@@ -110,6 +171,7 @@ _scene_settings = {}
 _action_settings = {}
 _runtime_sessions = {}
 _save_sessions = []
+_save_skin_materials = []
 _status = "Ready"
 _render_status = "Choose a render mode, fit the camera, then render the current frame."
 
@@ -2920,7 +2982,7 @@ def _studio_lights(scene):
             obj.get(STUDIO_COMPONENT_PROPERTY) == STUDIO_LIGHT_COMPONENT
             or (
                 obj.data.type == "AREA"
-                and str(obj.name).startswith(("Key Light", "Fill Light", "Rim Light"))
+                and str(obj.name).startswith(LEGACY_STUDIO_LIGHT_PREFIXES)
             )
         )
     ]
@@ -2940,13 +3002,13 @@ def _studio_backdrops(scene):
 
 def _studio_light_role(light):
     role = str(light.get("xivblend_studio_role", "")).casefold()
-    if role in DRAMATIC_LIGHT_PROFILE:
+    if role in MOOD_LIGHT_PROFILE:
         return role
     name = str(light.name).casefold()
     return next(
         (
             candidate
-            for candidate in DRAMATIC_LIGHT_PROFILE
+            for candidate in MOOD_LIGHT_PROFILE
             if name.startswith(candidate)
         ),
         "",
@@ -2960,6 +3022,16 @@ def _stored_float(owner, name, fallback):
         return float(fallback)
 
 
+def _stored_vector(owner, name, fallback):
+    try:
+        values = tuple(float(value) for value in owner.get(name, fallback))
+        if len(values) != len(fallback) or not all(math.isfinite(value) for value in values):
+            raise ValueError
+        return values
+    except (TypeError, ValueError):
+        return tuple(float(value) for value in fallback)
+
+
 def _beauty_light_baseline(light):
     if light.data.type != "AREA" or any(
         not hasattr(light.data, attribute) for attribute in BEAUTY_LIGHT_PROPERTIES
@@ -2971,7 +3043,105 @@ def _beauty_light_baseline(light):
         if property_name not in light:
             light[property_name] = current
         baseline[attribute] = _stored_float(light, property_name, current)
+    vectors = {
+        "location": tuple(light.location),
+        "rotation_euler": tuple(light.rotation_euler),
+        "color": tuple(light.data.color),
+    }
+    for attribute, current in vectors.items():
+        property_name = BEAUTY_LIGHT_TRANSFORM_PROPERTIES[attribute]
+        if property_name not in light:
+            light[property_name] = current
+        baseline[attribute] = _stored_vector(light, property_name, current)
+    shadow_property = BEAUTY_LIGHT_TRANSFORM_PROPERTIES["use_shadow"]
+    if shadow_property not in light:
+        light[shadow_property] = bool(light.data.use_shadow)
+    baseline["use_shadow"] = bool(light.get(shadow_property, light.data.use_shadow))
     return baseline
+
+
+def _restore_beauty_light(light, baseline):
+    for attribute in BEAUTY_LIGHT_PROPERTIES:
+        _set_if_present(light.data, attribute, baseline[attribute])
+    light.location = baseline["location"]
+    light.rotation_euler = baseline["rotation_euler"]
+    light.data.color = baseline["color"]
+    light.data.use_shadow = baseline["use_shadow"]
+
+
+def _studio_geometry(scene, baselines):
+    stored_center = scene.get(STUDIO_CENTER_PROPERTY)
+    stored_scale = _stored_float(scene, STUDIO_SCALE_PROPERTY, 0.0)
+    if (
+        stored_center is not None
+        and math.isfinite(stored_scale)
+        and stored_scale > 1.0e-6
+    ):
+        center = Vector(_stored_vector(scene, STUDIO_CENTER_PROPERTY, (0.0, 0.0, 0.0)))
+        return center, stored_scale
+
+    # Browser 0.8 exports did not persist the studio bounds. Recover them from
+    # the deterministic Beauty key rather than walking evaluated character
+    # geometry during a UI click or file-load migration.
+    key_light = next(
+        (light for light in baselines if _studio_light_role(light) == "key"),
+        None,
+    )
+    if key_light is None:
+        return Vector((0.0, 0.0, 0.0)), 1.0
+    baseline = baselines[key_light]
+    scale = float(baseline["size"]) / 0.736
+    if not math.isfinite(scale) or scale <= 1.0e-6:
+        scale = 1.0
+    center = Vector(baseline["location"]) - Vector((-1.125, -1.358, 1.242)) * scale
+    scene[STUDIO_CENTER_PROPERTY] = tuple(center)
+    scene[STUDIO_SCALE_PROPERTY] = scale
+    return center, scale
+
+
+def _aim_light(light, target):
+    direction = Vector(target) - light.location
+    if direction.length_squared > 1.0e-12:
+        light.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+
+def _render_exposure(mode):
+    if mode == "MOOD":
+        return MOOD_EXPOSURE
+    if mode == "DRAMATIC":
+        return DRAMATIC_EXPOSURE
+    return BEAUTY_EXPOSURE
+
+
+def _studio_light_colors(preset, mode):
+    if preset == "ACCURATE":
+        return {role: (1.0, 1.0, 1.0) for role in MOOD_LIGHT_PROFILE}
+    if mode == "MOOD":
+        return MOOD_LIGHT_COLORS
+    # Beauty, Detail and both fast modes use the exact colors captured from
+    # the exported light rig. This also preserves intentional user edits and
+    # old XivBlend files instead of replacing them with today's defaults.
+    return None
+
+
+def _apply_studio_light_colors(scene, mode, preset=None):
+    if preset is None:
+        preset = str(
+            getattr(
+                scene,
+                "xivblend_color_preset",
+                scene.get("xivblend_color_preset", "BEAUTY"),
+            )
+        )
+    colors = _studio_light_colors(preset, mode)
+    for light in _studio_lights(scene):
+        role = _studio_light_role(light)
+        if colors is None:
+            baseline = _beauty_light_baseline(light)
+            if baseline is not None:
+                light.data.color = baseline["color"]
+        elif role in colors:
+            light.data.color = colors[role]
 
 
 def _managed_world_background(scene):
@@ -2988,17 +3158,38 @@ def _managed_world_background(scene):
 
 def _apply_studio_light_profile(scene, mode):
     dramatic = mode == "DRAMATIC"
+    mood = mode == "MOOD"
+    baselines = {}
     for light in _studio_lights(scene):
         role = _studio_light_role(light)
-        if role not in DRAMATIC_LIGHT_PROFILE:
+        if role not in MOOD_LIGHT_PROFILE:
             continue
         baseline = _beauty_light_baseline(light)
         if baseline is None:
             continue
-        factors = DRAMATIC_LIGHT_PROFILE[role] if dramatic else None
-        for attribute, value in baseline.items():
-            factor = factors[attribute] if factors is not None else 1.0
-            _set_if_present(light.data, attribute, value * factor)
+        baselines[light] = baseline
+        _restore_beauty_light(light, baseline)
+
+    if dramatic:
+        for light, baseline in baselines.items():
+            factors = DRAMATIC_LIGHT_PROFILE[_studio_light_role(light)]
+            for attribute in BEAUTY_LIGHT_PROPERTIES:
+                _set_if_present(light.data, attribute, baseline[attribute] * factors[attribute])
+            light.data.use_shadow = True
+    elif mood:
+        center, scale = _studio_geometry(scene, baselines)
+        target = center + Vector((0.0, 0.0, 0.34 * scale))
+        for light in baselines:
+            profile = MOOD_LIGHT_PROFILE[_studio_light_role(light)]
+            light.location = center + Vector(profile["offset"]) * scale
+            light.data.energy = profile["energy"] * scale * scale
+            light.data.size = profile["size"] * scale
+            light.data.size_y = profile["size_y"] * scale
+            light.data.spread = profile["spread"]
+            light.data.use_shadow = profile["use_shadow"]
+            _aim_light(light, target)
+
+    _apply_studio_light_colors(scene, mode)
 
     world, background = _managed_world_background(scene)
     if world is not None and background is not None:
@@ -3006,11 +3197,120 @@ def _apply_studio_light_profile(scene, mode):
         if BEAUTY_WORLD_STRENGTH_PROPERTY not in world:
             world[BEAUTY_WORLD_STRENGTH_PROPERTY] = current
         baseline = _stored_float(world, BEAUTY_WORLD_STRENGTH_PROPERTY, current)
-        background.inputs["Strength"].default_value = (
-            baseline * DRAMATIC_WORLD_STRENGTH_SCALE if dramatic else baseline
-        )
+        strength = baseline
+        if dramatic:
+            strength *= DRAMATIC_WORLD_STRENGTH_SCALE
+        elif mood:
+            strength = MOOD_WORLD_STRENGTH
+        background.inputs["Strength"].default_value = strength
 
-    scene.view_settings.exposure = DRAMATIC_EXPOSURE if dramatic else BEAUTY_EXPOSURE
+    scene.view_settings.exposure = _render_exposure(mode)
+
+
+def _active_surface_principled(material):
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return None
+    outputs = [
+        node
+        for node in tree.nodes
+        if node.type == "OUTPUT_MATERIAL" and bool(node.is_active_output)
+    ]
+    if len(outputs) != 1:
+        return None
+    surface = outputs[0].inputs.get("Surface")
+    if surface is None or len(surface.links) != 1:
+        return None
+    node = surface.links[0].from_node
+    return node if node.type == "BSDF_PRINCIPLED" else None
+
+
+def _scene_face_skin_materials(scene):
+    materials = set()
+    for obj in scene.objects:
+        if obj.type != "MESH":
+            continue
+        for slot in obj.material_slots:
+            material = slot.material
+            if (
+                material is not None
+                and material.library is None
+                and str(material.get("ShaderPackage", "")).casefold() == "skin.shpk"
+                and str(material.get("GetMaterialValue", "")).casefold()
+                == "getmaterialvalueface"
+            ):
+                materials.add(material)
+    return materials
+
+
+def _apply_face_skin_materials(materials, enabled):
+    changed = 0
+    for material in materials:
+        try:
+            active = bool(material.get(FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False))
+            principled = None
+            if not enabled and active and material.node_tree is not None:
+                stored_name = str(material.get(FACE_SKIN_NODE_PROPERTY, ""))
+                stored_node = material.node_tree.nodes.get(stored_name)
+                if stored_node is not None and stored_node.type == "BSDF_PRINCIPLED":
+                    principled = stored_node
+            if principled is None:
+                principled = _active_surface_principled(material)
+            if principled is None:
+                if not enabled and active:
+                    material[FACE_SKIN_PROFILE_ACTIVE_PROPERTY] = False
+                continue
+            subsurface = principled.inputs.get("Subsurface Weight")
+            if subsurface is None or (enabled and subsurface.is_linked):
+                continue
+            if enabled:
+                if not active:
+                    baseline = float(subsurface.default_value)
+                    material[FACE_SKIN_BASELINE_SSS_PROPERTY] = baseline
+                    material[FACE_SKIN_NODE_PROPERTY] = principled.name
+                else:
+                    baseline = _stored_float(
+                        material,
+                        FACE_SKIN_BASELINE_SSS_PROPERTY,
+                        subsurface.default_value,
+                    )
+                # Some face mods deliberately author little or no SSS. Never
+                # increase their value: the final profile only removes broad
+                # waxy scattering when the source material actually has it.
+                subsurface.default_value = min(
+                    baseline,
+                    FACE_SKIN_RENDER_SSS_WEIGHT,
+                )
+                material[FACE_SKIN_PROFILE_ACTIVE_PROPERTY] = True
+                changed += 1
+            elif active:
+                baseline = _stored_float(
+                    material,
+                    FACE_SKIN_BASELINE_SSS_PROPERTY,
+                    subsurface.default_value,
+                )
+                subsurface.default_value = baseline
+                material[FACE_SKIN_PROFILE_ACTIVE_PROPERTY] = False
+                changed += 1
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+    return changed
+
+
+def _apply_face_skin_profile(scene, enabled):
+    """Reduce waxy face scattering for final renders without rewriting maps."""
+    materials = (
+        _scene_face_skin_materials(scene)
+        if enabled
+        else {
+            material
+            for material in bpy.data.materials
+            if bool(material.get(FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False))
+        }
+    )
+    changed = _apply_face_skin_materials(materials, enabled)
+    scene["xivblend_face_skin_profile_materials"] = changed if enabled else 0
+    return changed
 
 
 def _set_studio_shadow_quality(scene, beauty):
@@ -3124,8 +3424,15 @@ def _apply_render_quality(context, mode, *, switch_viewport=True):
         scene["xivblend_cycles_device"] = device
         count = _set_viewport_mode("DRAMATIC") if switch_viewport else 0
         message = f"Dramatic Detail: sculpted Cycles light, adaptive 256 samples • {device}"
+    elif mode == "MOOD":
+        device = _configure_cycles(scene)
+        _apply_studio_light_profile(scene, mode)
+        scene["xivblend_cycles_device"] = device
+        count = _set_viewport_mode("MOOD") if switch_viewport else 0
+        message = f"Mood Portrait: raking side key, deep shadow, cool edge • {device}"
     else:
         raise ClipError(f"Unknown render quality preset: {mode}")
+    _apply_face_skin_profile(scene, mode in {"BEAUTY", "DRAMATIC", "MOOD"})
     scene["xivblend_render_quality"] = mode
     _set_render_status(message)
     return message
@@ -3169,18 +3476,12 @@ def _apply_color_preset(scene, preset):
     if preset == "ACCURATE":
         scene.view_settings.view_transform = "Khronos PBR Neutral"
         scene.view_settings.look = "None"
-        light_colors = {"key": (1.0, 1.0, 1.0), "fill": (1.0, 1.0, 1.0), "rim": (1.0, 1.0, 1.0)}
     else:
         scene.view_settings.view_transform = "AgX"
         try:
             scene.view_settings.look = "AgX - Medium High Contrast"
         except TypeError:
             scene.view_settings.look = "Medium High Contrast"
-        light_colors = {
-            "key": (1.0, 0.975, 0.955),
-            "fill": (0.76, 0.86, 1.0),
-            "rim": (0.66, 0.80, 1.0),
-        }
     mode = str(
         getattr(
             scene,
@@ -3188,14 +3489,9 @@ def _apply_color_preset(scene, preset):
             scene.get("xivblend_render_quality", "PREVIEW"),
         )
     )
-    scene.view_settings.exposure = (
-        DRAMATIC_EXPOSURE if mode == "DRAMATIC" else BEAUTY_EXPOSURE
-    )
+    scene.view_settings.exposure = _render_exposure(mode)
     scene.view_settings.gamma = 1.0
-    for light in _studio_lights(scene):
-        role = _studio_light_role(light)
-        if role in light_colors:
-            light.data.color = light_colors[role]
+    _apply_studio_light_colors(scene, mode, preset)
     scene["xivblend_color_preset"] = preset
 
 
@@ -3607,12 +3903,19 @@ class XIVBLEND_PT_render_studio(Panel):
         scene = context.scene
         quality = layout.box()
         quality.label(text="Quality", icon="SHADING_RENDERED")
-        quality.prop(scene, "xivblend_render_quality", expand=True)
+        fast_row = quality.row(align=True)
+        fast_row.prop_enum(scene, "xivblend_render_quality", "ANIMATE")
+        fast_row.prop_enum(scene, "xivblend_render_quality", "PREVIEW")
+        final_row = quality.row(align=True)
+        final_row.prop_enum(scene, "xivblend_render_quality", "BEAUTY")
+        final_row.prop_enum(scene, "xivblend_render_quality", "DRAMATIC")
+        final_row.prop_enum(scene, "xivblend_render_quality", "MOOD")
         descriptions = {
             "ANIMATE": "Solid viewport • fastest posing • no shader changes",
             "PREVIEW": "Eevee • real materials • quick preview",
             "BEAUTY": "Cycles • adaptive samples • denoised final image",
             "DRAMATIC": "Cycles • deeper shadows • stronger surface detail",
+            "MOOD": "Cycles • Rembrandt side key • deep cinematic shadow",
         }
         quality.label(text=descriptions.get(scene.xivblend_render_quality, ""), icon="INFO")
 
@@ -3621,7 +3924,7 @@ class XIVBLEND_PT_render_studio(Panel):
         appearance.prop(scene, "xivblend_background_preset", text="Background")
         appearance.prop(scene, "xivblend_color_preset", text="Color")
         appearance.prop(scene, "xivblend_output_preset", text="File")
-        if scene.xivblend_render_quality in {"BEAUTY", "DRAMATIC"}:
+        if scene.xivblend_render_quality in {"BEAUTY", "DRAMATIC", "MOOD"}:
             device = str(
                 scene.get(
                     "xivblend_cycles_device",
@@ -3673,8 +3976,15 @@ class XIVBLEND_PT_render_studio(Panel):
 
 @persistent
 def _save_pre_handler(_filepath):
-    global _save_sessions
+    global _save_sessions, _save_skin_materials
     _save_sessions = []
+    active_skin_materials = [
+        material
+        for material in bpy.data.materials
+        if bool(material.get(FACE_SKIN_PROFILE_ACTIVE_PROPERTY, False))
+    ]
+    _save_skin_materials = [material.name for material in active_skin_materials]
+    _apply_face_skin_materials(active_skin_materials, False)
     _stop_playback()
     for target_name, session in list(_runtime_sessions.items()):
         target = bpy.data.objects.get(target_name)
@@ -3691,8 +4001,9 @@ def _save_pre_handler(_filepath):
 
 
 def _resume_after_save():
-    global _save_sessions
+    global _save_sessions, _save_skin_materials
     sessions, _save_sessions = _save_sessions, []
+    skin_names, _save_skin_materials = _save_skin_materials, []
     for session in sessions:
         target = bpy.data.objects.get(session["target"])
         asset_kind = session.get("asset_kind", "clip")
@@ -3714,19 +4025,41 @@ def _resume_after_save():
             ))
         except Exception as error:
             _set_status(f"Saved safely, but could not resume the preview: {error}")
+    eligible_skin_materials = set()
+    for scene in bpy.data.scenes:
+        mode = str(
+            getattr(
+                scene,
+                "xivblend_render_quality",
+                scene.get("xivblend_render_quality", "PREVIEW"),
+            )
+        )
+        if mode in {"BEAUTY", "DRAMATIC", "MOOD"}:
+            eligible_skin_materials.update(_scene_face_skin_materials(scene))
+    skin_materials = {
+        material
+        for name in skin_names
+        if (material := bpy.data.materials.get(name)) is not None
+        and material in eligible_skin_materials
+    }
+    if skin_materials:
+        try:
+            _apply_face_skin_materials(skin_materials, True)
+        except Exception as error:
+            _set_render_status(f"Saved safely, but could not restore face detail: {error}")
     return None
 
 
 @persistent
 def _save_post_handler(_filepath):
-    if _save_sessions:
+    if _save_sessions or _save_skin_materials:
         if not bpy.app.timers.is_registered(_resume_after_save):
             bpy.app.timers.register(_resume_after_save, first_interval=0.1)
 
 
 @persistent
 def _load_post_handler(_filepath):
-    global _catalog, _catalog_signature, _save_sessions
+    global _catalog, _catalog_signature, _save_sessions, _save_skin_materials
     _stop_playback()
     _purge_transient_actions(restore=True)
     _remove_runtime_visuals()
@@ -3736,6 +4069,7 @@ def _load_post_handler(_filepath):
     _action_settings.clear()
     _runtime_sessions.clear()
     _save_sessions = []
+    _save_skin_materials = []
     _catalog = None
     _catalog_signature = None
     _close_previews()
@@ -3755,7 +4089,7 @@ def _load_post_handler(_filepath):
                 scene.get("xivblend_render_quality", "PREVIEW"),
             )
         )
-        if mode not in {"ANIMATE", "PREVIEW", "BEAUTY", "DRAMATIC"}:
+        if mode not in {"ANIMATE", "PREVIEW", "BEAUTY", "DRAMATIC", "MOOD"}:
             mode = "PREVIEW"
         # Realize the saved preset after every file load. This migrates old
         # Beauty files from eight transparent bounces without forcing their
@@ -3804,7 +4138,7 @@ def register():
     )
     bpy.types.Scene.xivblend_render_quality = EnumProperty(
         name="Render quality",
-        description="Choose a lightweight viewport, fast Eevee, soft Cycles Beauty, or shadowed Cycles detail",
+        description="Choose a lightweight viewport, Eevee preview, or one of three Cycles portrait looks",
         items=(
             ("ANIMATE", "Animate", "Fast Solid viewport; keeps every material untouched", "PLAY", 0),
             ("PREVIEW", "Preview", "Fast Eevee render with the real materials", "SHADING_RENDERED", 1),
@@ -3815,6 +4149,13 @@ def register():
                 "Dramatic Cycles final render with a tighter key, deeper shadows, and reduced fill",
                 "LIGHT_AREA",
                 3,
+            ),
+            (
+                "MOOD",
+                "Mood",
+                "Atmospheric Cycles portrait with a raking warm key, deep shadow, and cool edge light",
+                "LIGHT_SPOT",
+                4,
             ),
         ),
         default="PREVIEW",
@@ -3872,8 +4213,14 @@ def register():
 
 
 def unregister():
-    global _save_sessions
+    global _save_sessions, _save_skin_materials
     _stop_playback()
+    try:
+        scene = bpy.context.scene
+        if scene is not None:
+            _apply_face_skin_profile(scene, False)
+    except Exception:
+        pass
     for target_name in list(_runtime_sessions):
         target = bpy.data.objects.get(target_name)
         if target is not None:
@@ -3893,6 +4240,7 @@ def unregister():
     except Exception:
         pass
     _save_sessions = []
+    _save_skin_materials = []
     for handlers, callback in (
         (bpy.app.handlers.save_pre, _save_pre_handler),
         (bpy.app.handlers.save_post, _save_post_handler),

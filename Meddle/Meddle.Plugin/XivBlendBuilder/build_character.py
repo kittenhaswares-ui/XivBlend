@@ -26,7 +26,7 @@ from mathutils import Matrix, Quaternion, Vector
 
 
 BUILDER_NAME = "XivBlend Blender Builder"
-BUILDER_VERSION = "0.10.1"
+BUILDER_VERSION = "0.10.2"
 ANIMATION_CATALOG_SCHEMA = 2
 MANIFEST_TEXT_NAME = "XIVBLEND_PROVENANCE.json"
 BUILD_REPORT_TEXT_NAME = "XIVBLEND_BUILD_REPORT.json"
@@ -1609,12 +1609,18 @@ def add_area_light(
     point_at(light, target)
     light["xivblend_component"] = "studio_light"
     light["xivblend_studio_role"] = role
-    # Render Studio can temporarily reshape these lights for its dramatic
-    # profile, then restore the exported Beauty setup without cumulative drift.
+    # Render Studio can temporarily reshape these lights for final profiles,
+    # then restore the exported Beauty setup without cumulative drift.
     light["xivblend_beauty_energy"] = float(energy)
     light["xivblend_beauty_size"] = float(size)
     light["xivblend_beauty_size_y"] = float(light_data.size_y)
     light["xivblend_beauty_spread"] = float(spread)
+    light["xivblend_beauty_location"] = tuple(float(value) for value in light.location)
+    light["xivblend_beauty_rotation_euler"] = tuple(
+        float(value) for value in light.rotation_euler
+    )
+    light["xivblend_beauty_color"] = tuple(float(value) for value in light_data.color)
+    light["xivblend_beauty_use_shadow"] = bool(use_shadow)
     light_linking = getattr(light, "light_linking", None)
     if light_linking is not None and receiver_collection is not None:
         try:
@@ -1898,6 +1904,8 @@ def configure_scene_setup(
         source_light.hide_viewport = True
 
     light_target = captured_center + Vector((0.0, 0.0, captured_size.z * 0.27))
+    scene["xivblend_studio_center"] = tuple(float(value) for value in captured_center)
+    scene["xivblend_studio_scale"] = float(largest)
     add_area_light(
         setup,
         "Key Light (Warm Softbox)",
@@ -2157,10 +2165,12 @@ def write_embedded_readme() -> None:
         "XivBlend Blender add-on installed, open the N sidebar and use XivBlend > "
         "Render Studio to fit the camera to the current pose or whole animation, then "
         "press Render Portrait.\n"
-        "- Render Studio has four simple modes: Animate uses Blender's fast Solid viewport, "
+        "- Render Studio has five simple modes: Animate uses Blender's fast Solid viewport, "
         "Preview uses Eevee with the real materials, Beauty uses soft Cycles studio light, and "
-        "Dramatic Detail uses more directional Cycles light and deeper shadows. None of these "
-        "modes replaces character materials.\n"
+        "Dramatic Detail uses more directional Cycles light. Mood adds a raking warm side key, "
+        "deep shadows and a cool rear edge. Final Cycles modes temporarily reduce broad face-skin "
+        "subsurface wash; the original value is restored for Preview, Animate and saved files. "
+        "Texture, normal, roughness and specular links are never replaced.\n"
         "- Charcoal, neutral gray and transparent background presets make repeatable preview "
         "images. Beauty Color uses AgX; Accurate Mod Colors uses neutral lights and Khronos PBR.\n"
         "- The portrait camera, three lights and studio sweep are isolated in the "
@@ -2573,6 +2583,9 @@ def validate_scene_setup(
     setup = collections["setup"]
     problems: list[str] = []
     _, validation_size, _ = character_bounds_across_frames(scene, meshes)
+    # character_bounds_across_frames restores the captured endpoint (frame
+    # 100), which is the pose used when the studio center was authored.
+    validation_center, _, _ = character_bounds(meshes)
     validation_largest = max(max(validation_size), 0.1)
 
     if setup.name != SETUP_COLLECTION or not any(
@@ -2648,6 +2661,45 @@ def validate_scene_setup(
             energy_scale, size_scale, size_y_scale, color, spread, use_shadow = expected
             expected_energy = energy_scale * validation_largest * validation_largest
             energy_tolerance = max(1.0e-5, expected_energy * 1.0e-5)
+            beauty_baseline_valid = (
+                approximately_equal(
+                    light.get("xivblend_beauty_energy", -1.0), light.data.energy
+                )
+                and approximately_equal(
+                    light.get("xivblend_beauty_size", -1.0), light.data.size
+                )
+                and approximately_equal(
+                    light.get("xivblend_beauty_size_y", -1.0), light.data.size_y
+                )
+                and approximately_equal(
+                    light.get("xivblend_beauty_spread", -1.0), light.data.spread
+                )
+                and all(
+                    approximately_equal(actual, wanted)
+                    for actual, wanted in zip(
+                        light.get("xivblend_beauty_location", ()), light.location
+                    )
+                )
+                and len(light.get("xivblend_beauty_location", ())) == 3
+                and all(
+                    approximately_equal(actual, wanted)
+                    for actual, wanted in zip(
+                        light.get("xivblend_beauty_rotation_euler", ()),
+                        light.rotation_euler,
+                    )
+                )
+                and len(light.get("xivblend_beauty_rotation_euler", ())) == 3
+                and all(
+                    approximately_equal(actual, wanted)
+                    for actual, wanted in zip(
+                        light.get("xivblend_beauty_color", ()), light.data.color
+                    )
+                )
+                and len(light.get("xivblend_beauty_color", ())) == 3
+                and "xivblend_beauty_use_shadow" in light
+                and bool(light.get("xivblend_beauty_use_shadow"))
+                == bool(light.data.use_shadow)
+            )
             exact_settings_valid = (
                 approximately_equal(
                     light.data.energy, expected_energy, energy_tolerance
@@ -2665,6 +2717,7 @@ def validate_scene_setup(
                 )
                 and light.data.normalize
                 and light.data.use_shadow == use_shadow
+                and beauty_baseline_valid
                 and (
                     role != "rim"
                     or getattr(
@@ -2687,6 +2740,20 @@ def validate_scene_setup(
             or not exact_settings_valid
         ):
             problems.append(f"studio light {light.name} is disabled or its softbox settings changed")
+
+    studio_center = scene.get("xivblend_studio_center", ())
+    if (
+        len(studio_center) != 3
+        or not all(math.isfinite(float(value)) for value in studio_center)
+        or not all(
+            approximately_equal(float(actual), float(wanted))
+            for actual, wanted in zip(studio_center, validation_center)
+        )
+        or not approximately_equal(
+            scene.get("xivblend_studio_scale", -1.0), validation_largest
+        )
+    ):
+        problems.append("the studio center or scale baseline is missing")
 
     studio_backdrops = [
         obj

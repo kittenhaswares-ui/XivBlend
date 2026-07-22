@@ -61,16 +61,19 @@ The current render rig therefore remains glTF-native. A future optional **NFLB/M
 
 ## Blender scene and render presets
 
-Builder **0.10.1** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.8.0** exposes four direct Blender workflows:
+Builder **0.10.2** creates a 1440 x 1800 portrait scene, fitted camera, grounded sweep, and studio lights. Browser **0.9.0** exposes five direct Blender workflows:
 
 - **Animate:** Solid viewport for responsive posing. It does not replace or edit character materials.
 - **Preview:** Eevee with real materials for fast shaded checks.
 - **Beauty:** Cycles with adaptive sampling, denoising, conservative ordinary light paths, 128 transparent bounces for deeply layered alpha-card hair and fur, and the user's available Cycles device.
 - **Detail:** the same Cycles quality and materials with a tighter key, reduced fill and world light, a controlled rim, and deeper surface-defining shadows.
+- **Mood:** a true side-lit portrait arrangement with a small warm key, near-zero ambient/front fill, a cool rear kicker, and strong Rembrandt-style shadows.
 
 The background choices are Charcoal Brand, Neutral Gray, and Transparent. The color choices are Beauty (AgX) and Accurate Mod Colors (Khronos PBR Neutral with neutral lights). Output choices are Web PNG (8-bit), High Quality PNG (16-bit), and a half-float EXR editing master.
 
 The sweep's visible gradient is camera-only in Cycles so it does not act like a giant emission light and flatten the character. The character receives shaped key/fill/rim lighting; the rim can be linked to the character collection. Cycles uses a 2K viewport texture limit without destructively converting source textures. No third-party “photoreal filter” or paid add-on is required. The Beauty result remains reproducible and suitable for consistent mod previews.
+
+Final Cycles modes temporarily lower only an unlinked Principled subsurface-weight socket on materials positively identified as `skin.shpk` face materials. All source color, normal, tiled pore detail, roughness, specular, makeup, and mod texture links remain unchanged. The browser records the actual socket value, restores it for Animate/Preview, restores every active material before saving or unregistering, and reapplies the final-mode profile after a successful save or file load. Linked inputs and body skin are skipped.
 
 ## Animation storage and schemas
 
@@ -85,8 +88,8 @@ Current format layers are:
 | Animation request queue | Schema 2 |
 | Animation bundle | Schema 3 |
 | Stored glTF bone-axis correction | Schema 1 |
-| Blender character builder | 0.10.1 |
-| Blender animation browser | 0.8.0 |
+| Blender character builder | 0.10.2 |
+| Blender animation browser | 0.9.0 |
 
 These versions are intentionally independent of the Dalamud plugin release number. A plugin update can change the builder or browser without changing every data schema, and a schema can change when compatibility requires it. Code should validate the layer it consumes instead of treating the plugin version as a universal format version.
 

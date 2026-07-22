@@ -1,24 +1,22 @@
-# XivBlend Prototype 0.0.17
+# XivBlend Prototype 0.0.18
 
-This update fixes dark opaque patches in densely layered modded hair and fur and adds an optional shadowed Cycles portrait look.
+This update adds the genuinely shadowed portrait look requested after the earlier Detail preset proved too close to Beauty.
 
 ## What changed
 
-- Raises only Cycles' transparent-ray depth from 8 to 128. Ordinary light-path depth remains 8, so opaque scenes do not pay for extra diffuse, glossy, or transmission bounces.
-- Applies the correction to new exports and automatically migrates the saved Render Studio preset when an existing `.blend` opens; **Beauty**, **Detail**, and **Render Portrait** also reassert it.
-- Adds **Render Studio** → **Detail**: the same materials and 256-sample adaptive Cycles setup as Beauty, but with a tighter key, much less fill and ambient light, and deeper shadows for face, hair, normal-map, and clothing-fold detail.
-- Restores the exact soft Beauty rig when switching back to Beauty, Preview, or Animate; repeated switching cannot accumulate light changes.
-- Keeps source textures and alpha masks unchanged; there is no texture conversion or quality loss.
-- Adds Blender 5.0 and 5.2 regression coverage for both configuration paths.
-
-The failing Wheel tail contains up to 96 overlapping transparent fur cards along a tested camera ray. The previous limit stopped those rays early and rendered the remaining layers black; 128 safely clears the measured stack.
+- Adds **Render Studio → Mood**. It moves the existing three-light rig into a photographer-style setup: a small warm side key, almost no frontal/ambient fill, and a narrow cool rear kicker. The result has strong Rembrandt-style facial and body shadow without adding render-heavy volumes or extra lights.
+- Keeps **Beauty** and **Detail** as separate choices. Switching between any mode restores Beauty's exact energy, size, position, rotation, color, and shadow baselines first, so repeated changes and files saved in Mood cannot drift.
+- Makes final Cycles faces less waxy by temporarily reducing only the unlinked subsurface weight on materials explicitly identified as FFXIV face skin. Normal, pore-detail, roughness, specular, color, makeup, and mod texture links stay untouched.
+- Restores the original face value for Eevee Preview, Solid Animate, saving, and add-on removal. Linked/custom skin inputs, body skin, orphan materials, and unrelated user lights are skipped.
+- Keeps the dense alpha-card hair/fur correction from 0.0.17.
+- Adds Blender 5.0 and 5.2 tests for Mood geometry and color, exact preset round-trips, saved-Mood reloads, face-only scope, linked-input safety, and fresh-export baselines.
 
 ## Install and test
 
-1. Update or reload XivBlend 0.0.17.
-2. In **Animations**, press **Set Up / Update Animation Browser** and wait for setup to finish without red text.
-3. Close and restart Blender so the running session loads browser 0.8.0.
-4. Reopen the same character `.blend`; no character re-export is required.
-5. In the XivBlend sidebar, select **Render Studio** → **Beauty** again for the soft look, or **Detail** for deeper shadows, and render.
+1. Update or reload XivBlend 0.0.18.
+2. In **Animations**, press **Set Up / Update Animation Browser**.
+3. Restart Blender so it loads browser 0.9.0.
+4. Reopen an existing XivBlend character file; a character re-export is not required.
+5. Open the Blender `N` sidebar → **XivBlend → Render Studio** and choose **Mood**.
 
-Dense transparent hair or fur can take somewhat longer to render because Cycles now follows those rays until the actual cards are cleared. **Animate** and Eevee **Preview** are unchanged.
+Mood is a final Cycles look, so use **Animate** or **Preview** while posing and switch to Mood when judging or rendering the picture.
